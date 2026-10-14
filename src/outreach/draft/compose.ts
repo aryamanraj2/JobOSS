@@ -1,5 +1,5 @@
 import { Prisma } from '../../../generated/prisma/client.js'
-import type { OutreachCase } from '../../../generated/prisma/enums.js'
+import type { DraftStatus, OutreachCase } from '../../../generated/prisma/enums.js'
 import type { Db } from '../../core/audit/audit-log.js'
 import { writeAudit } from '../../core/audit/audit-log.js'
 import { decideOutreachCase, type OutreachFacts } from '../../core/policy/outreach-case.js'
@@ -15,7 +15,7 @@ import {
   type DraftComposition,
   type DraftSentence,
 } from './message.js'
-import { selectContactSlots } from './slots.js'
+import { contactSlotRefusal, selectContactSlots } from './slots.js'
 import { renderTemplate, TEMPLATE_IDS, type TemplateVars } from './templates.js'
 import { GATE_VERSION, runQualityGate } from './quality-gate.js'
 import { INTRO, WINDOW, type PitchSentence } from './pitch.js'
@@ -56,6 +56,8 @@ export type ComposeOutcome = {
   tasksQueued: number
   refusals: { companyId: string; companyName: string; reason: ReasonCodeValue; detail: string }[]
   drafts: { draftId: string; companyName: string; contactEmail: string; outreachCase: OutreachCase; touchSlot: number }[]
+  /** Drafts ended because their contact may no longer be written to (F6 step 1). */
+  draftsClosed: { draftId: string; companyName: string; reason: ReasonCodeValue; detail: string }[]
 }
 
 export type ComposeOptions = {
@@ -77,8 +79,14 @@ export type ComposeOptions = {
   onlyDraftIds?: string[]
 }
 
-/** Statuses a composer may overwrite. Everything later is an approval or a record of a send. */
-const RECOMPOSABLE = new Set(['composing', 'quality_gate', 'gate_failed', 'awaiting_approval'])
+/**
+ * Statuses a composer may overwrite. Everything later is an approval or a record of a
+ * send — and `approvedAt` is checked separately, which is what lets `closed` appear
+ * here: a draft closed because its contact lost its slot was never approved and must
+ * compose again if that contact becomes eligible, while a draft closed by a
+ * `wrong_contact` report after a send carries an `approvedAt` and stays frozen.
+ */
+const RECOMPOSABLE = new Set(['composing', 'quality_gate', 'gate_failed', 'awaiting_approval', 'closed'])
 
 /** The claim keys the deterministic sentences draw on. */
 const NAME_CLAIM_KEY = 'identity.full_name'
@@ -92,6 +100,7 @@ export async function composeDrafts(db: Db, opts: ComposeOptions = {}): Promise<
     tasksQueued: 0,
     refusals: [],
     drafts: [],
+    draftsClosed: [],
   }
 
   const leads = await db.lead.findMany({
@@ -117,7 +126,15 @@ export async function composeDrafts(db: Db, opts: ComposeOptions = {}): Promise<
           teamSize: true,
           contacts: {
             where: { status: 'active' },
-            select: { id: true, contactType: true, verified: true, emailNormalized: true, discoveryMethod: true, evidenceId: true },
+            select: {
+              id: true,
+              contactType: true,
+              verified: true,
+              emailNormalized: true,
+              publicTitle: true,
+              discoveryMethod: true,
+              evidenceId: true,
+            },
           },
         },
       },
@@ -155,9 +172,52 @@ export async function composeDrafts(db: Db, opts: ComposeOptions = {}): Promise<
     const company = lead.company
     if (lead.campaignCycle !== latestCycle.get(company.id)) continue
 
-    // §10.7: one slot, or two for a company big enough that a second route reaches a
-    // genuinely different human.
-    const slots = selectContactSlots(company.contacts, company.teamSize)
+    // §10.7, as amended in F6 step 1: every contact who passes the slot policy gets
+    // their own message. The policy itself — titles, generic inboxes — lives in
+    // `slots.ts`, which is the only place a human's address enters the sending path.
+    const slots = selectContactSlots(company.contacts)
+
+    // A contact that no longer takes a slot must not leave a live draft behind. The
+    // title filter arrived three weeks after 36 drafts were composed, and 15 of them
+    // were addressed to someone it now refuses; leaving those in `awaiting_approval`
+    // would put exactly the rows this filter exists to stop in front of the operator.
+    // Closing is the right end state rather than re-composing: the refusal is about
+    // the recipient, and no rewrite of the body changes it.
+    const selected = new Set(slots.map((s) => s.contactId))
+    for (const contact of company.contacts) {
+      if (selected.has(contact.id)) continue
+      const refusal = contactSlotRefusal(contact)
+      if (!refusal) continue // unverified, or simply not selected: not a policy refusal
+      const orphans = await db.draft.findMany({
+        where: {
+          contactId: contact.id,
+          lead: { companyId: company.id },
+          approvedAt: null,
+          status: { in: [...RECOMPOSABLE] as DraftStatus[] },
+        },
+        select: { id: true },
+      })
+      for (const orphan of orphans) {
+        await db.draft.update({
+          where: { id: orphan.id },
+          data: { status: 'closed', statusReason: refusal.reason },
+        })
+        await writeAudit(db, {
+          actorType: 'system',
+          actorId: 'draft-composer',
+          action: 'draft.closed',
+          subjectType: 'Draft',
+          subjectId: orphan.id,
+          metadata: { companyId: company.id, contactId: contact.id, reason: refusal.reason, detail: refusal.detail },
+        })
+        out.draftsClosed.push({
+          draftId: orphan.id,
+          companyName: company.displayName,
+          reason: refusal.reason,
+          detail: refusal.detail,
+        })
+      }
+    }
 
     if (slots.length === 0) {
       // No VERIFIED contact — but the predicate still gets asked, because the two

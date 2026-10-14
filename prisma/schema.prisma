@@ -1024,12 +1024,15 @@ model SendAttempt {
   /// copied from the `Draft` it transmits.
   ///
   /// D3 gave a company exactly one first touch per cycle. The operator's F4 §10.7
-  /// decision is one for a small company and two for a larger one ("keep it 1 per
-  /// small company and 2 for a decent one"), so the company-level partial unique
-  /// index is keyed on this column instead of being dropped: the database still
-  /// caps the company, it just caps it at the number of slots rather than at one.
-  /// `src/outreach/draft/slots.ts` decides the value (teamSize >= 100 -> 2 slots,
-  /// unknown -> 1) and only 0 and 1 are ever allocated.
+  /// decision was one for a small company and two for a larger one, so the
+  /// company-level partial unique index is keyed on this column instead of being
+  /// dropped: the database caps each SLOT at one first touch per cycle.
+  ///
+  /// F6 step 1 replaced the slot count itself — the operator chose one message per
+  /// eligible contact, with no company ceiling ("send them individually") — so this
+  /// index no longer bounds a company, and `slots.ts` allocates 0..n-1 rather than
+  /// only 0 and 1. What still bounds a company is the number of contacts that pass
+  /// `contactSlotRefusal`; what still bounds a PERSON is A2's per-contact index.
   ///
   /// A2's per-CONTACT index is untouched by this: one first touch per human per
   /// cycle regardless of track is the invariant A2 exists for.

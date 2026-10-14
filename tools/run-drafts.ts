@@ -51,6 +51,16 @@ const onlyCompanies = {
   ...(draftIds.length > 0 ? { id: { in: draftIds } } : {}),
 }
 
+/**
+ * The drafts --queue, --drain and --gate work on.
+ *
+ * `approvedAt: null` alone was enough until F6 step 1 gave the composer a reason to
+ * END a draft without a send: a contact whose title the slot policy now refuses is
+ * closed, never approved, and must not be queued for an LLM task or gated as if it
+ * were still going out.
+ */
+const pending = { approvedAt: null, status: { not: 'closed' as const }, ...onlyCompanies }
+
 // Stated on every run rather than assumed. Sending needs two independent factors and
 // this build has neither: MILESTONE_STAGE is a source constant a reviewed commit
 // changes, not an environment variable.
@@ -122,6 +132,10 @@ if (!has('--gate') && !has('--drain')) {
   for (const d of out.drafts) {
     console.log(`    ${d.companyName.padEnd(18)} slot ${d.touchSlot}  ${d.outreachCase.padEnd(28)} ${d.contactEmail}`)
   }
+  if (out.draftsClosed.length > 0) {
+    console.log(`\n  closed ${out.draftsClosed.length} draft(s) whose contact may no longer be written to:`)
+    for (const d of out.draftsClosed) console.log(`    ${d.companyName.padEnd(18)} ${d.reason}  ${d.detail}`)
+  }
   if (out.refusals.length > 0) {
     console.log(`\n  refused ${out.refusals.length}:`)
     const byReason = out.refusals.reduce<Record<string, number>>((a, r) => {
@@ -133,7 +147,7 @@ if (!has('--gate') && !has('--drain')) {
 }
 
 if (has('--queue')) {
-  const drafts = await db.draft.findMany({ where: { approvedAt: null, ...onlyCompanies }, select: { id: true } })
+  const drafts = await db.draft.findMany({ where: pending, select: { id: true } })
   let queued = 0
   const skipped: Record<string, number> = {}
   for (const d of drafts) {
@@ -148,7 +162,7 @@ if (has('--queue')) {
 
 if (has('--drain')) {
   const scoped = new Set(
-    (await db.draft.findMany({ where: { approvedAt: null, ...onlyCompanies }, select: { id: true } })).map((d) => d.id),
+    (await db.draft.findMany({ where: pending, select: { id: true } })).map((d) => d.id),
   )
   const tasks = (await latestFulfilledDraftTasks(db)).filter((t) => scoped.has(t.subjectId))
   let merged = 0
@@ -162,7 +176,7 @@ if (has('--drain')) {
 
 if (has('--gate') || has('--drain')) {
   const drafts = await db.draft.findMany({
-    where: { approvedAt: null, ...onlyCompanies },
+    where: pending,
     select: { id: true, lead: { select: { company: { select: { displayName: true } } } } },
   })
   let passed = 0

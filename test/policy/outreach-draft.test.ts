@@ -10,7 +10,7 @@ import { validateComposition, renderBody, type DraftComposition } from '../../sr
 import { renderTemplate, TEMPLATE_IDS } from '../../src/outreach/draft/templates.js'
 import { checkJurisdiction } from '../../src/outreach/draft/jurisdiction.js'
 import { runQualityGate } from '../../src/outreach/draft/quality-gate.js'
-import { selectContactSlots } from '../../src/outreach/draft/slots.js'
+import { contactSlotRefusal, selectContactSlots } from '../../src/outreach/draft/slots.js'
 import { fulfilTask, rejectTask, HandoffLlmGateway } from '../../src/core/llm/handoff-gateway.js'
 import { MODULES, TLDR } from '../../src/outreach/draft/email.js'
 import { resolveSendingEnabled } from '../../src/core/config/config.js'
@@ -794,7 +794,14 @@ describe("the operator's email (outreach_draft@3, F6-EMAIL-SPEC), end to end", (
   async function named(w: Awaited<ReturnType<typeof world>>) {
     const c = await w.db.contact.update({
       where: { id: w.contact!.id },
-      data: { emailNormalized: 'person@acme.example', contactType: 'named_talent', discoveryMethod: 'lookup_provider' },
+      data: {
+        emailNormalized: 'person@acme.example',
+        contactType: 'named_talent',
+        // A named contact needs a published title to take a slot at all (F6 step 1);
+        // this one matches the verdict line in the evidence excerpt below.
+        publicTitle: 'Senior Recruiter',
+        discoveryMethod: 'lookup_provider',
+      },
       select: { evidenceId: true },
     })
     await w.db.evidence.update({
@@ -1217,34 +1224,122 @@ describe('the LLM boundary (docs/handoff-llm-gateway.md)', () => {
   })
 })
 
-describe('§10.7 — one contact per company, or two for a big one', () => {
-  const c = (id: string, contactType: string, verified = true) => ({ id, contactType, verified })
-
-  it('gives a small company one slot', () => {
-    expect(selectContactSlots([c('a', 'careers_alias'), c('b', 'talent_alias')], 40)).toHaveLength(1)
+describe('§10.7 — every eligible contact at a company, and who is eligible', () => {
+  const c = (
+    id: string,
+    contactType: string,
+    extra: { verified?: boolean; email?: string; title?: string | null } = {},
+  ) => ({
+    id,
+    contactType,
+    verified: extra.verified ?? true,
+    emailNormalized: extra.email ?? `careers@${id}.example`,
+    publicTitle: extra.title ?? null,
   })
 
-  it('gives a company at the threshold two', () => {
-    expect(selectContactSlots([c('a', 'careers_alias'), c('b', 'talent_alias')], 100)).toHaveLength(2)
-  })
-
-  it('gives an UNKNOWN team size one, never two', () => {
-    // A missing value is not evidence of a large company, and the failure directions
-    // are not symmetric: one message too many costs the sender's reputation at a
-    // company small enough to notice.
-    expect(selectContactSlots([c('a', 'careers_alias'), c('b', 'talent_alias')], null)).toHaveLength(1)
+  it('gives every eligible contact its own slot, whatever the team size', () => {
+    // The operator's F6 decision replaces the 1-small/2-large rule: "best would be to
+    // send them individually (if Strava has 3 people)".
+    const slots = selectContactSlots([
+      c('a', 'careers_alias'),
+      c('b', 'talent_alias'),
+      c('d', 'named_talent', { email: 'nina@acme.example', title: 'Senior Recruiter' }),
+    ])
+    expect(slots.map((s) => s.touchSlot)).toEqual([0, 1, 2])
   })
 
   it('never selects an unverified contact', () => {
-    expect(selectContactSlots([c('a', 'careers_alias', false)], 500)).toHaveLength(0)
+    expect(selectContactSlots([c('a', 'careers_alias', { verified: false })])).toHaveLength(0)
   })
 
   it('orders by H2 tier: university recruiting, then talent, then careers', () => {
-    const slots = selectContactSlots(
-      [c('a', 'careers_alias'), c('b', 'university_recruiting'), c('c', 'talent_alias')],
-      500,
-    )
-    expect(slots.map((s) => s.contactId)).toEqual(['b', 'c'])
+    const slots = selectContactSlots([c('a', 'careers_alias'), c('b', 'university_recruiting'), c('c', 'talent_alias')])
+    expect(slots.map((s) => s.contactId)).toEqual(['b', 'c', 'a'])
+  })
+
+  it('closes a live draft whose contact no longer takes a slot', async () => {
+    // The order these arrived in matters: 36 drafts were composed, and the title
+    // filter landed afterwards. A refused contact must not leave a draft sitting in
+    // `awaiting_approval` for the operator to approve.
+    const w = await world()
+    await composeDrafts(w.db)
+    const draft = await w.db.draft.findFirstOrThrow({ select: { id: true } })
+    await w.db.draft.update({ where: { id: draft.id }, data: { status: 'awaiting_approval' } })
+
+    await w.db.contact.update({
+      where: { id: w.contact!.id },
+      data: {
+        emailNormalized: 'person@acme.example',
+        contactType: 'named_employee',
+        publicTitle: 'IT Support Specialist',
+      },
+    })
+    const out = await composeDrafts(w.db)
+
+    expect(out.draftsClosed).toHaveLength(1)
+    expect(await w.db.draft.findUniqueOrThrow({ where: { id: draft.id }, select: { status: true, statusReason: true } })).toEqual({
+      status: 'closed',
+      statusReason: 'outreach_not_permitted',
+    })
+  })
+
+  describe('contactSlotRefusal — the title filter (F6 step 1)', () => {
+    const named = (title: string | null) =>
+      c('x', 'named_employee', { email: 'person@acme.example', title })
+
+    it('refuses the titles that were measured in the live draft queue', () => {
+      // Every one of these had a draft in `awaiting_approval` on 2026-10-05.
+      for (const title of [
+        'IT Support Specialist',
+        'Machine Learning Intern',
+        'Website Operations Manager',
+        'Deployment Lead',
+      ]) {
+        expect(contactSlotRefusal(named(title))).toMatchObject({ reason: 'outreach_not_permitted' })
+        expect(selectContactSlots([named(title)])).toHaveLength(0)
+      }
+    })
+
+    it('allows recruiting and engineering titles', () => {
+      for (const title of [
+        'Senior Recruiter',
+        'Talent Acquisition Specialist',
+        'Recruiting Lead',
+        'Senior Talent Partner',
+        // "People Operations" is the HR function: the recruiting check runs BEFORE the
+        // `operations` exclusion precisely so this is not refused.
+        'People Operations Manager',
+        'Engineering Manager',
+        'Senior Software Engineer',
+        'Applied AI Lead',
+        'iOS Developer',
+      ]) {
+        expect(contactSlotRefusal(named(title))).toBeNull()
+      }
+    })
+
+    it('fails closed on a title it does not recognise, and on no title at all', () => {
+      expect(contactSlotRefusal(named('Barista'))).toMatchObject({ reason: 'outreach_not_permitted' })
+      expect(contactSlotRefusal(named(null))).toMatchObject({ reason: 'outreach_not_permitted' })
+    })
+
+    it('judges a ROLE ALIAS on its local part, never on its title text', () => {
+      // A page-published alias's `publicTitle` holds whatever text sat beside the
+      // address, which is not a job title. Measured: May Mobility's was `"email":"`.
+      expect(
+        contactSlotRefusal(c('m', 'careers_alias', { email: 'careers@acme.example', title: '"email":"' })),
+      ).toBeNull()
+    })
+
+    it('refuses a generic company inbox as a recruiting route', () => {
+      for (const email of ['hello@acme.example', 'info@acme.example', 'contact@acme.example', 'team@acme.example']) {
+        expect(contactSlotRefusal(c('g', 'careers_alias', { email }))).toMatchObject({
+          reason: 'no_public_recruiting_route',
+        })
+      }
+      // A real careers route at the same company still passes.
+      expect(contactSlotRefusal(c('g', 'careers_alias', { email: 'careers@acme.example' }))).toBeNull()
+    })
   })
 })
 
