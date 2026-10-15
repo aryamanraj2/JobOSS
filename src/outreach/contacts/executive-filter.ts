@@ -1,24 +1,7 @@
-/**
- * `handover.md` §1.1, enforced.
- *
- * > *Never target CEOs, founders, executives, or generic employee lists by default.*
- *
- * The operator's F4 scope note broadened the contact policy to permit **named
- * employees at any level** — and explicitly kept this exclusion: *"except founders,
- * CEOs, C-suite, VPs"*. So this filter is not a leftover from a narrower era; it is
- * the boundary of the amendment, and it now does more work than it used to rather
- * than less.
- *
- * Two properties it is built for:
- *
- * **It fails closed on ambiguity.** A title it cannot parse is not waved through. The
- * cost of a false negative is mailing a founder, which is the single behaviour
- * `handover.md` §1 names first; the cost of a false positive is one contact skipped
- * out of a target set of two thousand.
- *
- * **It reads the local part as well as the title**, because a careers page often
- * publishes `founders@` or `ceo@` with no title text at all, and a filter that only
- * looked at titles would pass those straight through.
+/** Historical title/local-part classifier, retained for @1-@4 compatibility.
+ * This is descriptive, not a targeting exclusion. JOBOSS permits supported founders,
+ * technical leaders, engineers and recruiting contacts through recipientSuitability
+ * and current recipientState evidence checks.
  */
 
 /**
@@ -97,7 +80,7 @@ export type ExecutiveVerdict =
   | { isExecutive: true; matched: string; where: 'title' | 'local' }
 
 /**
- * Whether this contact is an executive and must therefore never be stored as a target.
+ * Whether this contact has a historically executive title or local part. This alone is not a refusal.
  *
  * `title` may be null — a page that publishes an address with no role text at all —
  * in which case the local part is the only signal and is checked alone.

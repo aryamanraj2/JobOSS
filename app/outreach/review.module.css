@@ -1,0 +1,8 @@
+.queue {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+.queue article { margin-bottom: 0; overflow-wrap: anywhere; }
+@media (max-width: 760px) { .queue { grid-template-columns: 1fr; } }

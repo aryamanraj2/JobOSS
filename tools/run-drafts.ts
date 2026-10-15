@@ -8,8 +8,8 @@
  * this project reach a live source, and this is not one of them.
  *
  *   npm run drafts:run                 compose drafts for qualified leads that have none yet
- *   npm run drafts:run -- --recompose  ALSO rewrite existing unapproved drafts (drops their
- *                                      written text until the next --drain)
+ *   npm run drafts:run -- --prepare --company-id <id> --upgrade-existing
+ *                                     create/resume a new @5 revision; preserve earlier drafts
  *   npm run drafts:run -- --limit 5    a first look
  *   npm run drafts:run -- --company Strava --company Linear ...
  *                                      every step below, for these companies only
@@ -31,6 +31,9 @@ import { resolveSendingEnabled } from '../src/core/config/config.js'
 import { composeDrafts, gateDraft } from '../src/outreach/draft/compose.js'
 import { queueOutreachDraft, applyOutreachDraft, latestFulfilledDraftTasks } from '../src/outreach/draft/queue-draft.js'
 import { approveDraft, revokeApproval } from '../src/outreach/draft/approve.js'
+import { prepareOutreachDrafts } from '../src/outreach/draft/prepare.js'
+import { reviewAction } from '../src/outreach/review/actions.js'
+import { outreachReviewQueue } from '../src/outreach/review/queue.js'
 import { formatDraftForReview } from '../src/outreach/draft/review.js'
 
 const args = process.argv.slice(2)
@@ -70,6 +73,11 @@ console.log(`\nMILESTONE_STAGE=${MILESTONE_STAGE} · sending ${sending.enabled ?
 const approveId = val('--approve')
 if (approveId) {
   const by = val('--by') ?? 'operator'
+  const target = await db.draft.findUnique({ where: { id: approveId }, select: { promptVersion: true } })
+  if (target?.promptVersion === 'outreach_draft@5') {
+    const result = await reviewAction(db, { draftId: approveId, snapshot: val('--snapshot') ?? '', by, action: 'approve' })
+    console.log(result.detail); await disconnectPrisma(); process.exit(result.ok ? 0 : 1)
+  }
   const result = await approveDraft(db, approveId, by)
   if (result.ok) {
     console.log(`  approved ${approveId}`)
@@ -87,6 +95,11 @@ if (approveId) {
 const revokeId = val('--revoke')
 if (revokeId) {
   const by = val('--by') ?? 'operator'
+  const target = await db.draft.findUnique({ where: { id: revokeId }, select: { promptVersion: true } })
+  if (target?.promptVersion === 'outreach_draft@5') {
+    const result = await reviewAction(db, { draftId: revokeId, snapshot: val('--snapshot') ?? '', by, action: 'revoke' })
+    console.log(result.detail); await disconnectPrisma(); process.exit(result.ok ? 0 : 1)
+  }
   const result = await revokeApproval(db, revokeId, by)
   if (result.ok) {
     console.log(`  revoked ${revokeId} (was ${result.revokedHash?.slice(0, 12) ?? 'no hash'}…) -> composing`)
@@ -98,7 +111,20 @@ if (revokeId) {
   process.exit(result.ok ? 0 : 1)
 }
 
+if (has('--prepare') || has('--recompose')) {
+  const ids = repeated('--company-id')
+  const named = companyNames.length ? await db.company.findMany({ where: { displayName: { in: companyNames } }, select: { id: true } }) : []
+  if (!ids.length && !named.length) throw new Error('Select --company-id or --company for bounded @5 preparation.')
+  const out = await prepareOutreachDrafts(db, { companyIds: [...ids, ...named.map((c) => c.id)], limit: Number(val('--limit') ?? 20),
+    upgradeExisting: has('--upgrade-existing') || has('--recompose'), ...(val('--revision-of') ? { reviseDraftId: val('--revision-of')! } : {}), ...(val('--campaign-cycle') ? { campaignCycle: val('--campaign-cycle')! } : {}) })
+  console.log(JSON.stringify(out, null, 2)); console.log('Review at /outreach. Manual tasks only; nothing approved or sent.')
+  await disconnectPrisma(); process.exit(0)
+}
+
 if (has('--review')) {
+  const reviews = await outreachReviewQueue(db)
+  for (const row of reviews) console.log(`${row.company.name} · ${row.state} · ${row.readiness.detail}\nDraft ${row.draft.id} · snapshot ${row.snapshot}\n/outreach/${row.draft.id}\n`)
+
   const drafts = await db.draft.findMany({
     where: { status: 'awaiting_approval', ...onlyCompanies },
     orderBy: { createdAt: 'asc' },
@@ -147,11 +173,12 @@ if (!has('--gate') && !has('--drain')) {
 }
 
 if (has('--queue')) {
-  const drafts = await db.draft.findMany({ where: pending, select: { id: true } })
+  const drafts = await db.draft.findMany({ where: pending, select: { id: true, promptVersion: true, composition: true } })
   let queued = 0
   const skipped: Record<string, number> = {}
   for (const d of drafts) {
-    const r = await queueOutreachDraft(db, d.id)
+    const v5 = d.promptVersion === 'outreach_draft@5' || (d.composition as { layout?: string } | null)?.layout === 'v5'
+    const r = await queueOutreachDraft(db, d.id, v5 ? 'outreach_draft@5' : 'outreach_draft@4')
     if (r.queued) queued += 1
     else skipped[r.reason] = (skipped[r.reason] ?? 0) + 1
   }

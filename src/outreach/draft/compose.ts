@@ -20,8 +20,11 @@ import { renderTemplate, TEMPLATE_IDS, type TemplateVars } from './templates.js'
 import { GATE_VERSION, runQualityGate } from './quality-gate.js'
 import { INTRO, WINDOW, type PitchSentence } from './pitch.js'
 import { recipientFirstName } from './greeting.js'
-import { isBoundEvidenceInScope, partitionEvidenceByScope } from './evidence-scope.js'
-import { draftSupportStatus, queueDraftSupport } from './support.js'
+import { partitionEvidenceByScope } from './evidence-scope.js'
+import { queueDraftSupport } from './support.js'
+import { lockDMutation } from '../review/locks.js'
+import { isStandaloneDatabaseClient } from '../../core/joboss/database-scope.js'
+import { evaluateOutreachReadiness } from '../review/readiness.js'
 
 /**
  * The composer — F4's payload, and the milestone where three mechanisms that have
@@ -545,6 +548,11 @@ export async function gateDraft(
   draftId: string,
   now: Date = new Date(),
 ): Promise<{ ok: boolean; reason: ReasonCodeValue | null; detail: string }> {
+  const version = await db.draft.findUnique({ where: { id: draftId }, select: { promptVersion: true } })
+  if (version?.promptVersion === 'outreach_draft@5') {
+    if (isStandaloneDatabaseClient(db)) return db.$transaction((tx) => gateDraft(tx, draftId, now), { timeout: 30_000 })
+    await lockDMutation(db)
+  }
   const draft = await db.draft.findUniqueOrThrow({
     where: { id: draftId },
     select: {
@@ -554,12 +562,22 @@ export async function gateDraft(
       composition: true,
       approvedAt: true,
       promptVersion: true,
+      status: true,
       contact: { select: { id: true, companyId: true, contactType: true, identityVerifiedAt: true, verified: true, status: true, emailNormalized: true, publicTitle: true } },
       citedEvidenceIds: true,
       lead: { select: { company: { select: { id: true, displayName: true, canonicalDomain: true, atsSlug: true, atsBoardToken: true, atsOwnershipEvidenceId: true, atsOwnershipVerifiedAt: true } } } },
     },
   })
 
+  if (draft.promptVersion === 'outreach_draft@5') {
+    if (!draft.approvedAt && draft.status !== 'closed') await queueDraftSupport(db, draft.id)
+    const result = await evaluateOutreachReadiness(db, draft.id, now)
+    if (!draft.approvedAt && draft.status !== 'closed') await db.draft.update({ where: { id: draft.id }, data: {
+      status: result.ready ? 'awaiting_approval' : 'quality_gate', statusReason: result.ready ? null : 'weak_evidence',
+      gateResult: { version: 'outreach-readiness@2', passed: result.ready, detail: result.detail },
+    } })
+    return { ok: result.ready, reason: result.ready ? null : 'weak_evidence', detail: result.detail }
+  }
   if (draft.approvedAt) return { ok: true, reason: null, detail: 'already approved; frozen' }
 
   const validated = await validateComposition(db, draft.composition, TEMPLATE_IDS)
@@ -585,9 +603,7 @@ export async function gateDraft(
     where: { id: { in: draft.citedEvidenceIds } },
     select: { id: true, sourceUrl: true, companyId: true, contactId: true },
   })
-  const person = draft.promptVersion === 'outreach_draft@5' && draft.contact ? await db.contactResearch.findUnique({ where: { contactId: draft.contact.id } }) : null
-  const personVerified = Boolean(person?.identityStatus === 'verified' && person.verifiedAt && person.companyId === draft.lead.company.id && draft.contact?.companyId === draft.lead.company.id && draft.contact.identityVerifiedAt)
-  const foreign = draft.promptVersion === 'outreach_draft@5' ? cited.filter((row) => !isBoundEvidenceInScope(row, { ...draft.lead.company, companyId: draft.lead.company.id, contactId: draft.contact?.id, verifiedPersonEvidenceIds: new Set(personVerified ? person!.citedEvidenceIds : []) }, row.id)) : partitionEvidenceByScope(cited, draft.lead.company.canonicalDomain).foreign
+  const foreign = partitionEvidenceByScope(cited, draft.lead.company.canonicalDomain).foreign
   if (foreign.length > 0) {
     await db.draft.update({
       where: { id: draftId },
@@ -609,21 +625,6 @@ export async function gateDraft(
       ok: false,
       reason: 'weak_evidence',
       detail: `foreign_evidence: cites rows about another company (${foreign.map((e) => e.sourceUrl).slice(0, 2).join(', ')})`,
-    }
-  }
-
-  if (draft.promptVersion === 'outreach_draft@5') {
-    const assessment = await db.outreachAssessment.findUnique({ where: { companyId: draft.lead.company.id } })
-    const ready = assessment?.status === 'draft_ready' && (assessment.fit as { supported?: boolean } | null)?.supported && assessment.selectedContactId === draft.contact?.id && draft.contact?.verified && draft.contact.status === 'active' && contactSlotRefusal(draft.contact) === null && (!draft.contact.contactType.startsWith('named') || personVerified)
-    if (!ready) {
-      await db.draft.update({ where: { id: draft.id }, data: { status: 'gate_failed', statusReason: 'weak_evidence', gateResult: { version: 'outreach-readiness@1', passed: false, detail: 'Supported fit, suitable verified route and recipient identity must be ready.' } } })
-      return { ok: false, reason: 'weak_evidence', detail: 'Outreach readiness is incomplete.' }
-    }
-    await queueDraftSupport(db, draft.id)
-    const support = await draftSupportStatus(db, draft)
-    if (!support.supported) {
-      await db.draft.update({ where: { id: draft.id }, data: { status: 'quality_gate', statusReason: 'weak_evidence', gateResult: { version: 'draft-support@1', passed: false, detail: support.detail, taskId: support.taskId ?? null } } })
-      return { ok: false, reason: 'weak_evidence', detail: support.detail }
     }
   }
 

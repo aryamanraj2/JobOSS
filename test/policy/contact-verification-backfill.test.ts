@@ -5,7 +5,6 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import { importContacts } from '../../src/outreach/contacts/import.js'
 import {
   BACKFILL_ACTION,
-  RETIRE_ACTION,
   backfillProviderVerification,
   readProviderVerdict,
 } from '../../src/outreach/contacts/verify-backfill.js'
@@ -158,46 +157,23 @@ describe('backfillProviderVerification', () => {
     expect(await testDb().auditLog.count({ where: { action: BACKFILL_ACTION } })).toBe(1)
   })
 
-  it('re-runs the executive filter first: a refused row is retired, never verified', async () => {
-    // The widened filter now refuses this title at import, so the row is planted the
-    // way the pre-F6 importer left it: imported under a title it passed, then carrying
-    // the one the old rule missed.
+  it('keeps an unsuitable commercial candidate visible and unverified without retiring it', async () => {
     await legacyImport('acme.com,sonal@acme.com,S S,Recruiter,named_talent,snov,,,valid')
-    await testDb().contact.updateMany({ data: { publicTitle: 'Head -Talent Acquisition' } })
-
+    await testDb().contact.updateMany({ data: { publicTitle: 'IT Asset Manager' } })
     const dry = await backfillProviderVerification(testDb(), { operator: 'op' })
-    expect(dry).toMatchObject({ flips: 0, executives: 1 })
-    expect((await testDb().contact.findFirstOrThrow()).status).toBe('active')
-
+    expect(dry).toMatchObject({ flips: 0, executives: 0 })
+    expect(dry.rows[0]?.verdict).toBe('REFUSED:unsuitable')
     await backfillProviderVerification(testDb(), { operator: 'op', dryRun: false })
-    const contact = await testDb().contact.findFirstOrThrow()
-    expect(contact).toMatchObject({ verified: false, status: 'retired' })
-    const audit = await testDb().auditLog.findFirstOrThrow({ where: { action: RETIRE_ACTION } })
-    expect(audit).toMatchObject({ subjectId: contact.id, reasonCode: 'executive_only_contact' })
-    // §1.1: the refused address is not copied into the audit trail.
-    expect(JSON.stringify(audit.metadata)).not.toContain('sonal')
+    expect(await testDb().contact.findFirst()).toMatchObject({ verified: false, status: 'active' })
+    expect(await testDb().auditLog.count({ where: { action: 'contact.retired_executive' } })).toBe(0)
   })
 
-  it('re-importing a retired contact never revives it, and never creates a second row', async () => {
+  it('re-importing a deliberately retired contact never revives or duplicates it', async () => {
     await legacyImport('acme.com,sonal@acme.com,S S,Recruiter,named_talent,snov,,,valid')
-    await testDb().contact.updateMany({ data: { publicTitle: 'Head -Talent Acquisition' } })
+    await testDb().contact.updateMany({ data: { publicTitle: 'Head -Talent Acquisition', status: 'retired' } })
     await backfillProviderVerification(testDb(), { operator: 'op', dryRun: false })
-
-    // Under the title the filter refuses: refused at the door, row untouched.
-    const asExec = await importContacts(
-      testDb(),
-      csv('acme.com,sonal@acme.com,S S,Head -Talent Acquisition,named_talent,snov,,,valid'),
-      OPTS,
-    )
-    expect(asExec.counts.executive).toBe(1)
-    // Under a title it would pass: the address already exists, so nothing is written.
-    const asBenign = await importContacts(
-      testDb(),
-      csv('acme.com,sonal@acme.com,S S,Recruiter,named_talent,snov,,,valid'),
-      OPTS,
-    )
-    expect(asBenign.counts.already_present).toBe(1)
-
+    const again = await importContacts(testDb(), csv('acme.com,sonal@acme.com,S S,Recruiter,named_talent,snov,,,valid'), OPTS)
+    expect(again.counts.already_present).toBe(1)
     const rows = await testDb().contact.findMany({ where: { emailNormalized: 'sonal@acme.com' } })
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({ status: 'retired', verified: false, publicTitle: 'Head -Talent Acquisition' })

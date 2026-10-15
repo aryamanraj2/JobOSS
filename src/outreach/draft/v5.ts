@@ -4,6 +4,8 @@ import { validateEmailV4 } from './email.js'
 
 export type OutreachDraftV5 = OutreachDraftResponseV4 & { personHook?: { text: string; evidenceIds: string[]; contactId: string } }
 
+export const isPersonAttribution = (text: string) => /\byou(?:'ve| have)?\s+(?:built|led|created|designed|developed|authored|wrote|published)\b|\byour (?:article|talk|work|post|research)\b/i.test(text)
+
 export function validatePersonHook(
   hook: NonNullable<OutreachDraftV5['personHook']>,
   target: { companyId: string; contactId: string; identityVerified: boolean },
@@ -15,6 +17,11 @@ export function validatePersonHook(
   const rows = new Map(evidence.map((row) => [row.id, row]))
   if (hook.evidenceIds.length === 0 || hook.evidenceIds.some((id) => rows.get(id)?.companyId !== target.companyId || rows.get(id)?.contactId !== target.contactId)) errors.push('Person hook cites evidence bound to another company or person.')
   const attributedWork = /\b(built|led|lead|created|designed|developed|authored|wrote|published|your (?:article|talk|work|post|research))\b/i.test(hook.text)
+  const responsibility = hook.text.match(/\b(built|led|created|designed|developed)\b/i)?.[1]
+  if (responsibility) {
+    const explicit = new RegExp(`\\bI\\s+${responsibility}\\b`, 'i')
+    if (!hook.evidenceIds.some((id) => explicit.test(rows.get(id)?.excerpt ?? ''))) errors.push('Product responsibility needs an explicit first-person work statement; an article byline alone does not prove built or led.')
+  }
   if (attributedWork) {
     const authored = new Set(hooks.filter((row) => row.authorshipVerified).flatMap((row) => row.evidenceIds))
     if (hook.evidenceIds.some((id) => !authored.has(id))) errors.push('Person work attribution lacks verified authorship evidence.')

@@ -115,39 +115,15 @@ const db = prisma()
   })
 }
 
-// 4. The executive filter, run against every stored contact.
-//
-// The intent is "no executive is TARGETABLE", not "no executive row is stored" — F6
-// deviation (F7-HANDOVER §4): the F6 backfill re-ran a widened filter and RETIRED the one
-// row it newly refused, keeping the record rather than deleting it. So a flagged contact
-// passes only when it is `retired` AND carries its retirement audit row. Every other
-// status fails, `suppressed` included: suppression is a decision about the recipient's
-// wishes or a bounce, not about §1.1, and must not stand in for it.
+// 4. Responsibility, route and person research replace the old blanket executive ban.
 {
-  const { isExecutiveContact } = await import('../src/outreach/contacts/executive-filter.js')
-  const { RETIRE_ACTION } = await import('../src/outreach/contacts/verify-backfill.js')
-  const contacts = await db.contact.findMany({ select: { id: true, emailNormalized: true, publicTitle: true, status: true } })
-  const executives = contacts.filter((c) => isExecutiveContact(c.emailNormalized, c.publicTitle).isExecutive)
-  const retiredWithAudit = new Set(
-    (
-      await db.auditLog.findMany({
-        where: { action: RETIRE_ACTION, subjectType: 'Contact', subjectId: { in: executives.map((c) => c.id) } },
-        select: { subjectId: true },
-      })
-    ).map((a) => a.subjectId),
-  )
-  const targetable = executives.filter((c) => c.status !== 'retired')
-  const unaudited = executives.filter((c) => c.status === 'retired' && !retiredWithAudit.has(c.id))
-  checks.push({
-    name: 'No founder/CEO/executive contact is targetable (§1.1)',
-    ok: targetable.length === 0 && unaudited.length === 0,
-    detail:
-      `${contacts.length} stored contact(s), ${executives.length} flagged by the filter: ` +
-      `${executives.length - targetable.length - unaudited.length} retired with a ${RETIRE_ACTION} audit row, ` +
-      `${unaudited.length} retired WITHOUT one, ${targetable.length} NOT retired` +
-      (targetable.length ? ` (statuses: ${targetable.map((c) => c.status).join(',')})` : '') +
-      ` — §1.1 is the boundary of the operator's F4 amendment and was NOT amended`,
-  })
+  const { recipientState } = await import('../src/outreach/contacts/verification.js')
+  const drafts = await db.draft.findMany({ where: { promptVersion: 'outreach_draft@5', status: { in: ['awaiting_approval', 'approved'] } }, include: { contact: true, lead: { include: { company: true } } } })
+  const invalid: string[] = []
+  for (const draft of drafts) {
+    if (!draft.contact || !(await recipientState(db, draft.contact, draft.lead.company.canonicalDomain, new Date())).ready) invalid.push(draft.id)
+  }
+  checks.push({ name: 'Reviewed @5 recipients have supported responsibility and current route/identity', ok: invalid.length === 0, detail: `${drafts.length} reviewed @5 drafts; ${invalid.length} recipients need research.` })
 }
 
 // 5. Unverified contacts open no outreach case.

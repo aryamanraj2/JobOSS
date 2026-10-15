@@ -37,14 +37,10 @@ import { CONTACT_IMPORT_COLUMNS, providerAttestsDeliverable } from './import.js'
  * would be a second provenance record for one fact. A dry run writes nothing at all,
  * audit rows included — the importer's rule.
  *
- * ## The executive filter runs again, first
- *
- * These rows passed `isExecutiveContact` at import, but F6 widened its "head of" rule
- * after a provider export wrote "Head -Talent Acquisition". Verifying a contact is the
- * step that lets a draft reach them, so the filter as it stands TODAY decides, not the
- * filter as it stood when the row arrived. A refused row is never flipped; on `--write`
- * it is set `retired` with an audit row naming the rule. Its address is not put in the
- * audit row, for `import.ts`'s reason: §1.1 says never target them.
+ * ## Responsibility and stops
+ * Unsuitable or ambiguous responsibilities remain visible and unverified. Founders
+ * and technical/recruiting leaders are not blanket-excluded. No contact is retired
+ * solely for seniority, and deliberately stopped contacts are never revived.
  */
 
 /** The header the importer's rows were written under, verdict column last. */

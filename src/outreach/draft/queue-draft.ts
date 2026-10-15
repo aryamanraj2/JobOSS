@@ -1,3 +1,4 @@
+import { isStandaloneDatabaseClient } from '../../core/joboss/database-scope.js'
 import { Prisma } from '../../../generated/prisma/client.js'
 import type { Db } from '../../core/audit/audit-log.js'
 import { writeAudit } from '../../core/audit/audit-log.js'
@@ -21,7 +22,12 @@ import {
 import { renderTemplate, TEMPLATE_IDS } from './templates.js'
 import { isBoundEvidenceInScope, partitionEvidenceByScope } from './evidence-scope.js'
 import { validateEmailV5, type OutreachDraftV5 } from './v5.js'
-import type { PersonFact } from '../contacts/prepare.js'
+import { supportSnapshot } from '../review/snapshot.js'
+import { currentCompanyContext } from '../review/context.js'
+import { recipientState, personFacts } from '../contacts/verification.js'
+import { fixedCandidateV5, fixedCandidateV5Error, FIXED_V5_KEYS } from './fixed-v5.js'
+import { listedRoleContextV5, listedRoleContextV5Error, listedRoleEvidenceV5 } from './role-v5.js'
+import { lockDMutation } from '../review/locks.js'
 import { queueDraftSupport } from './support.js'
 import { INTRO, WINDOW } from './pitch.js'
 import { MAX_WORDS, MAX_WORDS_V4, MODULES, PROJECT_LINKS, RESUME_LABEL, TLDR, validateEmail, validateEmailV4 } from './email.js'
@@ -142,13 +148,18 @@ export const INSTRUCTIONS_V5 = INSTRUCTIONS_V4.split('\n').filter((line) => !lin
 
 export type QueueDraftOutcome =
   | { queued: true; taskId: string; created: boolean; evidenceCount: number }
-  | { queued: false; reason: 'unknown_draft' | 'approved' | 'no_evidence' }
+  | { queued: false; reason: 'unknown_draft' | 'approved' | 'no_evidence' | 'work_changed' | 'recipient_unready' }
 
 export async function queueOutreachDraft(
   db: Db,
   draftId: string,
   promptVersion: 'outreach_draft@3' | 'outreach_draft@4' | 'outreach_draft@5' = OUTREACH_DRAFT_PROMPT_VERSION,
+  now: Date = new Date(),
 ): Promise<QueueDraftOutcome> {
+  if (promptVersion === 'outreach_draft@5') {
+    if (isStandaloneDatabaseClient(db)) return db.$transaction((tx) => queueOutreachDraft(tx, draftId, promptVersion, now), { timeout: 30_000 })
+    await lockDMutation(db)
+  }
   const draft = await db.draft.findUnique({
     where: { id: draftId },
     select: {
@@ -158,6 +169,8 @@ export async function queueOutreachDraft(
       lead: {
         select: {
           id: true,
+          leadKind: true,
+          opportunityId: true,
           score: true,
           primaryTrack: true,
           primaryTrackReason: true,
@@ -175,6 +188,17 @@ export async function queueOutreachDraft(
   // to mutate it puts a task in the operator's queue with nowhere to land.
   if (draft.approvedAt !== null) return { queued: false, reason: 'approved' }
 
+  const work = promptVersion === 'outreach_draft@5' ? await supportSnapshot(db, draftId) : null
+  if (work) {
+    if (!work.draft.contact) return { queued: false, reason: 'recipient_unready' }
+    const state = await recipientState(db, work.draft.contact, work.company.canonicalDomain, now)
+    if (!state.ready) return { queued: false, reason: 'recipient_unready' }
+    const previous = await db.llmTask.findFirst({ where: { kind: 'outreach_draft', promptVersion, subjectId: draft.id, status: { in: ['pending', 'claimed', 'fulfilled'] } }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] })
+    if (previous) {
+      if ((previous.input as { workSnapshot?: string }).workSnapshot !== work.hash) return { queued: false, reason: 'work_changed' }
+      return { queued: true, taskId: previous.id, created: false, evidenceCount: previous.allowedEvidenceIds.length }
+    }
+  }
   const company = draft.lead.company
   const person = promptVersion === 'outreach_draft@5' && draft.contact ? await db.contactResearch.findUnique({ where: { contactId: draft.contact.id } }) : null
   const personVerified = Boolean(person?.identityStatus === 'verified' && person.verifiedAt && person.companyId === company.id && draft.contact?.companyId === company.id && draft.contact.identityVerifiedAt)
@@ -211,7 +235,11 @@ export async function queueOutreachDraft(
   const contacts = await db.contact.findMany({ where: { companyId: company.id }, select: { emailNormalized: true } })
   const addresses = contacts.map((c) => c.emailNormalized.toLowerCase())
   const personalEvidence = personVerified ? await db.evidence.findMany({ where: { id: { in: [...personEvidenceIds] }, companyId: company.id, contactId: draft.contact!.id }, select }) : []
-  const candidateEvidence = [...new Map([...personalEvidence, ...pages, ...rest].map((e) => [e.id, e])).values()]
+  const current = promptVersion === 'outreach_draft@5' ? await currentCompanyContext(db, company.id, now) : null
+  const intendedRole = current?.currentRoles.find((o) => o.id === draft.lead.opportunityId)
+  const roleEvidence = intendedRole && current ? listedRoleEvidenceV5(intendedRole, current.currentEvidence) : []
+  const candidateEvidence = [...new Map([...roleEvidence, ...personalEvidence, ...pages, ...rest].map((e) => [e.id, e])).values()]
+    .filter((e) => !current || current.currentEvidence.some((row) => row.id === e.id))
     .filter((e) => !addresses.some((a) => e.excerpt.toLowerCase().includes(a)))
     .slice(0, MAX_DRAFT_EVIDENCE)
 
@@ -220,7 +248,7 @@ export async function queueOutreachDraft(
   // Greenhouse board token `tempo` — see evidence-scope.ts. Offering those excerpts
   // would invite a confident, verifiably-sourced sentence about the wrong company.
   const scoped = promptVersion === 'outreach_draft@5'
-    ? { inScope: candidateEvidence.filter((e) => isBoundEvidenceInScope(e, { ...company, companyId: company.id, contactId: draft.contact?.id, verifiedPersonEvidenceIds: personEvidenceIds }, e.id)), foreign: candidateEvidence.filter((e) => !isBoundEvidenceInScope(e, { ...company, companyId: company.id, contactId: draft.contact?.id, verifiedPersonEvidenceIds: personEvidenceIds }, e.id)) }
+    ? { inScope: candidateEvidence.filter((e) => isBoundEvidenceInScope(e, { ...company, companyId: company.id, contactId: draft.contact?.id ?? null, verifiedPersonEvidenceIds: personEvidenceIds }, e.id)), foreign: candidateEvidence.filter((e) => !isBoundEvidenceInScope(e, { ...company, companyId: company.id, contactId: draft.contact?.id ?? null, verifiedPersonEvidenceIds: personEvidenceIds }, e.id)) }
     : partitionEvidenceByScope(candidateEvidence, company.canonicalDomain)
   const { inScope: evidence, foreign } = scoped
   if (foreign.length > 0) {
@@ -246,12 +274,14 @@ export async function queueOutreachDraft(
   }
 
   const common = {
+    ...(work ? { workSnapshot: work.hash } : {}),
     company: {
       name: company.displayName,
       domain: company.canonicalDomain,
       countries: company.countries,
     },
     role: {
+      ...(promptVersion === 'outreach_draft@5' && draft.lead.leadKind === 'posted_role' && draft.lead.opportunity?.title ? { requiredContext: listedRoleContextV5(draft.lead.opportunity.title), evidenceIds: roleEvidence.map((e) => e.id), instruction: 'Start hook with requiredContext verbatim followed by the concrete product problem; cite the current posting and product evidence. This relates the posting to the internship inquiry; do not claim senior qualifications or invent an intern vacancy.' } : {}),
       title: draft.lead.opportunity?.title ?? null,
       location: draft.lead.opportunity?.location ?? null,
     },
@@ -260,9 +290,10 @@ export async function queueOutreachDraft(
       // to know who this goes to, and a payload is a place a page's text also lives.
       contactType: draft.contact?.contactType ?? null,
       publicTitle: draft.contact?.publicTitle ?? null,
-      ...(promptVersion === 'outreach_draft@5' ? { contactId: draft.contact?.id, fullName: draft.contact?.fullName, identityVerified: personVerified, research: personVerified ? { facts: person!.facts, hooks: person!.hooks, limitations: person!.limitations } : null, limitations: personVerified ? person!.limitations : ['Person-specific work unavailable; use a company-specific hook without personal attribution.'] } : {}),
+      ...(promptVersion === 'outreach_draft@5' ? { contactId: draft.contact?.id ?? null, fullName: draft.contact?.fullName, identityVerified: personVerified, research: personVerified ? { facts: person!.facts, hooks: person!.hooks, limitations: person!.limitations } : null, limitations: personVerified ? person!.limitations : ['Person-specific work unavailable; use a company-specific hook without personal attribution.'] } : {}),
     },
     outreachCase: draft.outreachCase,
+    ...(promptVersion === 'outreach_draft@5' ? { opportunityIntent: draft.lead.leadKind === 'posted_role' ? 'listed_role_inquiry' : 'speculative_inquiry', eligibility: current?.assessment.eligibility, instruction: 'For a listed role, describe only the current supplied posting; do not imply an application. For speculative outreach ask whether any internship/role could fit; do not imply a vacancy or work arrangements.' } : {}),
     lead: {
       score: draft.lead.score,
       primaryTrack: draft.lead.primaryTrack,
@@ -302,7 +333,8 @@ export async function queueOutreachDraft(
           layout:
             'TLDR: <tldr> / greeting / intro[, writing after <via>]. <hook> I\'ve been building for exactly that. / ' +
             'each story paragraph / <scene> / window, resume link, ask / sign-off',
-          intro: INTRO.text,
+          intro: promptVersion === 'outreach_draft@5' ? fixedCandidateV5(claims)?.intro.text : INTRO.text,
+          ...(promptVersion === 'outreach_draft@5' ? { window: fixedCandidateV5(claims)?.availability.text } : {}),
           bridge: "I've been building for exactly that.",
           resumeByTrack: RESUME_LABEL,
         },
@@ -412,9 +444,10 @@ export type MergeOutcome =
  * fulfilled last week may cite a claim the operator has since withdrawn.
  */
 export async function applyOutreachDraft(db: Db, taskId: string): Promise<MergeOutcome> {
+  if (isStandaloneDatabaseClient(db)) return db.$transaction((tx) => applyOutreachDraft(tx, taskId), { timeout: 30_000 })
   const task = await db.llmTask.findUnique({
     where: { id: taskId },
-    select: { id: true, kind: true, status: true, output: true, subjectId: true, promptVersion: true },
+    select: { id: true, kind: true, status: true, input: true, output: true, subjectId: true, promptVersion: true },
   })
   if (!task) return { merged: false, reason: 'unknown_task', detail: taskId }
   if (task.kind !== LLM_TASK_KINDS.outreachDraft) {
@@ -422,6 +455,8 @@ export async function applyOutreachDraft(db: Db, taskId: string): Promise<MergeO
   }
   if (task.status !== 'fulfilled') return { merged: false, reason: 'not_fulfilled', detail: task.status }
 
+  if (task.promptVersion === 'outreach_draft@5') await lockDMutation(db)
+  await db.$queryRaw`SELECT id FROM draft WHERE id = ${task.subjectId} FOR UPDATE`
   const draft = await db.draft.findUnique({
     where: { id: task.subjectId },
     select: {
@@ -438,6 +473,24 @@ export async function applyOutreachDraft(db: Db, taskId: string): Promise<MergeO
   const base = draft.composition as DraftComposition | null
   if (!base) return { merged: false, reason: 'no_composition', detail: draft.id }
   if (!task.output) return { merged: false, reason: 'no_output', detail: taskId }
+  if (task.promptVersion === 'outreach_draft@5') {
+    const marker = await db.auditLog.findFirst({ where: { action: 'draft.joboss_prepared', subjectType: 'Draft', subjectId: draft.id } })
+    if (!marker || base.layout !== 'v5') return { merged: false, reason: 'legacy_draft_preserved', detail: 'Only an identifiable JOBOSS @5 revision can receive @5 work.' }
+    if (base.promptVersion === 'outreach_draft@5') return { merged: false, reason: 'already_merged', detail: 'Written revisions are immutable; prepare a new revision to change content.' }
+    const newest = await db.llmTask.findFirst({ where: { kind: 'outreach_draft', subjectId: draft.id }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], select: { id: true } })
+    const current = await supportSnapshot(db, draft.id)
+    if (newest?.id !== task.id || (task.input as { workSnapshot?: string }).workSnapshot !== current.hash) return { merged: false, reason: 'work_changed', detail: 'Task no longer matches current recipient, evidence, claims, resume or revision.' }
+    if (current.draft.status === 'closed') return { merged: false, reason: 'draft_closed', detail: 'The revision is deliberately closed.' }
+    const fixedError = fixedCandidateV5Error(base, current.claims.filter((c) => c.isActive))
+    if (fixedError) return { merged: false, reason: 'candidate_facts_changed', detail: fixedError }
+    if (current.draft.lead.leadKind === 'posted_role') {
+      const role = current.company.opportunities.find((o) => o.id === current.draft.lead.opportunityId)
+      const hook = (task.output as OutreachDraftV5).hook
+      const detail = role && hook ? listedRoleContextV5Error({ ...base, sentences: [llmLine('company', hook)] }, role, current.company.evidence) : 'Listed role context is required in hook.'
+      if (detail) return { merged: false, reason: 'listed_role_context_missing', detail }
+    }
+  }
+
 
   // An answer merges only onto the layout it was written for. Without this, `--drain`
   // after a re-compose would put a draft's older @2 answer onto its new @3 base.
@@ -726,13 +779,16 @@ async function mergeV5(
   if (!merged.ok) return merged
   const limitations = [...(person?.limitations ?? [])]
   if (!answer.personHook) limitations.push('Company-specific hook; verified person-specific work is unavailable or not relevant.')
-  const composition: DraftComposition = { ...merged.composition, layout: 'v5', limitations, sentences: merged.composition.sentences.flatMap((sentence) => sentence.role === 'bridge' && answer.personHook ? [sentence, llmLine('person', answer.personHook)] : [sentence]) }
+  const fixedClaims = await db.approvedClaim.findMany({ where: { key: { in: FIXED_V5_KEYS }, isActive: true } })
+  const fixed = fixedCandidateV5(fixedClaims)
+  if (!fixed) return { ok: false, reason: 'candidate_facts_missing', detail: 'Current approved candidate facts are required.' }
+  const composition: DraftComposition = { ...merged.composition, layout: 'v5', limitations, sentences: merged.composition.sentences.map((s) => s.role === 'intro' ? fixed.intro : s.role === 'availability' ? fixed.availability : s).flatMap((sentence) => sentence.role === 'bridge' && answer.personHook ? [sentence, llmLine('person', answer.personHook)] : [sentence]) }
   const ids = compositionEvidenceIds(composition)
   const [evidence, claims] = await Promise.all([
     db.evidence.findMany({ where: { id: { in: ids } }, select: { id: true, companyId: true, contactId: true, excerpt: true } }),
     db.approvedClaim.findMany({ where: { id: { in: compositionClaimIds(composition) }, isActive: true }, select: { id: true, text: true } }),
   ])
-  const errors = validateEmailV5(answer, { companyId: company.id, companyName: company.displayName, contactId, identityVerified }, { evidence, claims: new Map(claims.map((claim) => [claim.id, claim.text])), hooks: (person?.hooks ?? []) as PersonFact[] }, renderBody(composition))
+  const errors = validateEmailV5(answer, { companyId: company.id, companyName: company.displayName, contactId, identityVerified }, { evidence, claims: new Map(claims.map((claim) => [claim.id, claim.text])), hooks: personFacts(person?.hooks) }, renderBody(composition))
   if (errors.length > 0) return { ok: false, reason: 'email_rules', detail: errors.join('; ') }
   return { ...merged, composition }
 }

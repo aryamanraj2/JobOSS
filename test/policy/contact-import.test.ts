@@ -67,57 +67,33 @@ describe('contact import', () => {
     })
   })
 
-  /**
-   * `handover.md` §1.1 is not amended by this milestone. A lookup provider asked for
-   * "someone at a 12-person startup" returns the founder, because at a 12-person
-   * startup the founder is who it has.
-   */
-  it('refuses an executive by title', async () => {
+  it('keeps a founder candidate without claiming verified identity', async () => {
     await company()
-    const result = await importContacts(
-      testDb(),
-      csv('zomato.com,deepinder@zomato.com,Deepinder G,Co-Founder & CEO,,,,'),
-      OPTS,
-    )
-
-    expect(result.counts.executive).toBe(1)
-    expect(await testDb().contact.count()).toBe(0)
+    const result = await importContacts(testDb(), csv('zomato.com,deepinder@zomato.com,Deepinder G,Co-Founder & CEO,,,,'), OPTS)
+    expect(result.counts.imported).toBe(1)
+    expect(await testDb().contact.findFirst()).toMatchObject({ suitability: 'founder', verified: false, identityVerifiedAt: null })
   })
 
-  it('refuses an executive by local part, with no title text at all', async () => {
+  it('does not infer responsibility from a founder-like local part', async () => {
     await company()
     const result = await importContacts(testDb(), csv('zomato.com,founders@zomato.com,,,,,,'), OPTS)
-    expect(result.counts.executive).toBe(1)
-    expect(await testDb().contact.count()).toBe(0)
+    expect(result.counts.imported).toBe(1)
+    expect(await testDb().contact.findFirst()).toMatchObject({ suitability: 'unknown', verified: false, identityVerifiedAt: null })
   })
 
-  /**
-   * §1.1 says never target them. Recording the address in an audit row so a later
-   * query could find it would keep exactly what the rule says not to keep — the same
-   * decision `curate.ts` makes.
-   */
-  it('does not record a refused executive address anywhere', async () => {
+  it('records candidate provenance without pretending an executive refusal occurred', async () => {
     await company()
     await importContacts(testDb(), csv('zomato.com,ceo@zomato.com,,Chief Executive,,,,'), OPTS)
-
-    const audits = await testDb().auditLog.findMany({ where: { reasonCode: 'executive_only_contact' } })
-    expect(audits.length).toBe(1)
-    expect(JSON.stringify(audits[0]?.metadata)).not.toContain('ceo@zomato.com')
+    expect(await testDb().auditLog.count({ where: { reasonCode: 'executive_only_contact' } })).toBe(0)
+    expect(await testDb().auditLog.count({ where: { action: 'contact.created' } })).toBe(1)
+    expect(await testDb().contact.findFirst()).toMatchObject({ verified: false, identityVerifiedAt: null })
   })
 
-  /**
-   * `tierAYield` counts `contact.refused` rows with no filter on who wrote them, so an
-   * import refusing one founder would move `executivesRejected` in the **Tier A** yield
-   * report — a statistic about what employer pages publish, shifted by a file nobody
-   * fetched.
-   */
-  it('records its refusals under its own action, not the curator\'s', async () => {
+  it('records import refusals separately from employer-page yield', async () => {
     await company()
-    await importContacts(testDb(), csv('zomato.com,ceo@zomato.com,,Chief Executive,,,,'), OPTS)
-
+    await importContacts(testDb(), csv('zomato.com,ceo@other.com,,Chief Executive,,,,'), OPTS)
     expect(await testDb().auditLog.count({ where: { action: 'contact.refused' } })).toBe(0)
     expect(await testDb().auditLog.count({ where: { action: 'contact.import_refused' } })).toBe(1)
-
     const { tierAYield } = await import('../../src/outreach/contacts/yield-report.js')
     expect((await tierAYield(testDb())).executivesRejected).toBe(0)
   })
@@ -241,8 +217,8 @@ describe('contact import', () => {
       csv('zomato.com,careers@zomato.com,,,,,,', 'zomato.com,ceo@zomato.com,,Chief Executive,,,,'),
       { ...OPTS, dryRun: true },
     )
-    expect(result.counts.imported).toBe(1)
-    expect(result.counts.executive).toBe(1)
+    expect(result.counts.imported).toBe(2)
+    expect(result.counts.executive).toBe(0)
     expect(await testDb().contact.count()).toBe(0)
     expect(await testDb().evidence.count()).toBe(0)
     expect(await testDb().auditLog.count()).toBe(0)

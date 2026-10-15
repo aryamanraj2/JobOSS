@@ -34,8 +34,8 @@ import { publishedIdentity } from './person-research.js'
  * timestamp"* — is the row's precondition, not a field somebody remembers to fill in.
  *
  * Refused, each with a reason code and an audit row:
- *   - an executive, at any tier (`executive_only_contact`) — §1.1, and the boundary of
- *     the operator's F4 amendment;
+ * Named candidates still require disambiguated current identity and responsibilities
+ * before @5 readiness. Founder/CEO/technical leadership is no longer blanket-excluded.
  *   - an address off the company's domain, which is a personal account or somebody
  *     else's employee;
  *   - a page whose text is shaped like instructions to an agent
@@ -86,10 +86,13 @@ export type CurateOutcome = {
   pagesRead: { url: string; kind: ContactSourcePageKind; chars: number }[]
   refusals: { reason: string; detail: string }[]
   executivesRejected: number
+  pagesAttempted: number
 }
 
 export type CurateOptions = {
   maxPages?: number
+  /** Unverified candidate URLs; employer-domain URLs only, fetched through the same gate. */
+  candidateUrls?: string[]
   now?: Date
   /** Credits charged per page. One, like every other research fetch (F2 §4.7). */
   costPerPage?: number
@@ -141,19 +144,24 @@ export async function curateCompanyContacts(
     pagesRead: [],
     refusals: [],
     executivesRejected: 0,
+    pagesAttempted: 0,
   }
 
   const seen = new Set<string>()
   let pagesAttempted = 0
 
-  for (const candidate of CONTACT_PAGE_PATHS) {
+  const supplied = (opts.candidateUrls ?? []).filter((url) => {
+    try { const parsed = new URL(url); return parsed.protocol === 'https:' && !parsed.username && !parsed.password && isCompanyDomain(`source@${parsed.hostname}`, company.canonicalDomain) } catch { return false }
+  }).map((url) => ({ path: url, kind: 'other' as const }))
+  for (const candidate of [...supplied, ...CONTACT_PAGE_PATHS]) {
     if (pagesAttempted >= maxPages) break
 
     // Before the second and every later request to this host, not before the first.
     if (pagesAttempted > 0) await sleep(opts.interPageDelayMs ?? 0)
     pagesAttempted += 1
+    out.pagesAttempted = pagesAttempted
 
-    const url = `https://${company.canonicalDomain}${candidate.path}`
+    const url = candidate.path.startsWith('https://') ? candidate.path : `https://${company.canonicalDomain}${candidate.path}`
 
     // F1's invariant: "a skipped source is an OUTCOME, not an exception." `fetchPage`
     // turns an HTTP error into `ok: false`, but a transport failure — DNS miss,
@@ -257,7 +265,7 @@ export async function curateCompanyContacts(
       // what the operator's Tier B amendment was about either. §10.5 keeps Tier B a
       // seam this milestone, so a page-read address that is not a recruiting route is
       // simply not stored.
-      if (!recipientSuitability({ emailNormalized: email, contactType, publicTitle: title }).suitable) {
+      if (!identity && !recipientSuitability({ emailNormalized: email, contactType, publicTitle: title }).suitable) {
         out.refusals.push({ reason: 'not_recruiting_route', detail: email })
         continue
       }
@@ -335,9 +343,9 @@ async function storeContact(
 ): Promise<{ id: string; created: boolean }> {
   const existing = await db.contact.findUnique({
     where: { emailNormalized: input.email },
-    select: { id: true },
+    select: { id: true, companyId: true, status: true, capturedAt: true },
   })
-  if (existing) return { id: existing.id, created: false }
+  if (existing && (existing.companyId !== input.companyId || existing.status !== 'active' || existing.capturedAt > input.now)) return { id: existing.id, created: false }
 
   const evidence = await writeEvidence(db, {
     companyId: input.companyId,
@@ -352,6 +360,13 @@ async function storeContact(
     fetchedVia: FETCHED_VIA.staticFetch,
   })
 
+  if (existing) {
+    await db.contact.updateMany({ where: { id: existing.id, companyId: input.companyId, status: 'active', capturedAt: { lte: input.now } },
+      data: { evidenceId: evidence.id, capturedAt: input.now, verified: true, discoveryMethod: 'page_published', sourcePageKind: input.pageKind } })
+    await writeAudit(db, { actorType: 'system', actorId: 'contact-curator', action: 'contact.route_recaptured', subjectType: 'Contact', subjectId: existing.id,
+      metadata: { evidenceId: evidence.id, sourceUrl: input.sourceUrl } })
+    return { id: existing.id, created: false }
+  }
   const row = await db.contact.create({
     data: {
       companyId: input.companyId,
@@ -404,8 +419,7 @@ export function windowAround(text: string, needle: string, radius = 200): string
  * The nearest plausible job title in the text preceding an address.
  *
  * Best-effort by design, and its failure mode is the safe one: a title this cannot
- * find is `null`, and `isExecutiveContact` then falls back to the local part rather
- * than waving the address through.
+ * find is `null`; missing responsibility stays visible and cannot establish readiness.
  */
 export function titleNear(text: string, email: string, radius = 120): string | null {
   const at = text.toLowerCase().indexOf(email.toLowerCase())

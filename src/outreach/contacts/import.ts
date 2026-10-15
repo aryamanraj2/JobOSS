@@ -42,12 +42,10 @@ import { recipientSuitability } from './suitability.js'
  *
  * ## The three refusals, and why each survives the change of source
  *
- * **Executives.** Every row goes through {@link isExecutiveContact}, exactly as a
- * scraped address does. `handover.md` §1.1 is not amended by anything in this
- * milestone, and the failure mode is specific rather than theoretical: a lookup
- * provider asked for "someone at a 12-person startup" returns the founder, because at
- * a 12-person startup the founder is who it has. The filter reads the local part as
- * well as the title, so `founders@` with no title text is still refused.
+ * **Responsibility.** Founder/CEO and technical leadership candidates may be imported.
+ * Current identity and authorship still need independently captured person evidence;
+ * a provider's name/title/valid address verdict never establishes those facts.
+ * Unknown responsibilities remain visible rather than guessed from an address.
  *
  * **Off-domain addresses.** Refused the way `curate.ts` refuses them. A `gmail.com`
  * address is somebody's personal account (§1.2), and an address at another company is
@@ -391,8 +389,8 @@ async function importRow(
  * as likely to be a support desk as a person, and Tier A stores recruiting routes
  * only. A row on this list is a named individual the operator looked up on purpose,
  * and the F4 amendment made any current employee a valid contact — "SDE1, SDE2,
- * senior, staff, tech lead, EM" — with founders, CEOs, C-suite and VPs excluded, which
- * is the executive filter's job and happens before this function is reached.
+ * senior, staff, tech lead, EM". JOBOSS also permits supported founders and technical
+ * leadership, while current identity/research and route checks remain separate.
  */
 function resolveContactType(row: CsvRow, email: string, title: string | null): ContactType {
   const supplied = cell(row, 'contact_type')

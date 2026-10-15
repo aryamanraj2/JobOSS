@@ -21,6 +21,7 @@ const USER_AGENT = 'outreach-intelligence-research/0.1 (+https://example.invalid
 beforeEach(async () => {
   await truncateAll()
   await seedHostPolicies(testDb())
+  await testDb().researchBudget.create({ data: { companyId: null, periodMonth: new Date().toISOString().slice(0, 7), creditsCap: 1000, billedUsdCap: 0 } })
 })
 afterAll(async () => closeTestDb())
 
@@ -136,28 +137,13 @@ describe('Tier A stores what the employer published', () => {
 })
 
 describe('what Tier A refuses (handover.md §1.1, §1.2)', () => {
-  it('NEVER stores an executive, and does not record their address either', async () => {
+  it('accepts supported founder/technical leadership routes while identity still needs research', async () => {
     const c = await company('exec.example')
-    serveCareers(
-      'exec.example',
-      page(
-        '<p>Our leadership team is always happy to hear from people. ' +
-          'Chief Technology Officer — cto@exec.example. Founder — founders@exec.example.</p>',
-      ),
-    )
-
+    serveCareers('exec.example', page('<p>Chief Technology Officer cto@exec.example</p><p>Founder founders@exec.example</p>'))
     const out = await curateCompanyContacts(testDb(), gate(), c)
-    expect(out.contacts).toHaveLength(0)
-    expect(out.executivesRejected).toBeGreaterThan(0)
-    expect(await testDb().contact.count()).toBe(0)
-
-    const audit = await testDb().auditLog.findFirstOrThrow({
-      where: { action: 'contact.refused', reasonCode: 'executive_only_contact' },
-    })
-    // §1.1 says never target them. Storing the address in an audit row so a later
-    // query could recover it would be keeping precisely what the rule says not to keep.
-    expect(JSON.stringify(audit.metadata)).not.toContain('cto@exec.example')
-    expect(JSON.stringify(audit.metadata)).not.toContain('founders@exec.example')
+    expect(out.contacts.length).toBeGreaterThan(0)
+    expect(out.executivesRejected).toBe(0)
+    expect((await testDb().contact.findMany()).every((c) => c.identityVerifiedAt === null)).toBe(true)
   })
 
   it('refuses an address that is not on the company domain', async () => {
