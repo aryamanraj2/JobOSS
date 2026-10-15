@@ -27,7 +27,7 @@ import { EnvKeyProvider } from '../src/core/crypto/env-key-provider.js'
 import { GmailTokenProvider } from '../src/outreach/mail/oauth.js'
 import { GmailProvider } from '../src/outreach/mail/gmail.js'
 import { evaluateSendGate, type SendGateOptions } from '../src/outreach/send/gate.js'
-import { sendApprovedDraft, reconcileInFlight } from '../src/outreach/send/send.js'
+import { sendApprovedDraft, reconcileInFlight, type SendOutcome } from '../src/outreach/send/send.js'
 import { deliverabilityCounters } from '../src/outreach/send/counters.js'
 import { capsForStage } from '../src/outreach/send/caps.js'
 
@@ -67,6 +67,12 @@ function mailProvider(): GmailProvider {
   return new GmailProvider(gate, tokens, { messageIdDomain: config.MESSAGE_ID_DOMAIN })
 }
 
+function reportPending(outcome: SendOutcome): void {
+  if (outcome.status !== 'pending_reconciliation') return
+  console.error(`Delivery remains unknown for ${outcome.attemptId}; reservation retained. Reconciliation must not send again.`)
+  process.exitCode = 2
+}
+
 console.log(`\nsend:run — stage ${MILESTONE_STAGE}, sending ${config.SENDING_ENABLED ? 'ENABLED' : 'disabled'}`)
 console.log(
   `  recipients: ${config.SEND_EXTERNAL_RECIPIENTS_ENABLED ? 'external permitted' : 'OWNED INBOXES ONLY'}` +
@@ -80,7 +86,10 @@ if (has('reconcile')) {
   // may already have sent and records what it finds.
   const outcomes = await reconcileInFlight(db, mailProvider())
   console.log(`\nreconciled ${outcomes.length} in-flight attempt(s):`)
-  for (const o of outcomes) console.log(`  ${o.status}  ${JSON.stringify(o)}`)
+  for (const o of outcomes) {
+    console.log(`  ${o.status}  ${JSON.stringify(o)}`)
+    reportPending(o)
+  }
 } else if (has('list') || !flag('id')) {
   const drafts = await db.draft.findMany({
     where: { status: { in: ['approved', 'sending'] } },
@@ -120,6 +129,7 @@ if (has('reconcile')) {
   } else {
     const outcome = await sendApprovedDraft(db, mailProvider(), draftId, gateOptions)
     console.log(`\n${JSON.stringify(outcome, null, 2)}`)
+    reportPending(outcome)
   }
 }
 

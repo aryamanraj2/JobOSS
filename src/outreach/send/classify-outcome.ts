@@ -1,3 +1,5 @@
+import { normalizedHeaders, autoSubmittedKeyword } from '../mail/headers.js'
+
 /**
  * Bounce and reply classification — A12's first gap, closed.
  *
@@ -104,7 +106,7 @@ export function classifyBounce(message: {
   return { kind: 'bounce', hardness: 'soft', providerCode: null, diagnostic, inferred: true }
 }
 
-export type ReplyClassification = 'opt_out' | 'wrong_contact' | 'auto_reply' | 'reply'
+export type ReplyClassification = 'opt_out' | 'wrong_contact' | 'auto_reply' | 'reply' | 'unclassified'
 
 /**
  * Drafts composed before F6 carried an explicit opt-out line (`signoff.plain@1`, B4).
@@ -159,9 +161,13 @@ export function classifyReply(message: {
   // RFC 3834 and the de-facto Microsoft header. Trusted before any text matching:
   // a vacation responder that happens to contain "not interested" in a signature
   // would otherwise read as an opt-out from someone who never saw the message.
-  const headers = Object.fromEntries(Object.entries(message.headers ?? {}).map(([key, value]) => [key.toLowerCase(), value]))
-  const autoSubmitted = headers['auto-submitted'] ?? headers['Auto-Submitted']
-  if (autoSubmitted && autoSubmitted.trim().split(';')[0]?.toLowerCase() !== 'no') return 'auto_reply'
+  const headers = normalizedHeaders(message.headers)
+  const autoSubmitted = headers['auto-submitted']
+  if (autoSubmitted !== undefined) {
+    const keyword = autoSubmittedKeyword(autoSubmitted)
+    if (keyword === null) return 'unclassified'
+    if (keyword !== 'no') return 'auto_reply'
+  }
   if (headers['x-autoreply'] ?? headers['x-autorespond'] ?? headers['X-Autoreply']) return 'auto_reply'
 
   const text = `${message.subject}\n${message.bodyText}`

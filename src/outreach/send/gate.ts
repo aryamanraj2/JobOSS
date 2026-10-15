@@ -196,7 +196,8 @@ export async function evaluateSendGate(
     lead.statusReason === 'replied' ||
     lead.statusReason === 'opt_out' ||
     lead.statusReason === 'wrong_contact' ||
-    lead.statusReason === 'hard_bounce'
+    lead.statusReason === 'hard_bounce' ||
+    lead.statusReason === 'soft_bounce'
   ) {
     return await refuse(db, draftId, lead.statusReason, `lead is stopped: ${lead.statusReason}`)
   }

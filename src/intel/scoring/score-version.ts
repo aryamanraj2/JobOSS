@@ -177,7 +177,12 @@ export const SCORE_VERSION_V3: ScoreVersionSpec = assertSumsTo100({
   frozenUntilSends: SCORE_VERSION_V2.frozenUntilSends,
 })
 
-export const ACTIVE_SCORE_VERSION: ScoreVersionSpec = SCORE_VERSION_V3
+/** C binds inputs to current ownership, board/content hashes and distinct current observations. */
+export const SCORE_VERSION_V4: ScoreVersionSpec = assertSumsTo100({
+  ...SCORE_VERSION_V3, label: 'joboss-v4', weights: { ...SCORE_VERSION_V3.weights },
+  thresholds: { ...SCORE_VERSION_V3.thresholds },
+})
+export const ACTIVE_SCORE_VERSION: ScoreVersionSpec = SCORE_VERSION_V4
 
 export type ScoreBand = 'queue' | 'research' | 'reject'
 

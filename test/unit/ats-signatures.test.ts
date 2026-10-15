@@ -115,3 +115,60 @@ describe('detectAllAtsInText', () => {
     ])
   })
 })
+
+describe('RC-2 actual parsed vendor and board', () => {
+  const target = { id: 'synthetic', canonicalDomain: 'acme.example', atsSlug: 'greenhouse', atsBoardToken: 'acme' }
+  it.each([
+    'https://jobs.lever.co/?next=https://job-boards.greenhouse.io/acme',
+    'https://jobs.lever.co/foreign/1?next=https://job-boards.greenhouse.io/acme/jobs/1',
+    'https://jobs.lever.co/foreign/1#https://job-boards.greenhouse.io/acme/jobs/1',
+    'https://jobs.lever.co/foreign/https://job-boards.greenhouse.io/acme/jobs/1',
+    'https://job-boards.greenhouse.io/foreign/jobs/1?next=https://job-boards.greenhouse.io/acme',
+    'https://job-boards.greenhouse.io/foreign/jobs/1#https://job-boards.greenhouse.io/acme',
+    'https://job-boards.greenhouse.io/foreign/https://job-boards.greenhouse.io/acme',
+    'https://boards.greenhouse.io/?for=acme',
+    'https://boards.greenhouse.io/embed/other?for=acme',
+    'https://boards.greenhouse.io/embed/job_board?for=acme&for=foreign',
+    'https://boards.greenhouse.io/embed/job_board?next=https://job-boards.greenhouse.io/acme',
+    'https://job-boards.greenhouse.io/acme%2Fforeign/jobs/1',
+    'http://job-boards.greenhouse.io/acme',
+    'https://user:password@job-boards.greenhouse.io/acme',
+    'https://job-boards.greenhouse.io:8443/acme',
+    'https://jobs.eu.lever.co/acme',
+    'https://evil.example/?next=https://job-boards.greenhouse.io/acme',
+  ])('rejects cross-vendor/token/query/fragment/path confusion: %s', async (url) => {
+    const { belongsToBoard } = await import('../../src/ingest/ats/verified.js')
+    expect(belongsToBoard(url, target)).toBe(false)
+  })
+  it.each([
+    'https://job-boards.greenhouse.io/acme',
+    'https://boards.greenhouse.io/acme/jobs/123?gh_src=fixture#application',
+    'https://boards-api.greenhouse.io/v1/boards/acme/jobs?content=true',
+    'https://boards-api.greenhouse.io/v1/boards/acme/jobs/123',
+    'https://boards.greenhouse.io/embed/job_board?for=acme',
+    'https://boards.greenhouse.io/embed/job_board/js?for=acme',
+    'https://job-boards.greenhouse.io/embed/job_board?for=acme',
+    'https://job-boards.greenhouse.io/embed/job_board/js?for=acme',
+  ])('preserves a valid Greenhouse origin/path: %s', async (url) => {
+    const { belongsToBoard } = await import('../../src/ingest/ats/verified.js')
+    expect(belongsToBoard(url, target)).toBe(true)
+  })
+  it('extracts each complete outer URL once, keeping nested descriptions out of identity', () => {
+    const nested = 'https://jobs.lever.co/?next=https://job-boards.greenhouse.io/acme'
+    expect(detectAtsInUrl(nested)).toBeNull()
+    expect(detectAllAtsInText(`<a href="${nested}">Jobs</a>`)).toEqual([])
+    expect(detectAtsInUrl('https://jobs.lever.co/foreign/123?next=https://job-boards.greenhouse.io/acme')).toMatchObject({ vendor: 'lever', boardToken: 'foreign' })
+  })
+})
+
+it.each([
+  ['https://jobs.lever.co/acme/123/apply', 'lever'],
+  ['https://api.lever.co/v0/postings/acme?mode=json', 'lever'],
+  ['https://api.lever.co/v0/postings/acme/123', 'lever'],
+  ['https://jobs.ashbyhq.com/acme/123/application', 'ashby'],
+  ['https://api.ashbyhq.com/posting-api/job-board/acme', 'ashby'],
+])('uses the actual supported %s origin and path', async (url, vendor) => {
+  const { belongsToBoard } = await import('../../src/ingest/ats/verified.js')
+  expect(belongsToBoard(url, { id: 'synthetic', canonicalDomain: 'acme.example', atsSlug: vendor, atsBoardToken: 'acme' })).toBe(true)
+  expect(belongsToBoard(url, { id: 'synthetic', canonicalDomain: 'acme.example', atsSlug: vendor, atsBoardToken: 'foreign' })).toBe(false)
+})

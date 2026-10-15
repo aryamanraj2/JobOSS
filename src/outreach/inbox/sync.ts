@@ -57,6 +57,7 @@ export async function syncInbox(db: Db, mail: InboxProvider, opts: InboxSyncOpti
             subject: message.subject, bodyText: message.bodyText, inReplyTo: message.inReplyTo,
             receivedAt: message.receivedAt, headers: message.headers,
           }, { suppressionSalt: opts.suppressionSalt })
+          if (result.kind === 'unresolved') throw new Error(`unresolved inbound ${message.id.slice(0, 200)}: ${result.detail}`)
           if (result.kind !== 'unmatched') matchedPage += 1
         }
         scannedPage += 1

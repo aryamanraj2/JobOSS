@@ -1,6 +1,9 @@
 import type { Db } from '../../core/audit/audit-log.js'
 import { writeAudit } from '../../core/audit/audit-log.js'
 import { emailHmac, normalizeEmail, domainOf } from '../../core/crypto/secret-store.js'
+import { isStandaloneDatabaseClient } from '../../core/joboss/database-scope.js'
+import { readDsnEvidence } from '../mail/dsn-evidence.js'
+import { normalizedHeaders, senderAddress } from '../mail/headers.js'
 import type { ReasonCodeValue } from '../../core/reason-codes/registry.js'
 import { classifyBounce, classifyReply, type ReplyClassification } from './classify-outcome.js'
 
@@ -56,48 +59,85 @@ export type InboundForIngest = {
   headers?: Record<string, string>
 }
 
-/**
- * Finds the `SendAttempt` a received message is about.
- *
- * Matches In-Reply-To/References against both actual and client-supplied RFC IDs.
- * Thread matching is the fallback; a DSN may instead quote the original ID in its
- * body. Gmail's stored ID differs from the stable local reconciliation handle.
- */
-export async function matchSendAttempt(
-  db: Db,
-  message: InboundForIngest,
-): Promise<{ id: string; draftId: string; contactId: string; companyId: string } | null> {
-  const select = { id: true, draftId: true, contactId: true, companyId: true }
+export type MatchedAttempt = { id: string; draftId: string; contactId: string; companyId: string }
+export type DetailedMatch =
+  | { kind: 'matched'; attempt: MatchedAttempt }
+  | { kind: 'unmatched'; detail: string }
+  | { kind: 'unresolved'; detail: string; candidateAttemptIds: string[]; reasonCode: null; suppressed: false }
+export type UnresolvedInbound = Extract<DetailedMatch, { kind: 'unresolved' }>
+export type IngestResult = IngestedOutcome | Extract<DetailedMatch, { kind: 'unmatched' | 'unresolved' }>
 
+/** Compatibility lookup: unresolved returns null; ingestion MUST use the detailed result. */
+export async function matchSendAttempt(db: Db, message: InboundForIngest): Promise<MatchedAttempt | null> {
+  const result = await matchSendAttemptDetailed(db, message)
+  return result.kind === 'matched' ? result.attempt : null
+}
+
+/** Exact IDs precede weak thread history. Never choose a contact by first-row order. */
+export async function matchSendAttemptDetailed(db: Db, message: InboundForIngest): Promise<DetailedMatch> {
+  const headers = normalizedHeaders(message.headers)
   const ids = new Set([
     ...(message.inReplyTo?.match(/<[^<>\s]+>/g) ?? []),
-    ...(message.headers?.['references']?.match(/<[^<>\s]+>/g)?.reverse() ?? []),
+    ...(headers['in-reply-to']?.match(/<[^<>\s]+>/g) ?? []),
+    ...(headers['references']?.match(/<[^<>\s]+>/g) ?? []),
+    ...(message.bodyText.match(/<[^<>\s]+@[^<>\s]+>/g) ?? []),
   ])
-  for (const id of ids) {
-    const hit = await db.sendAttempt.findFirst({
-      where: { OR: [{ providerRfc822MessageId: id }, { rfc822MessageId: id }] }, select,
-    })
-    if (hit) return hit
+  const select = { id: true, draftId: true, contactId: true, companyId: true, campaignCycle: true,
+    attemptedAt: true, draft: { select: { leadId: true } }, contact: { select: { emailNormalized: true } } }
+  const exact = ids.size ? await db.sendAttempt.findMany({ where: {
+    OR: [{ providerRfc822MessageId: { in: [...ids] } }, { rfc822MessageId: { in: [...ids] } }],
+  }, select }) : []
+  const thread = message.threadId ? await db.sendAttempt.findMany({ where: { providerThreadId: message.threadId }, select }) : []
+  const sender = senderAddress(message.from)
+  const daemon = sender !== null && /^(mailer-daemon|postmaster|mail\.delivery\.subsystem)@/i.test(sender)
+  const evidence = readDsnEvidence(message.bodyText)
+  const dsn = daemon || evidence.recipients.length > 0 || /^reporting-mta:/im.test(message.bodyText) || classifyBounce(message).kind === 'bounce'
+  // Only readable addresses can be queried, but all explicit values (including
+  // unknown and unreadable recipients) remain in evidence for the consistency gate.
+  const recipients = new Set(evidence.recipients.filter((recipient): recipient is string => recipient !== null))
+  const recipientCandidates = dsn && recipients.size ? await db.sendAttempt.findMany({
+    where: { contact: { emailNormalized: { in: [...recipients] } } }, select,
+  }) : []
+  const candidates = exact.length ? exact : recipientCandidates.length ? recipientCandidates : thread
+  const unresolved = (detail: string): DetailedMatch => ({ kind: 'unresolved', detail, reasonCode: null, suppressed: false,
+    candidateAttemptIds: [...new Set([...exact, ...recipientCandidates, ...thread].map((a) => a.id))].sort().slice(0, 50) })
+  const conversations = (rows: typeof candidates) => new Set(rows.map((a) => `${a.contactId}:${a.draft.leadId}:${a.campaignCycle}`))
+  if (conversations(exact).size > 1) return unresolved('conflicting exact message IDs identify different contacts/conversations')
+  if (exact.length && recipientCandidates.some((a) => !exact.some((e) => e.contactId === a.contactId))) {
+    return unresolved('DSN recipients conflict with exact original message contact')
   }
-  if (message.threadId) {
-    const byThread = await db.sendAttempt.findFirst({ where: { providerThreadId: message.threadId }, select })
-    if (byThread) return byThread
+  if (!candidates.length) return { kind: 'unmatched', detail: 'no known original message ID or thread' }
+  if (!sender) return unresolved('sender mailbox is unreadable, unsupported or multiple')
+  if (headers['from'] !== undefined && senderAddress(headers['from']) !== sender) return unresolved('From header contradicts parsed sender')
+  let consistent = candidates
+  if (dsn) {
+    if (evidence.issue) return unresolved(evidence.issue)
+    // Daemon address is not the recipient. Require original ID or DSN recipient
+    // evidence; a reused thread alone is insufficient even for a daemon message.
+    if (!exact.length && !recipients.size) return unresolved('DSN has only weak thread identity; original message/recipient evidence required')
+    if (recipients.size) {
+      consistent = candidates.filter((a) => recipients.has(normalizeEmail(a.contact.emailNormalized)))
+      if (consistent.length !== candidates.length && exact.length) return unresolved('DSN recipient contradicts original message identity')
+      if (!consistent.length) return unresolved('DSN recipient does not identify a known conversation')
+    }
+  } else {
+    consistent = candidates.filter((a) => normalizeEmail(a.contact.emailNormalized) === sender)
+    if (!consistent.length) return unresolved('human sender contradicts known message/thread contact')
+    if (exact.length && consistent.length !== candidates.length) return unresolved('human sender contradicts exact message identity')
   }
-
-  for (const id of message.bodyText.match(/<[^<>\s]+@[^<>\s]+>/g) ?? []) {
-    const hit = await db.sendAttempt.findFirst({
-      where: { OR: [{ providerRfc822MessageId: id }, { rfc822MessageId: id }] }, select,
-    })
-    if (hit) return hit
-  }
-  return null
+  if (conversations(consistent).size !== 1) return unresolved('multiple candidate conversations remain unresolved')
+  // Same-contact conversation history is legitimate; attribute to its latest known
+  // attempt, with a stable tie break. Distinct cycles/leads never collapse here.
+  consistent.sort((a, b) => b.attemptedAt.getTime() - a.attemptedAt.getTime() || a.id.localeCompare(b.id))
+  const hit = consistent[0]!
+  return { kind: 'matched', attempt: { id: hit.id, draftId: hit.draftId, contactId: hit.contactId, companyId: hit.companyId } }
 }
 
 export async function ingestInboundMessage(
   db: Db,
   message: InboundForIngest,
   opts: { suppressionSalt: string; now?: Date },
-): Promise<IngestedOutcome | { kind: 'unmatched'; detail: string }> {
+): Promise<IngestResult> {
   if (!message.providerMessageId.trim()) throw new Error('inbound provider identity is required')
   return inTransaction(db, async (tx) => {
     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`inbox:${message.providerMessageId}`}, 0))::text`
@@ -121,16 +161,28 @@ export async function ingestInboundMessage(
   })
 }
 
+async function recordUnresolved(db: Db, message: InboundForIngest, result: UnresolvedInbound): Promise<UnresolvedInbound> {
+  // Called under provider-message lock. Retain bounded identity/reason for review,
+  // but no irreversible outcome fact; retries re-evaluate current evidence.
+  const prior = await db.auditLog.findFirst({ where: { action: 'inbox.unresolved', subjectId: message.providerMessageId }, select: { id: true } })
+  if (!prior) await writeAudit(db, { actorType: 'system', actorId: 'inbox', action: 'inbox.unresolved',
+    subjectType: 'InboundMessage', subjectId: message.providerMessageId,
+    metadata: { detail: result.detail, candidateAttemptIds: result.candidateAttemptIds,
+      threadId: message.threadId.slice(0, 200), from: message.from.slice(0, 200) } })
+  return result
+}
+
 async function inTransaction<T>(db: Db, work: (tx: Db) => Promise<T>): Promise<T> {
-  return '$transaction' in db && typeof db.$transaction === 'function' ? db.$transaction(work, { timeout: 30_000 }) : work(db)
+  return isStandaloneDatabaseClient(db) ? db.$transaction(work, { timeout: 30_000 }) : work(db)
 }
 
 async function ingestOnce(
   db: Db, message: InboundForIngest, opts: { suppressionSalt: string; now?: Date },
-): Promise<IngestedOutcome | { kind: 'unmatched'; detail: string }> {
+): Promise<IngestResult> {
   const now = opts.now ?? new Date()
-  const attempt = await matchSendAttempt(db, message)
-  if (!attempt) {
+  const match = await matchSendAttemptDetailed(db, message)
+  if (match.kind === 'unresolved') return recordUnresolved(db, message, match)
+  if (match.kind === 'unmatched') {
     // Recorded rather than dropped. A bounce we cannot attribute is still a fact about
     // deliverability, and silently discarding it is how "nothing is bouncing" becomes
     // a belief rather than a measurement (B3).
@@ -146,6 +198,7 @@ async function ingestOnce(
     return { kind: 'unmatched', detail: 'no SendAttempt matched this message' }
   }
 
+  const attempt = match.attempt
   await db.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`outcome:${attempt.id}`}, 0))::text`
   const contact = await db.contact.findUniqueOrThrow({
     where: { id: attempt.contactId },
@@ -203,6 +256,10 @@ async function ingestOnce(
     subject: message.subject,
     bodyText: message.bodyText,
     ...(message.headers ? { headers: message.headers } : {}),
+  })
+
+  if (classification === 'unclassified') return recordUnresolved(db, message, {
+    kind: 'unresolved', reasonCode: null, suppressed: false, candidateAttemptIds: [attempt.id], detail: 'malformed Auto-Submitted keyword; review inbound classification',
   })
 
   await db.reply.create({

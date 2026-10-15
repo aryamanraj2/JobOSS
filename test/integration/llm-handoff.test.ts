@@ -14,6 +14,7 @@ import { queueResearchBrief, RESEARCH_BRIEF_PROMPT_VERSION } from '../../src/int
 import { scoreCompanyAndPersist } from '../../src/intel/scoring/run.js'
 import { COMPANY_SCORING_SELECT } from '../../src/intel/scoring/collect.js'
 import { registerSecretValue, clearRegisteredSecrets } from '../../src/core/logging/redact.js'
+import { proveBoard, boardSnapshot, syntheticJob } from '../fixtures/discovery-support.js'
 import { z } from 'zod'
 
 const NOW = new Date('2026-09-09T12:00:00Z')
@@ -43,28 +44,16 @@ async function seedQualifiedLead(): Promise<{ leadId: string; companyId: string;
     },
     select: COMPANY_SCORING_SELECT,
   })
-  await testDb().opportunity.create({
-    data: {
-      companyId: company.id, kind: 'published_role', status: 'open', title: 'iOS Engineer Intern',
-      roleUrl: 'https://job-boards.greenhouse.io/acme/jobs/1', externalId: 'j1', lastSeenAt: NOW,
-    },
-  })
-  const evidenceIds: string[] = []
-  for (const [type, excerpt] of [
-    ['ats', '{"title":"iOS Engineer Intern","location":"Bengaluru"}'],
-    ['company_page', 'We are a distributed team writing Swift and SwiftUI, hiring interns each spring.'],
-  ] as const) {
-    const row = await testDb().evidence.create({
-      data: {
-        companyId: company.id, sourceUrl: `https://acme.example/${type}`, sourceType: type,
-        excerpt, contentHash: Math.random().toString(36).slice(2), observedAt: NOW, confidence: 0.9,
-        fetchedVia: type === 'ats' ? 'structured_feed' : 'static_fetch',
-      },
-      select: { id: true },
-    })
-    evidenceIds.push(row.id)
-  }
-  const outcome = await scoreCompanyAndPersist(testDb(), company, { now: NOW })
+  const owned = await proveBoard(company.id, NOW)
+  await boardSnapshot(company.id, NOW, [syntheticJob('j1')])
+  const ats = await testDb().evidence.findMany({ where: { companyId: company.id, sourceType: 'ats', sourceUrl: 'https://job-boards.greenhouse.io/acme/jobs/j1' } })
+  const page = await testDb().evidence.create({ data: {
+    companyId: company.id, sourceUrl: 'https://acme.example/product', sourceType: 'company_page',
+    excerpt: 'We are a distributed team writing Swift and SwiftUI, hiring interns each spring.',
+    contentHash: 'synthetic-current-product', observedAt: NOW, confidence: 0.9, fetchedVia: 'static_fetch',
+  } })
+  const evidenceIds = [ats[0]!.id, page.id, ...ats.slice(1).map((e) => e.id)]
+  const outcome = await scoreCompanyAndPersist(testDb(), { ...company, ...owned }, { now: NOW })
   if (!outcome.scored) throw new Error('fixture company failed to score')
   await testDb().lead.update({ where: { id: outcome.leadId }, data: { status: 'qualified' } })
   return { leadId: outcome.leadId, companyId: company.id, evidenceIds }

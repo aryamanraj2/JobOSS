@@ -8,6 +8,9 @@ import { isInboxProvider } from '../inbox/contracts.js'
 import { syncInbox } from '../inbox/sync.js'
 import type { ReasonCodeValue } from '../../core/reason-codes/registry.js'
 import { AmbiguousSendError } from '../mail/gmail.js'
+import { isStandaloneDatabaseClient } from '../../core/joboss/database-scope.js'
+import { verifyApprovalHash } from '../draft/approve.js'
+import { reservationSnapshot, lockReservationSnapshot, planMatchesSnapshot } from './reservation.js'
 import { deriveIdempotencyKey } from '../mail/message-id.js'
 import { evaluateSendGate, type SendGateOptions, type SendPlan } from './gate.js'
 
@@ -39,8 +42,8 @@ import { evaluateSendGate, type SendGateOptions, type SendPlan } from './gate.js
  *
  * `AmbiguousSendError` means the outcome is unknown: a timeout, a reset, a 5xx, a 429,
  * or a 200 whose body we could not read. The response is **never** another send. The
- * reconciliation runs first. A miss ends this attempt with a failure report; it
- * does not prove non-delivery and does not license another send under its key.
+ * reconciliation runs first. A miss or lookup failure retains an in-flight reservation and reports pending
+ * reconciliation. It does not prove non-delivery or license another send.
  *
  * A non-ambiguous error (a 4xx that is not 429, a gate refusal) means the request was
  * rejected and no message exists. Those are recorded `failed` without a search,
@@ -52,6 +55,7 @@ export type SendOutcome =
   | { status: 'sent'; attemptId: string; providerMessageId: string; reconciled: boolean }
   | { status: 'refused'; reason: ReasonCodeValue; detail: string }
   | { status: 'failed'; attemptId: string; detail: string }
+  | { status: 'pending_reconciliation'; attemptId: string; detail: string }
 
 export type SendOptions = SendGateOptions & {
   /**
@@ -67,6 +71,8 @@ export async function sendApprovedDraft(
   draftId: string,
   opts: SendOptions,
 ): Promise<SendOutcome> {
+  if (!isStandaloneDatabaseClient(db)) return { status: 'refused', reason: 'weak_evidence', detail: 'send invocation requires a standalone database client so its reservation can commit before transport' }
+
   // --- Step 0: is there already an attempt under this key? -----------------
   //
   // **Before the gate, not after.** A9: *"A retry finding an `in_flight` attempt
@@ -128,8 +134,27 @@ export async function sendApprovedDraft(
   // cap or the same dedup slot. The provider call remains outside the transaction.
   const reservation = await db.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended('outreach-send-reservation', 0))::text`
+    const snapshot = await reservationSnapshot(tx, draftId)
     const decision = await evaluateSendGate(tx, draftId, opts)
     if (!decision.allowed) return decision
+    await lockReservationSnapshot(tx, snapshot)
+    const current = await reservationSnapshot(tx, draftId)
+    if (JSON.stringify(snapshot) !== JSON.stringify(current) || current.draft?.status !== 'approved' || !planMatchesSnapshot(decision.plan, current)) {
+      const detail = 'validated approval/content/recipient snapshot changed before reservation'
+      await writeAudit(tx, { actorType: 'system', actorId: 'send', action: 'send.refused', subjectType: 'Draft', subjectId: draftId, reasonCode: 'approval_hash_mismatch', metadata: { detail } })
+      return { allowed: false as const, reason: 'approval_hash_mismatch' as const, detail }
+    }
+    const verified = await verifyApprovalHash(tx, draftId)
+    if (!verified.matches) return { allowed: false as const, reason: verified.reason, detail: 'approval changed before reservation' }
+    const approved = current.draft
+    // This conditional transition is the reservation linearization point. A revoker
+    // holding the draft row first clears approval; a later revoker sees the attempt.
+    const changed = await tx.draft.updateMany({
+      where: { id: draftId, status: 'approved', approvalHash: approved.approvalHash,
+        approvedAt: approved.approvedAt, contactId: approved.contactId, updatedAt: approved.updatedAt },
+      data: { status: 'sending' },
+    })
+    if (changed.count !== 1) throw new Error('approval reservation lost its locked snapshot')
     const plan = decision.plan
     const row = await tx.sendAttempt.create({
       data: {
@@ -151,7 +176,6 @@ export async function sendApprovedDraft(
       },
       select: { id: true },
     })
-    await tx.draft.update({ where: { id: plan.draftId }, data: { status: 'sending' } })
     return { allowed: true as const, attempt: row, plan }
   }, { timeout: 30_000 })
   if (!reservation.allowed) return { status: 'refused', reason: reservation.reason, detail: reservation.detail }
@@ -262,9 +286,12 @@ export async function reconcileAttempt(
   // The recipient narrows the provider's candidate search from "everything sent this
   // week" to "the one message sent to this person". It is a hint, never a filter the
   // answer depends on: a provider that keeps the Message-ID ignores it.
-  const found = await mail.findByMessageId(rfc822MessageId, {
-    to: attempt.contact?.emailNormalized,
-  })
+  let found: Awaited<ReturnType<MailProvider['findByMessageId']>>
+  try {
+    found = await mail.findByMessageId(rfc822MessageId, { to: attempt.contact?.emailNormalized })
+  } catch {
+    return pendingReconciliation(db, attemptId, 'provider lookup failed; delivery remains unknown')
+  }
   if (found) {
     // The send landed and the response was lost. Record it and stop.
     await markSent(db, attemptId, attempt.draftId, found.providerMessageId, found.threadId ?? null, true, storedMessageId(found))
@@ -283,16 +310,19 @@ export async function reconcileAttempt(
     return { status: 'sent', attemptId, providerMessageId: found.providerMessageId, reconciled: true }
   }
 
-  await markFailed(db, attemptId, attempt.draftId, 'reconciliation found no sent message')
-  await writeAudit(db, {
-    actorType: 'system',
-    actorId: 'send',
-    action: 'send.reconciled',
-    subjectType: 'SendAttempt',
-    subjectId: attemptId,
-    metadata: { rfc822MessageId, outcome: 'not_found_marked_failed' },
+  return pendingReconciliation(db, attemptId, 'no matching sent message found; delivery remains unknown')
+}
+
+async function pendingReconciliation(db: Db, attemptId: string, detail: string): Promise<SendOutcome> {
+  // No status/timestamp mutation: original day/domain cap and partial unique indexes
+  // keep counting this reservation, even after repeated misses or provider failures.
+  await db.$transaction(async (tx) => {
+    await tx.deliveryEvent.create({ data: { sendAttemptId: attemptId,
+      eventType: 'pending_reconciliation', occurredAt: new Date(), raw: { detail } } })
+    await writeAudit(tx, { actorType: 'system', actorId: 'send', action: 'send.pending_reconciliation',
+      subjectType: 'SendAttempt', subjectId: attemptId, metadata: { detail } })
   })
-  return { status: 'failed', attemptId, detail: 'reconciliation found no sent message' }
+  return { status: 'pending_reconciliation', attemptId, detail }
 }
 
 /**
@@ -359,7 +389,7 @@ async function markFailed(db: Db, attemptId: string, draftId: string, detail: st
     // still stands and the message still exists. A7 says a mismatch returns a draft to
     // `awaiting_approval`; a transport failure is not a mismatch and must not quietly
     // discard an approval the operator already gave.
-    await tx.draft.update({ where: { id: draftId }, data: { status: 'approved' } })
+    await tx.draft.updateMany({ where: { id: draftId, status: 'sending', statusReason: null, approvedAt: { not: null }, approvalHash: { not: null } }, data: { status: 'approved' } })
     await tx.deliveryEvent.create({
       data: {
         sendAttemptId: attemptId,

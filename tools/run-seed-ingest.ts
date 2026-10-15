@@ -47,6 +47,7 @@ import {
   readOperatorSeedFile,
   upsertOperatorSeededCompany,
 } from '../src/ingest/file/operator-seed.js'
+import { prepareDiscovery } from '../src/ingest/discovery/prepare.js'
 import { detectAtsForCompany, saveDetection } from '../src/ingest/ats/detect.js'
 import { atsProviders, ingestPostings } from '../src/ingest/ats/ingest-postings.js'
 
@@ -93,6 +94,18 @@ const gate = new FetchPolicyGate(db, {
   robotsTtlSeconds: config.ROBOTS_CACHE_TTL_SECONDS,
   defaultRateDelayMs: config.DEFAULT_HOST_RATE_DELAY_MS,
 })
+
+// Explicit deterministic discovery mode. This CLI is never run by tests or an automatic scheduler.
+if (process.argv.includes('--discovery')) {
+  try {
+    const summary = await prepareDiscovery(db, gate, { limit,
+      ...(flag('run-id') ? { runId: flag('run-id')! } : {}), resume: process.argv.includes('--resume'),
+      delayMs: config.DEFAULT_HOST_RATE_DELAY_MS })
+    console.log(JSON.stringify(summary, null, 2))
+    if (!summary.complete) process.exitCode = 2
+  } finally { await disconnectPrisma() }
+  process.exit(process.exitCode ?? 0)
+}
 
 /** Per-company outcome, for the report the operator acts on. */
 type Row = {
@@ -294,8 +307,7 @@ if (!seedOnly) {
     let vendor = company.atsSlug
     let boardToken = company.atsBoardToken
 
-    if (!vendor || !boardToken) {
-      if (postingsOnly) continue
+    if (!vendor || !boardToken || postingsOnly) {
       try {
         const outcome = await detectAtsForCompany(db, gate, company, {
           maxPages: 2,

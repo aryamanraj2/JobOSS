@@ -1,3 +1,4 @@
+import { configuredTestTarget, verifyTestTarget } from '../helpers/test-target.js'
 import { createPrismaClient, type PrismaClient } from '../../src/core/db/client.js'
 
 const TABLES = [
@@ -14,15 +15,9 @@ let client: PrismaClient | undefined
 
 /** Fail closed before any test database writes, including truncation. */
 export function assertSafeTestDatabase(): string {
-  const url = process.env.TEST_DATABASE_URL
-  if (!url) throw new Error('TEST_DATABASE_URL is not set')
-  const test = new URL(url)
-  const liveId = process.env.JOBOSS_B_LIVE_DATABASE_ID
-  if (test.pathname !== '/outreach_test_joboss_b' || !liveId ||
-      `${test.hostname}:${test.port || '5432'}${test.pathname}` === liveId) {
-    throw new Error('Refusing unsafe B database; dedicated target must differ from live')
-  }
-  return url
+  const target = configuredTestTarget()
+  if (target.database !== 'outreach_test_joboss_b') throw new Error('B tests require their dedicated database')
+  return target.url
 }
 
 export function testDb(): PrismaClient {
@@ -35,6 +30,7 @@ export function testDb(): PrismaClient {
 
 export async function truncateAll(): Promise<void> {
   assertSafeTestDatabase()
+  await verifyTestTarget(configuredTestTarget())
   const db = testDb()
   await db.$executeRawUnsafe(
     `TRUNCATE TABLE ${TABLES.map((t) => `"${t}"`).join(', ')} RESTART IDENTITY CASCADE`,

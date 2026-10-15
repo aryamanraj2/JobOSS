@@ -1,3 +1,4 @@
+import { proveBoard } from '../fixtures/discovery-support.js'
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import { seedHostPolicies } from '../../src/core/policy/host-policy.js'
 import { GreenhouseProvider } from '../../src/ingest/ats/greenhouse.js'
@@ -16,7 +17,7 @@ beforeEach(async () => {
 afterAll(async () => closeTestDb())
 
 async function makeCompany(overrides: Record<string, unknown> = {}) {
-  return testDb().company.create({
+  const company = await testDb().company.create({
     data: {
       canonicalDomain: 'razorpay.com',
       displayName: 'Razorpay',
@@ -28,6 +29,7 @@ async function makeCompany(overrides: Record<string, unknown> = {}) {
       ...overrides,
     },
   })
+  return proveBoard(company.id, new Date(), BOARD_TOKEN)
 }
 
 function boardFetcher(body = readFixture('greenhouse-jobs')) {
@@ -199,6 +201,7 @@ describe('ATS posting ingest', () => {
 
     const raw = JSON.parse(readFixture('greenhouse-jobs')) as { jobs: Record<string, unknown>[] }
     raw.jobs = raw.jobs.slice(0, 3)
+    ;(raw as unknown as { meta: { total: number } }).meta.total = 3
     await ingestPostings(testDb(), new GreenhouseProvider(boardFetcher(JSON.stringify(raw))), {
       id: company.id,
       atsBoardToken: BOARD_TOKEN,
@@ -256,15 +259,15 @@ describe('ATS posting ingest', () => {
 })
 
 describe('ATS detection over the network path', () => {
-  it('resolves a board from a stored careers URL without issuing a request', async () => {
+  it('rejects a stored third-party careers URL without fetched employer proof', async () => {
     const company = await makeCompany({
       careersUrl: 'https://job-boards.greenhouse.io/acmecorp',
     })
     const fetcher = new StubFetcher({})
     const outcome = await detectAtsForCompany(testDb(), fetcher, company)
 
-    expect(outcome).toMatchObject({ found: true, fetches: 0 })
-    expect(fetcher.requested).toEqual([])
+    expect(outcome).toMatchObject({ found: false })
+    expect(fetcher.requested.length).toBeGreaterThan(0)
   })
 
   /**
@@ -295,7 +298,7 @@ describe('ATS detection over the network path', () => {
 
     // The token is a stored fact, so it needs provenance like any other.
     const evidence = await testDb().evidence.findFirst({
-      where: { companyId: company.id, sourceType: 'company_page' },
+      where: { companyId: company.id, sourceType: 'company_page', excerpt: { contains: 'jobs.lever.co/acmeco' } },
     })
     expect(evidence?.excerpt).toContain('jobs.lever.co/acmeco')
   })

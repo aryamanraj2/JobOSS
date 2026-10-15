@@ -180,7 +180,7 @@ async function upsertSeededCompany(
 ): Promise<{ status: 'created' | 'updated'; evidenceSkipped: boolean }> {
   const existing = await db.company.findUnique({
     where: { canonicalDomain },
-    select: { id: true, website: true, status: true, tags: true },
+    select: { id: true, website: true, status: true, tags: true, ycStatus: true },
   })
 
   const data = {
@@ -205,7 +205,9 @@ async function upsertSeededCompany(
   const company = existing
     ? await db.company.update({
         where: { id: existing.id },
-        data: { ...data, status: existing.status, website: existing.website ?? seed.website,
+        data: { ...data, status: existing.status,
+          ycStatus: ['inactive', 'acquired', 'public'].includes(existing.ycStatus?.toLowerCase() ?? '') ? existing.ycStatus : data.ycStatus,
+          website: existing.website ?? seed.website,
           tags: [...new Set([...existing.tags, ...data.tags])] },
         select: { id: true },
       })
@@ -243,8 +245,9 @@ async function upsertSeededCompany(
  * loader that rewrote its evidence every run would add tens of thousands of
  * identical rows a week, and `Evidence` would stop being a record of what changed
  * and become a record of how often we looked. The record-level `contentHash` is
- * per company (deviation §4.10), so this skips exactly the companies that did not
- * move.
+ * per company (deviation §4.10). A hash is unchanged only once every required
+ * source-bound per-key row and its record-bound signal are present. Interrupted
+ * imports retain their durable rows and repair missing provenance on replay.
  */
 async function writeSeedEvidence(
   db: Db,
@@ -254,67 +257,50 @@ async function writeSeedEvidence(
 ): Promise<boolean> {
   const record = seed.source.record
 
+  // A record hash identifies content, not completion. Old interrupted imports may
+  // have written only this first row; verify/repair every required field and signal.
+  const recordExcerpt = verbatimExcerpt(JSON.stringify({ id: record['id'], name: record['name'], website: record['website'] }))
   const priorRecord = await db.evidence.findFirst({
-    where: { companyId, sourceType: 'yc', contentHash: seed.source.contentHash },
-    select: { id: true },
+    where: { companyId, sourceType: 'yc', sourceUrl: seed.source.url, contactId: null,
+      fetchedVia: FETCHED_VIA.structuredFeed, contentHash: seed.source.contentHash, excerpt: recordExcerpt },
+    select: { id: true, observedAt: true },
   })
-  if (priorRecord) {
-    await writeAudit(db, {
-      actorType: 'system',
-      actorId: 'seed-loader',
-      action: 'seed.record_unchanged',
-      subjectType: 'Company',
-      subjectId: companyId,
-      reasonCode: 'content_unchanged',
-      metadata: { contentHash: seed.source.contentHash },
-    })
-    return true
+  let changed = !priorRecord
+  const recordEvidence = priorRecord ?? {
+    ...await writeEvidence(db, { companyId, sourceUrl: seed.source.url, sourceType: 'yc',
+      excerpt: recordExcerpt, contentHash: seed.source.contentHash, observedAt,
+      confidence: SEED_CONFIDENCE, fetchedVia: FETCHED_VIA.structuredFeed }), observedAt,
   }
-
-  const recordEvidence = await writeEvidence(db, {
-    companyId,
-    sourceUrl: seed.source.url,
-    sourceType: 'yc',
-    excerpt: verbatimExcerpt(
-      JSON.stringify({ id: record['id'], name: record['name'], website: record['website'] }),
-    ),
-    contentHash: seed.source.contentHash,
-    observedAt,
-    confidence: SEED_CONFIDENCE,
-    fetchedVia: FETCHED_VIA.structuredFeed,
-  })
 
   for (const key of Object.keys(YC_SOURCE_KEYS) as YcSourceKey[]) {
     const value = record[key]
-    // A key the source did not publish justifies nothing, and an evidence row
-    // quoting `null` is noise that makes real provenance harder to read.
-    if (value === undefined || value === null) continue
-    if (Array.isArray(value) && value.length === 0) continue
-    if (typeof value === 'string' && value.trim() === '') continue
-
-    await writeEvidence(db, {
-      companyId,
-      sourceUrl: seed.source.url,
-      sourceType: 'yc',
-      excerpt: verbatimExcerpt(JSON.stringify({ [key]: value })),
-      // Per KEY, so F2 can tell which field changed rather than only that
-      // something did.
-      contentHash: contentHashOf({ [key]: value }),
-      observedAt,
-      confidence: SEED_CONFIDENCE,
-      fetchedVia: FETCHED_VIA.structuredFeed,
+    if (value === undefined || value === null || (Array.isArray(value) && value.length === 0) ||
+      (typeof value === 'string' && value.trim() === '')) continue
+    const contentHash = contentHashOf({ [key]: value })
+    const excerpt = verbatimExcerpt(JSON.stringify({ [key]: value }))
+    const existing = await db.evidence.findFirst({
+      where: { companyId, sourceType: 'yc', sourceUrl: seed.source.url, contactId: null,
+        fetchedVia: FETCHED_VIA.structuredFeed, contentHash, excerpt }, select: { id: true },
     })
+    if (existing) continue
+    await writeEvidence(db, { companyId, sourceUrl: seed.source.url, sourceType: 'yc', excerpt, contentHash,
+      observedAt, confidence: SEED_CONFIDENCE, fetchedVia: FETCHED_VIA.structuredFeed })
+    changed = true
   }
-
-  await writeCompanySignal(db, {
-    companyId,
-    evidenceId: recordEvidence.id,
-    signalType: 'yc_profile',
-    observedAt,
-    confidence: SEED_CONFIDENCE,
+  const profileSignal = await db.companySignal.findFirst({
+    where: { companyId, evidenceId: recordEvidence.id, signalType: 'yc_profile', observedAt: recordEvidence.observedAt },
+    select: { id: true },
   })
-
-  return false
+  if (!profileSignal) {
+    await writeCompanySignal(db, { companyId, evidenceId: recordEvidence.id, signalType: 'yc_profile',
+      observedAt: recordEvidence.observedAt, confidence: SEED_CONFIDENCE })
+    changed = true
+  }
+  if (!changed) await writeAudit(db, {
+    actorType: 'system', actorId: 'seed-loader', action: 'seed.record_unchanged', subjectType: 'Company',
+    subjectId: companyId, reasonCode: 'content_unchanged', metadata: { contentHash: seed.source.contentHash },
+  })
+  return !changed
 }
 
 /**

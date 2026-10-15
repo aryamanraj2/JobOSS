@@ -16,7 +16,7 @@ beforeEach(truncateAll)
 afterAll(closeTestDb)
 const syncOptions = { suppressionSalt: SEND_TEST_SALT, checkpointKey: 'test-mailbox' }
 function message(id: string, body = 'Hello', over: Partial<GmailMessage> = {}): GmailMessage {
-  return { id, threadId: 'broken-thread', from: 'human@example.com', to: 'owner@owned.example', subject: 'Re: enquiry',
+  return { id, threadId: 'broken-thread', from: 'owner@owned.example', to: 'owner@owned.example', subject: 'Re: enquiry',
     rfc822MessageId: `<${id}@example.com>`, inReplyTo: null, snippet: body, bodyText: body,
     labelIds: ['INBOX'], receivedAt: new Date(), fromIsSelf: false, headers: {}, ...over }
 }

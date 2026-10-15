@@ -191,6 +191,7 @@ export type YcOssSeedProviderOptions = {
 
 export class YcOssSeedProvider implements SeedProvider {
   readonly slug = 'yc-oss'
+  readonly coverage = { feedHash: '', records: 0, malformed: 0, scanCapped: false }
 
   constructor(
     private readonly fetcher: GatedFetcher,
@@ -233,14 +234,17 @@ export class YcOssSeedProvider implements SeedProvider {
       throw SourceError.unusable(url, 'feed was not a JSON array')
     }
 
+    this.coverage.feedHash = contentHashOf(fetched.value)
+    this.coverage.records = fetched.value.length
+    this.coverage.scanCapped = fetched.value.length > 10_000
     const limit = this.opts.limit ?? Number.POSITIVE_INFINITY
     let yielded = 0
-    for (const raw of fetched.value) {
+    for (const raw of fetched.value.slice(0, 10_000)) {
       if (yielded >= limit) return
       const parsed = YcCompanyRecord.safeParse(raw)
       // A single malformed record is skipped, not fatal: one bad row must not
       // cost the other 1,479.
-      if (!parsed.success) continue
+      if (!parsed.success) { this.coverage.malformed++; continue }
       if (this.opts.filter && !this.opts.filter(parsed.data)) continue
 
       yielded += 1

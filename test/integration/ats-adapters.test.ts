@@ -173,6 +173,8 @@ describe('adapters over the real gate transport', () => {
 
     await truncateAll()
     await seedHostPolicies(testDb())
+    const { currentPeriodMonth } = await import('../../src/core/policy/budget.js')
+    await testDb().researchBudget.create({ data: { companyId: null, periodMonth: currentPeriodMonth(), creditsCap: 100, billedUsdCap: 0 } })
 
     const meta = readFixtureMeta('greenhouse-jobs')
     const boardPath = new URL(meta.url).pathname

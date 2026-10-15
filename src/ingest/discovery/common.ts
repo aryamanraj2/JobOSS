@@ -46,4 +46,4 @@ export type DiscoveryCandidate = {
   funding?: Record<string, unknown>[]
 }
 
-export type CandidateHandler = (candidate: DiscoveryCandidate) => Promise<void>
+export type CandidateHandler = (candidate: DiscoveryCandidate) => Promise<void | boolean>

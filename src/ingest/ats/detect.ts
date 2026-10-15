@@ -4,9 +4,10 @@ import type { GatedFetcher } from '../../core/interfaces/providers.js'
 import { contentHashOf } from '../../core/evidence/content-hash.js'
 import { FETCHED_VIA, verbatimExcerpt, writeEvidence } from '../../core/evidence/write-evidence.js'
 import { fetchPage } from '../fetch-page.js'
+import { belongsToBoard } from './verified.js'
 import { parseHTML } from 'linkedom'
 import { canonicalizeDomain } from '../domain/canonicalize.js'
-import { detectAllAtsInText, detectAtsInUrl, type AtsDetection } from './signatures.js'
+import { detectAtsInUrl, type AtsDetection } from './signatures.js'
 
 export type DetectTarget = { id: string; canonicalDomain: string; careersUrl: string | null; website: string | null }
 
@@ -69,9 +70,10 @@ export function employerAtsLinks(html: string, pageUrl: string, companyDomain: s
     )
     const embedded = element.localName !== 'a' && /job_board|posting-api|jobs\./i.test(value)
     if (!onCareersPage && !careerContext && !embedded) continue
-    for (const hit of detectAllAtsInText(value)) {
-      if (!candidates.some((c) => c.vendor === hit.vendor && c.boardToken === hit.boardToken)) candidates.push(hit)
-    }
+    let target: string
+    try { target = new URL(value, pageUrl).href } catch { continue }
+    const hit = detectAtsInUrl(target)
+    if (hit && !candidates.some((c) => c.vendor === hit.vendor && c.boardToken === hit.boardToken)) candidates.push(hit)
   }
   return candidates
 }
@@ -79,16 +81,9 @@ export function employerAtsLinks(html: string, pageUrl: string, companyDomain: s
 /**
  * ATS detection with slug resolution (Part F, F1).
  *
- * Two stages, cheapest first, which is D4's source precedence applied at the level
- * of a single company:
- *
- *   1. **No request at all.** If a stored careers URL or website already points at
- *      a hosted board, the token is right there in the string. Greenhouse and Ashby
- *      companies are usually resolved here.
- *   2. **Read the company's own pages.** Lever publishes no discovery endpoint
- *      (B6), so for a Lever company the slug exists nowhere except on pages the
- *      company controls. The homepage is tried first, then a short list of
- *      conventional careers paths.
+ * Reads the employer's own homepage/careers markup. Stored third-party careers
+ * URLs are hints only. A single current, exact vendor/board link binds ownership;
+ * absent/ambiguous results clear the old binding for downstream freshness checks.
  *
  * Every request goes through the gate, so the company's `derived_company` allow
  * row, its robots.txt, its rate policy and both budget envelopes all apply. A
@@ -137,16 +132,16 @@ export async function detectAtsForCompany(
     }
 
     const hits = employerAtsLinks(page.body, page.url, company.canonicalDomain)
-    const expected = company.careersUrl ? detectAtsInUrl(company.careersUrl) : null
     const hit = hits.length === 1 ? hits[0] : null
-    if (hit && (!expected || (hit.vendor === expected.vendor && hit.boardToken === expected.boardToken))) {
+    if (hit) {
       // Cite the URL that actually served the markup, not the one we asked for.
       await recordDetectionEvidence(db, company.id, page.url, hit, now())
       return { found: true, detection: hit, sourceUrl: page.url, fetches }
     }
-    failures.push(`${page.url}: ${hits.length > 1 ? 'ambiguous employer boards' : expected && hit ? 'board ownership mismatch' : 'no employer careers board link'}`)
+    failures.push(`${page.url}: ${hits.length > 1 ? 'ambiguous employer boards' : 'no employer careers board link'}`)
   }
 
+  await db.company.update({ where: { id: company.id }, data: { atsOwnershipEvidenceId: null, atsOwnershipVerifiedAt: null } })
   await writeAudit(db, {
     actorType: 'system',
     actorId: 'ats-detect',
@@ -201,12 +196,14 @@ export async function saveDetection(
   detection: AtsDetection,
   careersUrl: string,
 ): Promise<void> {
+  const proofUrl = /^[a-z][a-z0-9+.-]*:/i.test(detection.matchedText) ? detection.matchedText : `https://${detection.matchedText}`
+  if (!belongsToBoard(proofUrl, { id: companyId, canonicalDomain: '', atsSlug: detection.vendor, atsBoardToken: detection.boardToken })) throw new Error('ATS ownership requires an exact vendor/board URL')
   const company = await db.company.findUniqueOrThrow({ where: { id: companyId }, select: { canonicalDomain: true } })
   const owner = canonicalizeDomain(careersUrl)
   const evidence = owner.ok && owner.domain === company.canonicalDomain
     ? await db.evidence.findFirst({
         where: { companyId, sourceUrl: careersUrl, sourceType: 'company_page',
-          contentHash: contentHashOf({ vendor: detection.vendor, boardToken: detection.boardToken }) },
+          contentHash: contentHashOf({ vendor: detection.vendor, boardToken: detection.boardToken }), excerpt: detection.matchedText, contactId: null },
         orderBy: { observedAt: 'desc' }, select: { id: true, observedAt: true },
       }) : null
   if (!evidence) throw new Error('ATS ownership requires a fetched employer careers link')

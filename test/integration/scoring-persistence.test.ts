@@ -1,7 +1,8 @@
+import { proveBoard, boardSnapshot, syntheticJob } from '../fixtures/discovery-support.js'
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import { closeTestDb, testDb, truncateAll } from '../helpers/db.js'
 import { COMPANY_SCORING_SELECT, type CompanyForScoring } from '../../src/intel/scoring/collect.js'
-import { ensureScoreVersion, scoreCompanyAndPersist } from '../../src/intel/scoring/run.js'
+import { ensureScoreVersion, scoreCompanyAndPersist as persistScore } from '../../src/intel/scoring/run.js'
 import { reconstructTotal } from '../../src/intel/scoring/score.js'
 import { SCORE_VERSION_V1 } from '../../src/intel/scoring/score-version.js'
 import { computeJobCountDelta, latestJobCountDelta } from '../../src/intel/signals/job-count-delta.js'
@@ -12,8 +13,17 @@ const NOW = new Date('2026-09-09T12:00:00Z')
 beforeEach(async () => truncateAll())
 afterAll(async () => closeTestDb())
 
+async function scoreCompanyAndPersist(...args: Parameters<typeof persistScore>) {
+  const [db, company, opts] = args
+  const owned = await proveBoard(company.id, NOW)
+  const jobs = await db.opportunity.findMany({ where: { companyId: company.id, status: 'open' } })
+  const evidence = await db.evidence.findMany({ where: { companyId: company.id, sourceType: 'ats' }, select: { sourceUrl: true } })
+  if (jobs.some((o) => !evidence.some((e) => e.sourceUrl === o.roleUrl))) await boardSnapshot(company.id, NOW, jobs.map((o) => ({ ...syntheticJob(o.externalId!, o.title ?? '', o.description ?? ''), location: { name: o.location } })))
+  return persistScore(db, { ...company, ...owned }, opts)
+}
+
 async function makeCompany(overrides: Record<string, unknown> = {}): Promise<CompanyForScoring> {
-  return testDb().company.create({
+  const company = await testDb().company.create({
     data: {
       canonicalDomain: `c${Math.random().toString(36).slice(2, 10)}.example`,
       displayName: 'Test Co',
@@ -29,6 +39,7 @@ async function makeCompany(overrides: Record<string, unknown> = {}): Promise<Com
     },
     select: COMPANY_SCORING_SELECT,
   })
+  return proveBoard(company.id, new Date('2026-09-01T00:00:00Z'))
 }
 
 async function addEvidence(
@@ -37,10 +48,11 @@ async function addEvidence(
   excerpt: string,
   observedAt = NOW,
 ): Promise<string> {
+  const company = await testDb().company.findUniqueOrThrow({ where: { id: companyId } })
   const row = await testDb().evidence.create({
     data: {
       companyId,
-      sourceUrl: `https://example.invalid/${Math.random().toString(36).slice(2)}`,
+      sourceUrl: `https://${company.canonicalDomain}/research/${Math.random().toString(36).slice(2)}`,
       sourceType,
       excerpt,
       contentHash: Math.random().toString(36).slice(2),
@@ -54,17 +66,10 @@ async function addEvidence(
 }
 
 async function addBoardCount(companyId: string, count: number, observedAt: Date): Promise<void> {
-  const evidenceId = await addEvidence(companyId, 'ats', JSON.stringify({ openPostings: count }), observedAt)
-  await testDb().companySignal.create({
-    data: {
-      companyId,
-      evidenceId,
-      signalType: 'job_posting',
-      observedAt,
-      confidence: 0.95,
-      numericValue: count,
-    },
-  })
+  await proveBoard(companyId, observedAt)
+  const result = await boardSnapshot(companyId, observedAt, Array.from({ length: count }, (_, i) => syntheticJob(String(i))))
+  if (!result.complete) throw new Error('Synthetic complete board expected')
+
 }
 
 describe('ScoreVersion rows (A1, A11)', () => {
@@ -153,7 +158,7 @@ describe('scoring a company end to end', () => {
         kind: 'published_role',
         status: 'open',
         title: 'iOS Engineer Intern',
-        roleUrl: 'https://boards.example/jobs/1',
+        roleUrl: 'https://job-boards.greenhouse.io/acme/jobs/job-1',
         externalId: 'job-1',
         lastSeenAt: NOW,
       },
@@ -171,7 +176,7 @@ describe('scoring a company end to end', () => {
     await testDb().opportunity.create({
       data: {
         companyId: company.id, kind: 'published_role', status: 'open', title: 'Android Engineer',
-        roleUrl: url, externalId: 'job-2', lastSeenAt: NOW,
+        roleUrl: url, externalId: '4242', lastSeenAt: NOW,
       },
     })
     await scoreCompanyAndPersist(testDb(), company, { now: NOW })
@@ -298,7 +303,7 @@ describe('posting bodies (F5b)', () => {
     await testDb().opportunity.create({
       data: {
         companyId: company.id, kind: 'published_role', status: 'open', title, description,
-        roleUrl: 'https://boards.example/jobs/9', externalId: `job-${Math.random()}`, lastSeenAt: NOW,
+        roleUrl: 'https://job-boards.greenhouse.io/acme/jobs/job-9', externalId: 'job-9', lastSeenAt: NOW,
       },
     })
     await scoreCompanyAndPersist(testDb(), company, { now: NOW })
@@ -327,7 +332,7 @@ describe('posting bodies (F5b)', () => {
       data: {
         companyId: company.id, kind: 'published_role', status: 'open', title: 'Engineer, Growth',
         description: 'You will ship our Android app in Kotlin with Jetpack Compose.',
-        roleUrl: 'https://boards.example/jobs/11', externalId: 'job-body-1', lastSeenAt: NOW,
+        roleUrl: 'https://job-boards.greenhouse.io/acme/jobs/job-body-1', externalId: 'job-body-1', lastSeenAt: NOW,
       },
     })
     const outcome = await scoreCompanyAndPersist(testDb(), company, { now: NOW })

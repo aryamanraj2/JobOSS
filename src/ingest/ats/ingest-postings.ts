@@ -14,8 +14,7 @@ import { AshbyProvider } from './ashby.js'
 import { GreenhouseProvider } from './greenhouse.js'
 import { LeverProvider } from './lever.js'
 import type { AtsVendor } from './signatures.js'
-import { detectAllAtsInText } from './signatures.js'
-import { canonicalizeDomain } from '../domain/canonicalize.js'
+import { verifiedOwnership, belongsToBoard } from './verified.js'
 
 export function atsProviders(fetcher: GatedFetcher): Record<AtsVendor, AtsProvider> {
   return {
@@ -37,7 +36,7 @@ export type PostingIngestResult = {
   sourceFailure?: { reason: ReasonCodeValue; detail: string } | undefined
 }
 
-export type IngestPostingsOptions = { now?: () => Date }
+export type IngestPostingsOptions = { now?: () => Date; maxPostings?: number }
 
 /**
  * Reads one company's board and writes `Opportunity` rows with provenance.
@@ -68,18 +67,17 @@ export async function ingestPostings(
 ): Promise<PostingIngestResult> {
   const now = opts.now ?? (() => new Date())
   const observedAt = now()
+  const maxPostings = opts.maxPostings ?? 2000
+  if (!Number.isInteger(maxPostings) || maxPostings < 1 || maxPostings > 10_000 || !Number.isFinite(observedAt.getTime())) throw new Error('Invalid ATS observation/bound')
   const result: PostingIngestResult = { fetched: 0, created: 0, updated: 0, unchanged: 0, duplicates: 0 }
 
   const owner = await db.company.findUnique({ where: { id: company.id }, select: {
-    canonicalDomain: true, atsSlug: true, atsBoardToken: true, atsOwnershipEvidenceId: true, atsOwnershipVerifiedAt: true,
+    id: true, canonicalDomain: true, atsSlug: true, atsBoardToken: true, atsOwnershipEvidenceId: true, atsOwnershipVerifiedAt: true,
   } })
   const ownership = owner?.atsOwnershipEvidenceId
     ? await db.evidence.findUnique({ where: { id: owner.atsOwnershipEvidenceId } }) : null
-  const ownershipDomain = ownership ? canonicalizeDomain(ownership.sourceUrl) : null
-  if (!owner?.atsOwnershipVerifiedAt || !ownership || ownership.companyId !== company.id ||
-      !ownershipDomain?.ok || ownershipDomain.domain !== owner.canonicalDomain ||
-      owner.atsSlug !== provider.slug || owner.atsBoardToken !== company.atsBoardToken ||
-      !detectAllAtsInText(ownership.excerpt).some((hit) => hit.vendor === provider.slug && hit.boardToken === company.atsBoardToken)) {
+  if (!owner || !verifiedOwnership(owner, ownership, observedAt) ||
+      owner.atsSlug !== provider.slug || owner.atsBoardToken !== company.atsBoardToken) {
     result.sourceFailure = { reason: 'weak_evidence', detail: 'ATS board ownership is not verified by an employer careers link' }
     await writeAudit(db, { actorType: 'system', actorId: `ats-${provider.slug}`, action: 'ats.ownership_refused',
       subjectType: 'Company', subjectId: company.id, reasonCode: 'weak_evidence' })
@@ -111,6 +109,11 @@ export async function ingestPostings(
     return result
   }
 
+  // A malformed or foreign role URL invalidates completeness, even if the feed envelope parsed.
+  const accepted = postings.filter((p) => p.externalId && p.title && belongsToBoard(p.url, owner))
+  if (accepted.length !== postings.length) complete = false
+  if (accepted.length > maxPostings) complete = false
+  postings = accepted.slice(0, maxPostings)
   result.fetched = postings.length
   result.complete = complete
   const seenExternalIds = new Set<string>()
@@ -188,7 +191,9 @@ async function upsertPosting(
   if (existing) {
     const currentHash = postingContentHash({ externalId: existing.externalId!, title: existing.title ?? '',
       url: existing.roleUrl ?? '', location: existing.location, content: existing.description ?? '', postedAt: existing.postedAt })
-    if (currentHash === hash) {
+    const currentEvidence = await db.evidence.findFirst({ where: { companyId, sourceUrl: posting.url, sourceType: 'ats', contentHash: hash,
+      observedAt: { gte: new Date(observedAt.getTime() - 60 * 86_400_000), lte: observedAt } } })
+    if (currentHash === hash && currentEvidence) {
       // Unchanged: touch `lastSeenAt` only. A8's freshness question is "was this
       // still listed", and that is exactly what lastSeenAt answers.
       await db.opportunity.update({
@@ -227,6 +232,14 @@ async function upsertPosting(
     confidence: 0.95,
     fetchedVia: FETCHED_VIA.structuredFeed,
   })
+
+  // Keep bounded, verbatim body windows so a body-only fit has an actual quotable citation.
+  for (let offset = 0; offset < posting.content.length && offset < 4000; offset += 500) {
+    const excerpt = posting.content.slice(offset, offset + 500)
+    if (!excerpt.trim()) continue
+    await writeEvidence(db, { companyId, sourceUrl: posting.url, sourceType: 'ats', excerpt,
+      contentHash: hash, observedAt, confidence: 0.95, fetchedVia: FETCHED_VIA.structuredFeed })
+  }
 
   const data = {
     kind: 'published_role' as const,

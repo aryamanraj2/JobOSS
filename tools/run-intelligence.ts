@@ -29,6 +29,7 @@ import { SignalGraphService } from '../src/intel/signal-graph.js'
 import { researchCompanyPage } from '../src/intel/research/page-research.js'
 import { FirecrawlResearchProvider } from '../src/intel/research/firecrawl.js'
 import { queueResearchBrief } from '../src/intel/brief/queue-brief.js'
+import { rankOutreachCompanies } from '../src/intel/outreach/assess.js'
 import { ACTIVE_SCORE_VERSION } from '../src/intel/scoring/score-version.js'
 
 function flag(name: string): string | undefined {
@@ -104,26 +105,19 @@ if (researchLimit > 0) {
     ...(refreshPages ? { pageRefreshDays: 0 } : {}),
   })
 
-  // Companies the scorer could not label come first: they are the ones with
-  // nothing but a YC blurb, and page research is the only source they have left.
+  // Supported mobile/AI fit and meaningful startup triggers set research order.
+  // Unknown geography and missing ATS remain researchable.
   // `detect_ats` actions are skipped here — detection belongs to `ingest:seed`,
   // which owns the two-stage path and its own rate budget.
   const countryFilter = country ? { countries: { has: country } } : {}
   const seedFilter = seededOnly ? { evidence: { some: { fetchedVia: 'user_hint' as const } } } : {}
-  const companies = [
-    ...(await db.company.findMany({
-      where: { status: 'insufficient_evidence', ...countryFilter, ...seedFilter },
-      select: { id: true, canonicalDomain: true, careersUrl: true, atsSlug: true, atsBoardToken: true, countries: true },
-      orderBy: { createdAt: 'asc' },
-      take: researchLimit,
-    })),
-    ...(await db.company.findMany({
-      where: { status: { not: 'insufficient_evidence' }, ...countryFilter, ...seedFilter },
-      select: { id: true, canonicalDomain: true, careersUrl: true, atsSlug: true, atsBoardToken: true, countries: true },
-      orderBy: { createdAt: 'asc' },
-      take: researchLimit,
-    })),
-  ].slice(0, researchLimit)
+  const priorities = await rankOutreachCompanies(db, { limit: 10_000 })
+  const priorityById = new Map(priorities.map((row) => [row.companyId, row.priority]))
+  const companies = (await db.company.findMany({
+    where: { status: { not: 'excluded' }, ...countryFilter, ...seedFilter },
+    select: { id: true, canonicalDomain: true, careersUrl: true, atsSlug: true, atsBoardToken: true, countries: true, createdAt: true },
+  })).sort((a, b) => (priorityById.get(b.id) ?? 0) - (priorityById.get(a.id) ?? 0) ||
+    a.createdAt.getTime() - b.createdAt.getTime()).slice(0, researchLimit)
 
   console.log(
     `\nResearching ${companies.length} companies${country ? ` in ${country}` : ''}` +

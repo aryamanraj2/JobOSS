@@ -25,11 +25,13 @@ export function parseFundingDate(value: unknown): FundingDate {
 }
 
 export function fundingSourceKey(round: Record<string, unknown>): string {
-  // Event IDs identify the same round across investor portfolios; deterministic fields cover sources without IDs.
-  return str(round.eventId) ? `startupdb:${str(round.eventId)!}` : `round:${contentHashOf({
-    stage: str(round.roundLabel), date: str(round.eventDate), amount: object(round.amount),
-    sources: strings(round.sourceUrls).sort(),
-  })}`
+  // Strong IDs win. Otherwise equal dated round facts merge across portfolio/source URLs.
+  const eventId = str(round.eventId) ?? (Number.isSafeInteger(round.eventId) ? String(round.eventId) : null)
+  if (eventId) return `startupdb:${eventId}`
+  const stage = str(round.roundLabel)?.toLowerCase().trim() ?? null, date = str(round.eventDate), amount = object(round.amount)
+  if (stage && date && parseFundingDate(date).announcedAt) return `facts:${contentHashOf({ stage, date, amount })}`
+  // Sparse/undated facts cannot safely be identified as one event across sources.
+  return `round:${contentHashOf({ stage, date, amount, sources: strings(round.sourceUrls).sort() })}`
 }
 
 export function earlyFundingStage(stage: string | null): boolean {
@@ -44,25 +46,36 @@ export function fundingRecent(date: FundingDate, now: Date, days = 180): boolean
   return start >= now.getTime() - days * 86_400_000 && end <= now.getTime()
 }
 
-/** Conservative source support: the source must name the company, funding stage and matching event date. */
+/**
+ * Recognize a narrow affirmative company/action/stage/date statement, not a bag
+ * of sentence-wide words. Ambiguous compound clauses and investor-name stages
+ * stay indexed. This intentionally is not a general language fact checker.
+ */
 export function fundingSupportExcerpt(text: string, companyName: string, stage: string, date: FundingDate): string | null {
-  if (!date.announcedAt || date.datePrecision === 'unknown') return null
+  if (!date.announcedAt || !Number.isFinite(date.announcedAt.getTime()) || date.datePrecision === 'unknown') return null
   const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
-  const company = normalize(companyName), fundingStage = normalize(stage)
+  const company = normalize(companyName)
+  const fundingStage = normalize(stage).replace(/ (?:round|funding)$/, '')
+  if (!company || !/^(?:pre seed|preseed|seed|series [a-z])$/.test(fundingStage)) return null
   const year = String(date.announcedAt.getUTCFullYear())
   const monthName = new Intl.DateTimeFormat('en', { month: 'long', timeZone: 'UTC' }).format(date.announcedAt)
-  const month = `(?:${monthName}|${monthName.slice(0, 3)}\\.?)`
+  const month = String.raw`(?:${monthName}|${monthName.slice(0, 3)}\.?)`
   const day = date.announcedAt.getUTCDate()
-  const exactDate = date.datePrecision === 'date'
-    ? new RegExp(`\\b(?:${date.dateText}|${month}\\s+${day}(?:st|nd|rd|th)?\\s*,?\\s*${year}|${day}(?:st|nd|rd|th)?\\s+${month}\\s*,?\\s*${year})\\b`, 'i')
+  const iso = date.announcedAt.toISOString().slice(0, date.datePrecision === 'date' ? 10 : date.datePrecision === 'month' ? 7 : 4)
+  const datePattern = date.datePrecision === 'date'
+    ? String.raw`\b(?:${iso}|${month}\s+${day}(?:st|nd|rd|th)?\s*,?\s*${year}|${day}(?:st|nd|rd|th)?\s+${month}\s*,?\s*${year})\b`
     : date.datePrecision === 'month'
-      ? new RegExp(`\\b(?:${date.dateText}(?:-\\d{2})?|${month}\\s+(?:\\d{1,2}(?:st|nd|rd|th)?\\s*,?\\s*)?${year})\\b`, 'i')
-      : new RegExp(`\\b${year}\\b`)
-  for (let offset = 0; offset < text.length; offset += 250) {
-    const excerpt = text.slice(offset, offset + 500)
-    const normalized = normalize(excerpt)
-    if (!normalized.includes(company) || !normalized.includes(fundingStage) || !/rais|fund|invest|financ/i.test(excerpt)) continue
-    if (!exactDate.test(excerpt)) continue
+      ? String.raw`\b(?:${iso}(?:-\d{2})?|${month}\s+(?:\d{1,2}(?:st|nd|rd|th)?\s*,?\s*)?${year})\b`
+      : String.raw`\b${year}\b`
+  const factPrefix = new RegExp(String.raw`^${company} (?:has )?(?:raised|raises|secured|closed|announced) (?:a |an |its )?${fundingStage} (?:funding(?: round)?|round|financing|investment)(?: from\s*\d+ investors)? (?:on|in)$`)
+  // Readability may concatenate adjacent paragraphs without a space after punctuation.
+  for (const sentence of text.split(/(?<=[.!?])(?:\s+|(?=[A-Z]))|[\r\n]+/)) {
+    const excerpt = sentence.trim()
+    if (!excerpt || excerpt.length > 500) continue
+    const eventDate = new RegExp(datePattern, 'i').exec(excerpt)
+    if (!eventDate || !factPrefix.test(normalize(excerpt.slice(0, eventDate.index)))) continue
+    // A second event, qualification or attribution after the date is undetermined.
+    if (!/^[.!?]?\s*$/.test(excerpt.slice(eventDate.index + eventDate[0].length))) continue
     return excerpt
   }
   return null
@@ -71,44 +84,56 @@ export function fundingSupportExcerpt(text: string, companyName: string, stage: 
 export async function storeFundingRound(db: Db, gate: GatedFetcher,
   company: { id: string; canonicalDomain: string; displayName: string }, round: Record<string, unknown>,
   indexUrl: string, now: Date, investor?: { name: string; domain: string }): Promise<void> {
-  const sourceKey = fundingSourceKey(round)
-  const existing = await db.fundingRecord.findUnique({ where: { companyId_sourceKey: { companyId: company.id, sourceKey } } })
-  if (existing?.verificationStatus === 'primary_verified') return
+  let sourceKey = fundingSourceKey(round)
+  let existing = await db.fundingRecord.findUnique({ where: { companyId_sourceKey: { companyId: company.id, sourceKey } } })
   const date = parseFundingDate(round.eventDate)
+  if (!existing && !str(round.eventId) && date.announcedAt && str(round.roundLabel)) {
+    const legacy = await db.fundingRecord.findMany({ where: { companyId: company.id, stage: str(round.roundLabel), dateText: date.dateText }, take: 10 })
+    const matching = legacy.filter((r) => r.sourceKey.startsWith('round:') &&
+      r.amount?.toString() === (str(object(round.amount).original) ?? undefined) && r.currency === str(object(round.amount).currency))
+    if (matching.length === 1) { existing = matching[0]!; sourceKey = existing.sourceKey }
+  }
   const stage = str(round.roundLabel)
   const amount = object(round.amount)
   const numericAmount = str(amount.original)
   const parsedAmount = numericAmount && /^\d+(?:\.\d+)?$/.test(numericAmount) ? numericAmount : null
   const sources = strings(round.sourceUrls)
-  let evidenceId: string | null = existing?.evidenceId ?? null
+  let evidenceId: string | null = null
   let verificationStatus = 'indexed'
   let sourceUrl = indexUrl
-  const primary = sources.find((url) => {
+  const attempts: Record<string, unknown>[] = []
+  const primaries = [...new Set(sources)].filter((url) => {
     const domain = canonicalizeDomain(url)
     return domain.ok && (domain.domain === company.canonicalDomain || domain.domain === investor?.domain)
-  })
-  if (primary && stage) {
-    const domain = canonicalizeDomain(primary)
-    if (domain.ok) await ensureDerivedCompanyHost(db, { companyId: company.id, host: domain.domain, sourceUrl: indexUrl })
-    const page = await fetchPage(gate, primary, { companyId: company.id, cost: 1, sameHostDelayMs: 5_000 })
-    if (page.ok) {
+  }).slice(0, 3)
+  for (const primary of primaries) {
+    if (!stage || !date.announcedAt || date.announcedAt > now) break
+    try {
+      const domain = canonicalizeDomain(primary)
+      if (domain.ok) await ensureDerivedCompanyHost(db, { companyId: company.id, host: domain.domain, sourceUrl: indexUrl })
+      const page = await fetchPage(gate, primary, { companyId: company.id, cost: 1, sameHostDelayMs: 5_000 })
+      if (!page.ok) { attempts.push({ url: primary, failure: page.detail }); continue }
       const servedDomain = canonicalizeDomain(page.url)
       const readable = extractReadable(page.body)
       const excerpt = servedDomain.ok && (servedDomain.domain === company.canonicalDomain || servedDomain.domain === investor?.domain)
         ? fundingSupportExcerpt(readable?.text ?? '', company.displayName, stage, date) : null
-      if (excerpt) {
-        const evidence = await writeEvidence(db, { companyId: company.id, sourceUrl: page.url,
+      attempts.push({ url: primary, servedUrl: page.url, contentHash: contentHashOf(page.body), supported: !!excerpt })
+      if (!excerpt) continue
+      const hash = contentHashOf(page.body)
+      const evidence = await db.evidence.findFirst({ where: { companyId: company.id, sourceUrl: page.url, contentHash: hash, excerpt,
+        observedAt: { gte: new Date(now.getTime() - 60 * 86_400_000), lte: now } } }) ??
+        await writeEvidence(db, { companyId: company.id, sourceUrl: page.url,
           sourceType: servedDomain.ok && servedDomain.domain === company.canonicalDomain ? 'company_page' : 'external_source',
-          excerpt, contentHash: contentHashOf(page.body), observedAt: now, publishedAt: date.announcedAt,
+          excerpt, contentHash: hash, observedAt: now, publishedAt: date.announcedAt,
           confidence: 0.95, fetchedVia: 'static_fetch' })
-        evidenceId = evidence.id
-        sourceUrl = page.url
-        verificationStatus = 'primary_verified'
-      }
-    }
+      evidenceId = evidence.id
+      sourceUrl = page.url
+      verificationStatus = 'primary_verified'
+      break
+    } catch (error) { attempts.push({ url: primary, failure: error instanceof Error ? error.message : String(error) }) }
   }
   if (!evidenceId) {
-    const evidence = await writeEvidence(db, { companyId: company.id, sourceUrl: indexUrl, sourceType: 'external_source',
+    const evidence = await db.evidence.findFirst({ where: { companyId: company.id, sourceUrl: indexUrl, contentHash: contentHashOf(round) } }) ?? await writeEvidence(db, { companyId: company.id, sourceUrl: indexUrl, sourceType: 'external_source',
       excerpt: verbatimExcerpt(JSON.stringify({ roundLabel: round.roundLabel, eventDate: round.eventDate,
         amount: round.amount, sourceUrls: round.sourceUrls })), contentHash: contentHashOf(round),
       observedAt: now, confidence: 0.65, fetchedVia: 'structured_feed' })
@@ -117,9 +142,21 @@ export async function storeFundingRound(db: Db, gate: GatedFetcher,
   const investorNames = array(round.participants).map((participant) => str(object(participant).name)).filter((name): name is string => !!name)
   const data = { companyId: company.id, sourceKey, sourceUrl, evidenceId, stage, amount: parsedAmount,
     currency: str(amount.currency), ...date, investorNames, verificationStatus, observedAt: now,
-    metadata: { originalSourceUrls: sources, original: round, attribution: 'StartupDB (https://startupdb.com)',
+    metadata: { originalSourceUrls: [...new Set([...strings(object(existing?.metadata).originalSourceUrls), ...sources])],
+      indexUrls: [...new Set([...strings(object(existing?.metadata).indexUrls), indexUrl])],
+      primaryAttempts: attempts, previousVerification: existing?.verificationStatus ?? null,
+      fields: { stage: verificationStatus, date: verificationStatus, amount: 'indexed', currency: 'indexed', investors: 'indexed' },
+      currentStageUncertainty: 'Incomplete round history; latest known round is not verified current stage',
+      conflicts: [...array(object(existing?.metadata).conflicts), ...(existing &&
+        (existing.stage !== stage || existing.dateText !== date.dateText || existing.amount?.toString() !== (parsedAmount ?? undefined) || existing.currency !== str(amount.currency))
+        ? [{ previousStage: existing.stage, previousDateText: existing.dateText, previousAmount: existing.amount?.toString() ?? null, previousCurrency: existing.currency, detectedAt: now.toISOString() }] : [])].slice(-20),
+      original: round, attribution: 'StartupDB (https://startupdb.com)',
       license: 'CC BY 4.0', dateMeaning: round.dateMeaning ?? 'unknown' } as Prisma.InputJsonValue }
-  await db.fundingRecord.upsert({ where: { companyId_sourceKey: { companyId: company.id, sourceKey } }, create: data, update: data })
-  if (!existing) await writeCompanySignal(db, { companyId: company.id, evidenceId, signalType: 'funding_or_growth',
-    observedAt: now, confidence: verificationStatus === 'primary_verified' ? 0.95 : 0.65 })
+  const persist = async (tx: Db) => {
+    await tx.fundingRecord.upsert({ where: { companyId_sourceKey: { companyId: company.id, sourceKey } }, create: data, update: data })
+    if (!existing) await writeCompanySignal(tx, { companyId: company.id, evidenceId, signalType: 'funding_or_growth',
+      observedAt: now, confidence: verificationStatus === 'primary_verified' ? 0.95 : 0.65 })
+  }
+  if ('$transaction' in db) await db.$transaction(persist)
+  else await persist(db)
 }

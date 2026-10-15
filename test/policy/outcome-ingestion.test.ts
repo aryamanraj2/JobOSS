@@ -113,7 +113,7 @@ function inbound(over: Partial<InboundForIngest> = {}): InboundForIngest {
   return {
     providerMessageId: `in-${Math.random().toString(16).slice(2)}`,
     threadId: 'thread-1',
-    from: 'someone@acme.example',
+    from: RECIPIENT,
     subject: 'Re: Internship enquiry',
     bodyText: 'Thanks for writing.',
     inReplyTo: OUR_MESSAGE_ID,

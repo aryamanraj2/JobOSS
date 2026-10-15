@@ -509,7 +509,7 @@ describe('A9 — a crash mid-send issues no second send', () => {
     expect(await db.sendAttempt.count()).toBe(1)
   })
 
-  it('marks failed, and does NOT send again, when the reconciliation finds nothing', async () => {
+  it('marks a definite provider refusal failed without delivering', async () => {
     const { db, draftId } = await world()
     const mail = new FakeMailProvider({ messageIdDomain: 'owned.example' })
     mail.failNextSendWith(new Error('400 malformed'))
@@ -546,7 +546,7 @@ describe('A9 — a crash mid-send issues no second send', () => {
   it('a provider that strips the custom header too still cannot cause a double send', async () => {
     // The residual risk once the Message-ID is known not to survive. If the handle is
     // gone entirely the reconciliation genuinely cannot tell — and the requirement is
-    // that it reports failure rather than guessing, because a guess of "not sent" is
+    // that it retains a pending reservation rather than guessing, because a guess of "not sent" is
     // what delivers a second copy.
     const { db, draftId } = await world()
     const mail = new FakeMailProvider({ messageIdDomain: 'owned.example', preservesOutreachRef: false })
@@ -555,7 +555,8 @@ describe('A9 — a crash mid-send issues no second send', () => {
     const result = await sendApprovedDraft(db, mail, draftId, baseOptions())
 
     expect(mail.sent).toHaveLength(1) // it WAS delivered
-    expect(result.status).toBe('failed') // and we cannot tell
+    expect(result.status).toBe('pending_reconciliation') // and we cannot tell
+    expect((await db.sendAttempt.findFirstOrThrow()).status).toBe('in_flight')
     expect(mail.sendCalls).toBe(1) // but we still did not send twice
   })
 })

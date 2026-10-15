@@ -1,3 +1,4 @@
+import { isStandaloneDatabaseClient } from '../../core/joboss/database-scope.js'
 import type { Db } from '../../core/audit/audit-log.js'
 import { writeAudit } from '../../core/audit/audit-log.js'
 import type { ReasonCodeValue } from '../../core/reason-codes/registry.js'
@@ -202,20 +203,27 @@ export async function revokeApproval(
   draftId: string,
   revokedBy: string,
 ): Promise<RevokeResult> {
+  return isStandaloneDatabaseClient(db)
+    ? db.$transaction((tx) => revokeApprovalLocked(tx, draftId, revokedBy), { timeout: 30_000 })
+    : revokeApprovalLocked(db, draftId, revokedBy)
+}
+
+async function revokeApprovalLocked(db: Db, draftId: string, revokedBy: string): Promise<RevokeResult> {
+  // Orders with the sender's conditional approved->sending transition. Audit and
+  // clearing the approval commit with this row lock; success cannot race a reservation.
+  await db.$queryRaw`SELECT id FROM draft WHERE id = ${draftId} FOR UPDATE`
   const draft = await db.draft.findUnique({
     where: { id: draftId },
     select: { id: true, status: true, approvedAt: true, approvedBy: true, approvalHash: true, senderIdentity: true },
   })
   if (!draft) return { ok: false, reason: 'unknown_draft', detail: draftId }
-  if (draft.status !== 'approved' || !draft.approvedAt) {
-    return { ok: false, reason: 'not_approved', detail: `status is "${draft.status}"; only an approved draft can be revoked` }
-  }
-
   const attempt = await db.sendAttempt.findFirst({ where: { draftId }, select: { id: true, status: true } })
   if (attempt) {
     return { ok: false, reason: 'send_attempted', detail: `send attempt ${attempt.id} is ${attempt.status}` }
   }
-
+  if (draft.status !== 'approved' || !draft.approvedAt) {
+    return { ok: false, reason: 'not_approved', detail: `status is "${draft.status}"; only an approved draft can be revoked` }
+  }
   // Conditional on the status the checks above read, so a draft that moved on in the
   // meantime (scheduled, sending) is not dragged back by a stale read.
   const updated = await db.draft.updateMany({
