@@ -1,5 +1,6 @@
 import type { ReasonCodeValue } from '../../core/reason-codes/registry.js'
 import { classifyLocal } from '../contacts/classify.js'
+import { recipientSuitability } from '../contacts/suitability.js'
 
 /**
  * §10.7 — which contacts at one company may become drafts, and how many.
@@ -35,33 +36,6 @@ import { classifyLocal } from '../contacts/classify.js'
  *
  * The number of eligible contacts per company is 1 to 6 in the live corpus today.
  */
-
-/**
- * Titles that are a recruiting route. Checked FIRST, before the exclusions, because
- * "People Operations Manager" and "Talent Operations Partner" are the HR function and
- * must not be caught by the `operations` exclusion below.
- */
-const RECRUITING_TITLE =
-  /\b(recruit\w*|talent|sourcer|sourcing|staffing|people|hr|human resources|campus|university relations|hiring)\b/i
-
-/**
- * Titles that never take a slot, whatever else they contain. The handover's list
- * (support, IT, intern, website, operations) plus the commercial functions a
- * technical cold email has no business reaching.
- *
- * `\bit\b` is word-anchored so it cannot fire inside "Site" or "Unit"; the pattern is
- * still ambiguous against the English word "it", which no job title contains.
- */
-const EXCLUDED_TITLE =
-  /\b(support|helpdesk|help desk|it|information technology|intern|interns|internship|website|web ops|operations|office manager|facilities|sales|account executive|marketing|finance|accounting|legal|counsel|procurement|customer success|administrator|receptionist)\b/i
-
-/**
- * Engineering titles. The operator chose "recruiters plus any engineering title",
- * which includes individual contributors, so this is deliberately wide — but it is an
- * ALLOWLIST, and an unrecognised title is refused (see `contactSlotRefusal`).
- */
-const ENGINEERING_TITLE =
-  /\b(engineer|engineering|developer|development|software|swe|programmer|ios|android|mobile|frontend|front[- ]end|backend|back[- ]end|full[- ]?stack|platform|infrastructure|devops|sre|machine learning|ml|ai|data|architect|tech lead|technical lead|technologist|research scientist|cto office)\b/i
 
 export type SlotCandidate = {
   id: string
@@ -101,17 +75,8 @@ export function contactSlotRefusal(c: SlotCandidate): SlotRefusal | null {
   // title at all. Only a named human is judged on a title.
   if (!c.contactType.startsWith('named')) return null
 
-  const title = c.publicTitle?.trim()
-  if (!title) {
-    return { reason: 'outreach_not_permitted', detail: 'named contact with no published title' }
-  }
-  if (RECRUITING_TITLE.test(title)) return null
-  const excluded = title.match(EXCLUDED_TITLE)
-  if (excluded) {
-    return { reason: 'outreach_not_permitted', detail: `excluded title: ${title} (matched "${excluded[0]}")` }
-  }
-  if (ENGINEERING_TITLE.test(title)) return null
-  return { reason: 'outreach_not_permitted', detail: `title is neither recruiting nor engineering: ${title}` }
+  const suitability = recipientSuitability(c)
+  return suitability.suitable ? null : { reason: 'outreach_not_permitted', detail: suitability.reason }
 }
 
 /**
@@ -125,19 +90,11 @@ export function contactSlotRefusal(c: SlotCandidate): SlotRefusal | null {
  * case at all (`outreach-case.ts`), so admitting one here would produce a draft that
  * the predicate then refuses — a wasted row and a confusing audit trail.
  */
-const TIER_ORDER: Record<string, number> = {
-  university_recruiting: 0,
-  talent_alias: 1,
-  careers_alias: 2,
-  named_talent: 3,
-  named_employee: 4,
-}
-
 export function selectContactSlots(contacts: SlotCandidate[]): { contactId: string; touchSlot: number }[] {
   return contacts
     .filter((c) => c.verified && contactSlotRefusal(c) === null)
     .sort((a, b) => {
-      const rank = (TIER_ORDER[a.contactType] ?? 99) - (TIER_ORDER[b.contactType] ?? 99)
+      const rank = recipientSuitability(a).priority - recipientSuitability(b).priority
       // Ties break on id so a re-run selects the same contacts rather than reshuffling
       // the operator's review queue — F3 §4.4's rule, for the same reason.
       return rank !== 0 ? rank : a.id.localeCompare(b.id)

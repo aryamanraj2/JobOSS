@@ -84,6 +84,8 @@ export type SendGateOptions = {
   caps?: SendCaps
   breaker?: BreakerConfig
   touchNumber?: number
+  /** Final @5 validator is owned by People/drafts; absent means fail closed. */
+  evaluateOutreachReadiness?: (db: Db, draftId: string, now: Date) => Promise<{ ready: boolean; detail: string }>
 }
 
 /**
@@ -126,6 +128,7 @@ export async function evaluateSendGate(
       subject: true,
       bodyText: true,
       outreachCase: true,
+      promptVersion: true,
       approvedAt: true,
       approvalHash: true,
       senderIdentity: true,
@@ -228,10 +231,18 @@ export async function evaluateSendGate(
   // Re-derived from live rows rather than trusted from `draft.outreachCase`. The
   // stored value is what was true at composition; Part C is a question about now, and
   // an application submitted since approval changes the answer.
-  const facts = factsFor(lead, contact, contact.verified)
-  const decision = decideOutreachCase(facts)
-  if (!decision.permitted) {
-    return await refuse(db, draftId, decision.reason, 'the Part C predicate refuses this message now')
+  if (draft.promptVersion === 'outreach_draft@5') {
+    if (!opts.evaluateOutreachReadiness) {
+      return await refuse(db, draftId, 'weak_evidence', '@5 readiness validator is not integrated')
+    }
+    const readiness = await opts.evaluateOutreachReadiness(db, draftId, now)
+    if (!readiness.ready) return await refuse(db, draftId, 'weak_evidence', readiness.detail)
+  } else {
+    const facts = factsFor(lead, contact, contact.verified)
+    const decision = decideOutreachCase(facts)
+    if (!decision.permitted) {
+      return await refuse(db, draftId, decision.reason, 'the Part C predicate refuses this message now')
+    }
   }
 
   // --- 4. Evidence freshness, and the posting for a posted role (A8) --------
@@ -255,7 +266,7 @@ export async function evaluateSendGate(
   // runs BEFORE this function (see `refreshPostingBeforeSend`) — a network call inside
   // the gate's transaction would hold a database transaction open across the internet.
   // What is checked here is the refreshed state.
-  if (facts.hasRelevantPosting && lead.opportunity) {
+  if (lead.leadKind === 'posted_role' && lead.opportunity) {
     if (lead.opportunity.status !== 'open') {
       return await refuse(db, draftId, 'stale_at_send', `posting status is "${lead.opportunity.status}"`)
     }

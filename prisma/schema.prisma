@@ -184,10 +184,9 @@ enum OutreachCase {
 /// **Tier B — quality.** A named human, `named_talent` for a published Talent/People
 /// contact and `named_employee` for any other individual contributor or line manager.
 ///
-/// `handover.md` §1.1 is NOT amended: founders, CEOs, C-suite and VPs are never
-/// targeted, at any tier. There is deliberately no enum value that could hold one, and
-/// `src/outreach/contacts/executive-filter.ts` refuses them with
-/// `executive_only_contact` before a row can be written.
+/// JOBOSS permits relevant founders, engineers, technical leaders and recruiting
+/// contacts. Named people use named_employee/named_talent; verified identity and
+/// suitability are assessed separately from title.
 enum ContactType {
   careers_alias
   talent_alias
@@ -262,6 +261,7 @@ enum EvidenceSourceType {
   social_api
   browser_task
   user_hint
+  external_source
 
   @@map("evidence_source_type")
 }
@@ -390,6 +390,8 @@ enum ReasonCode {
 model Evidence {
   id          String             @id @default(uuid(7))
   companyId   String?            @map("company_id")
+  contactId   String?            @map("contact_id")
+  publishedAt DateTime?          @map("published_at")
   sourceUrl   String             @map("source_url")
   sourceType  EvidenceSourceType @map("source_type")
   excerpt     String             @map("excerpt") @db.VarChar(500)
@@ -403,7 +405,10 @@ model Evidence {
 
   company       Company?        @relation(fields: [companyId], references: [id], onDelete: SetNull)
   companySignal CompanySignal[]
+  contact       Contact?        @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  fundingRecords FundingRecord[]
 
+  @@index([contactId])
   @@index([companyId])
   @@index([contentHash])
   @@index([sourceType, observedAt])
@@ -537,6 +542,7 @@ model ResearchBudget {
 
   company Company? @relation(fields: [companyId], references: [id], onDelete: Cascade)
 
+  /// Global null-company uniqueness is enforced by one_global_research_budget_per_period in SQL.
   @@unique([companyId, periodMonth])
   @@map("research_budget")
 }
@@ -625,6 +631,8 @@ model Company {
   statusReason  ReasonCode?   @map("status_reason")
   atsSlug       String?       @map("ats_slug")
   atsBoardToken String?       @map("ats_board_token")
+  atsOwnershipEvidenceId String? @map("ats_ownership_evidence_id")
+  atsOwnershipVerifiedAt DateTime? @map("ats_ownership_verified_at")
   careersUrl    String?       @map("careers_url")
   lastRefreshedAt DateTime?   @map("last_refreshed_at")
   createdAt     DateTime      @default(now()) @map("created_at")
@@ -639,6 +647,9 @@ model Company {
   applicationPackets ApplicationPacket[]
   sendAttempts       SendAttempt[]
   researchBudgets    ResearchBudget[]
+  fundingRecords     FundingRecord[]
+  outreachAssessment OutreachAssessment?
+  contactResearch    ContactResearch[]
 
   @@index([status])
   @@index([ycBatch])
@@ -747,6 +758,11 @@ model Contact {
   /// Tier A only: which page kind yielded this address. Drives the yield report.
   sourcePageKind ContactSourcePageKind? @map("source_page_kind")
   publicTitle    String?       @map("public_title")
+  fullName       String?       @map("full_name")
+  identitySourceUrl String?    @map("identity_source_url")
+  identityVerifiedAt DateTime? @map("identity_verified_at")
+  suitability    String?      @map("suitability")
+  suitabilityReason String?   @map("suitability_reason")
   /// Mandatory: the public page this address was published on, with the excerpt
   /// and capture timestamp on the Evidence row.
   evidenceId     String        @map("evidence_id")
@@ -758,8 +774,11 @@ model Contact {
   leads        Lead[]
   drafts       Draft[]
   sendAttempts SendAttempt[]
+  personEvidence Evidence[]
+  research       ContactResearch?
 
   @@unique([emailNormalized])
+  @@unique([id, companyId])
   @@index([companyId, status])
   @@map("contact")
 }
@@ -937,6 +956,8 @@ model Draft {
   /// `one_first_touch_per_company_per_cycle` with an index over this column, so the
   /// database keeps a hard ceiling of two rather than trusting policy code.
   touchSlot       Int          @default(0) @map("touch_slot")
+  revision        Int          @default(1) @map("revision")
+  revisionOfId    String?      @map("revision_of_id")
   researchBriefId String?      @map("research_brief_id")
   resumeVersionId String?      @map("resume_version_id")
   status          DraftStatus  @default(composing) @map("status")
@@ -991,11 +1012,13 @@ model Draft {
   researchBrief ResearchBrief? @relation(fields: [researchBriefId], references: [id], onDelete: SetNull)
   resumeVersion ResumeVersion? @relation(fields: [resumeVersionId], references: [id], onDelete: SetNull)
   sendAttempts  SendAttempt[]
+  revisionOf    Draft? @relation("DraftRevisions", fields: [revisionOfId], references: [id], onDelete: SetNull)
+  revisions     Draft[] @relation("DraftRevisions")
 
   /// One draft per recipient per cycle's slot. The company-level ceiling of two
   /// lives on `send_attempt` (D3) where A2's invariant belongs — this only stops the
   /// composer handing the operator two copies of the same message to the same person.
-  @@unique([leadId, contactId, touchSlot])
+  @@unique([leadId, contactId, touchSlot, revision])
   @@index([status])
   @@map("draft")
 }
@@ -1043,6 +1066,7 @@ model SendAttempt {
   statusReason      ReasonCode?       @map("status_reason")
   providerMessageId String?           @map("provider_message_id")
   providerThreadId  String?           @map("provider_thread_id")
+  providerRfc822MessageId String?       @map("provider_rfc822_message_id")
   attemptedAt       DateTime          @default(now()) @map("attempted_at")
   reconciledAt      DateTime?         @map("reconciled_at")
 
@@ -1105,6 +1129,7 @@ model Reply {
 
 /// A12: hardness is explicit. A soft bounce must not permanently suppress.
 model Bounce {
+  providerMessageId String? @unique @map("provider_message_id")
   id            String         @id @default(uuid(7))
   sendAttemptId String         @map("send_attempt_id")
   hardness      BounceHardness @map("hardness")
@@ -1120,6 +1145,7 @@ model Bounce {
 }
 
 model OptOut {
+  providerMessageId String? @unique @map("provider_message_id")
   id            String   @id @default(uuid(7))
   sendAttemptId String?  @map("send_attempt_id")
   emailHmac     String   @map("email_hmac")
@@ -1256,9 +1282,102 @@ model LlmTask {
   attempts      Int           @default(0) @map("attempts")
   createdAt     DateTime      @default(now()) @map("created_at")
   claimedAt     DateTime?     @map("claimed_at")
+  claimToken    String?       @map("claim_token")
+  leaseExpiresAt DateTime?    @map("lease_expires_at")
+  runnerMetadata Json?        @map("runner_metadata")
   fulfilledAt   DateTime?     @map("fulfilled_at")
 
+  /// SQL partial uniqueness one_open_llm_task_per_identity applies to pending/claimed tasks only.
   @@index([status, kind])
   @@index([subjectType, subjectId])
   @@map("llm_task")
+}
+
+// JOBOSS: discovery provenance and preparation state are separate from send approval.
+model FundingRecord {
+  id String @id @default(uuid(7))
+  companyId String @map("company_id")
+  sourceKey String @map("source_key")
+  sourceUrl String @map("source_url")
+  evidenceId String @map("evidence_id")
+  stage String?
+  amount Decimal? @db.Decimal(20, 2)
+  currency String?
+  announcedAt DateTime? @map("announced_at")
+  datePrecision String @map("date_precision")
+  dateText String? @map("date_text")
+  investorNames String[] @map("investor_names")
+  verificationStatus String @map("verification_status")
+  observedAt DateTime @map("observed_at")
+  metadata Json?
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  evidence Evidence @relation(fields: [evidenceId], references: [id], onDelete: Restrict)
+  @@unique([companyId, sourceKey])
+  @@index([announcedAt])
+  @@map("funding_record")
+}
+
+model DiscoveryRun {
+  id String @id @default(uuid(7))
+  source String
+  status String
+  cursor Json?
+  counts Json?
+  coverage Json?
+  errors Json?
+  startedAt DateTime @default(now()) @map("started_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  completedAt DateTime? @map("completed_at")
+  @@index([source, status])
+  @@map("discovery_run")
+}
+
+model OutreachAssessment {
+  id String @id @default(uuid(7))
+  companyId String @unique @map("company_id")
+  researchPriority Int @map("research_priority")
+  primaryTrack RoleTrackKey? @map("primary_track")
+  status String
+  blockers String[]
+  eligibility Json?
+  fit Json?
+  trigger Json?
+  selectedContactId String? @map("selected_contact_id")
+  citedEvidenceIds String[] @map("cited_evidence_ids")
+  assessedAt DateTime @map("assessed_at")
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  @@index([researchPriority])
+  @@map("outreach_assessment")
+}
+
+model ContactResearch {
+  id String @id @default(uuid(7))
+  contactId String @unique @map("contact_id")
+  companyId String @map("company_id")
+  identityStatus String @map("identity_status")
+  facts Json
+  hooks Json?
+  citedEvidenceIds String[] @map("cited_evidence_ids")
+  limitations String[]
+  researchedAt DateTime @map("researched_at")
+  verifiedAt DateTime? @map("verified_at")
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  @@map("contact_research")
+}
+
+model PreparationRun {
+  id String @id @default(uuid(7))
+  status String
+  limit Int
+  provider String
+  checkpoint Json
+  usage Json?
+  errors Json?
+  cohort Json?
+  startedAt DateTime @default(now()) @map("started_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  completedAt DateTime? @map("completed_at")
+  @@index([status])
+  @@map("preparation_run")
 }

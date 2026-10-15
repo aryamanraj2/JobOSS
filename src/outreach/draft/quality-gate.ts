@@ -175,8 +175,8 @@ export function runQualityGate(input: GateInput, now: Date = new Date()): GateRe
   // 3. §10.8 and §8: short enough to scan.
   checks.push({
     id: 'body_length',
-    passed: input.bodyText.length <= MAX_BODY_CHARS,
-    detail: `${input.bodyText.length} chars (max ${MAX_BODY_CHARS}); §10.8 "short, not a cover letter"`,
+    passed: input.composition.layout === 'v5' ? input.bodyText.replace(/https?:\/\/\S+/g, '').split(/\s+/).filter(Boolean).length <= 280 : input.bodyText.length <= MAX_BODY_CHARS,
+    detail: input.composition.layout === 'v5' ? 'Detailed narrative capped at 280 words, URLs excluded.' : `${input.bodyText.length} chars (max ${MAX_BODY_CHARS}); §10.8 "short, not a cover letter"`,
   })
   checks.push({
     id: 'subject_length',

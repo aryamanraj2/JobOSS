@@ -168,7 +168,16 @@ export const SCORE_VERSION_V2: ScoreVersionSpec = assertSumsTo100({
  * stays exported and stays frozen: it is what historical `f2-v1` leads and audit
  * rows are replayed against, and editing it would rewrite their meaning.
  */
-export const ACTIVE_SCORE_VERSION: ScoreVersionSpec = SCORE_VERSION_V2
+/** JOBOSS corrects freshness, verified ATS ownership and distinct-source derivation; historical weights remain frozen. */
+export const SCORE_VERSION_V3: ScoreVersionSpec = assertSumsTo100({
+  label: 'joboss-v3',
+  weights: { ...SCORE_VERSION_V2.weights },
+  thresholds: { ...SCORE_VERSION_V2.thresholds },
+  maxRiskDeduction: SCORE_VERSION_V2.maxRiskDeduction,
+  frozenUntilSends: SCORE_VERSION_V2.frozenUntilSends,
+})
+
+export const ACTIVE_SCORE_VERSION: ScoreVersionSpec = SCORE_VERSION_V3
 
 export type ScoreBand = 'queue' | 'research' | 'reject'
 

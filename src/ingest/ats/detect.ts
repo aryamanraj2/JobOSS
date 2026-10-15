@@ -4,7 +4,9 @@ import type { GatedFetcher } from '../../core/interfaces/providers.js'
 import { contentHashOf } from '../../core/evidence/content-hash.js'
 import { FETCHED_VIA, verbatimExcerpt, writeEvidence } from '../../core/evidence/write-evidence.js'
 import { fetchPage } from '../fetch-page.js'
-import { detectAtsInText, detectAtsInUrl, type AtsDetection } from './signatures.js'
+import { parseHTML } from 'linkedom'
+import { canonicalizeDomain } from '../domain/canonicalize.js'
+import { detectAllAtsInText, detectAtsInUrl, type AtsDetection } from './signatures.js'
 
 export type DetectTarget = { id: string; canonicalDomain: string; careersUrl: string | null; website: string | null }
 
@@ -53,6 +55,27 @@ const sleep = (ms: number) =>
  */
 export const CAREERS_PATHS = ['/careers', '/jobs', '/careers/', '/about/careers'] as const
 
+/** Ignore testimonials, customer links and arbitrary script text. A careers link/embed is an ownership claim. */
+export function employerAtsLinks(html: string, pageUrl: string, companyDomain: string): AtsDetection[] {
+  const owner = canonicalizeDomain(pageUrl)
+  if (!owner.ok || owner.domain !== companyDomain) return []
+  const { document } = parseHTML(html)
+  const onCareersPage = /\/(careers?|jobs?|join)(\/|$)/i.test(new URL(pageUrl).pathname)
+  const candidates: AtsDetection[] = []
+  for (const element of document.querySelectorAll('a[href],iframe[src],script[src]')) {
+    const value = element.getAttribute('href') ?? element.getAttribute('src') ?? ''
+    const careerContext = /career|\bjobs?\b|open\s+(roles|positions)|join\s+(us|our)|work\s+(with|at)/i.test(
+      `${element.textContent ?? ''} ${element.getAttribute('aria-label') ?? ''} ${element.getAttribute('title') ?? ''}`,
+    )
+    const embedded = element.localName !== 'a' && /job_board|posting-api|jobs\./i.test(value)
+    if (!onCareersPage && !careerContext && !embedded) continue
+    for (const hit of detectAllAtsInText(value)) {
+      if (!candidates.some((c) => c.vendor === hit.vendor && c.boardToken === hit.boardToken)) candidates.push(hit)
+    }
+  }
+  return candidates
+}
+
 /**
  * ATS detection with slug resolution (Part F, F1).
  *
@@ -81,17 +104,13 @@ export async function detectAtsForCompany(
   const now = opts.now ?? (() => new Date())
   const maxPages = opts.maxPages ?? 3
 
-  for (const candidate of [company.careersUrl, company.website]) {
-    if (!candidate) continue
-    const hit = detectAtsInUrl(candidate)
-    if (hit) {
-      await recordDetectionEvidence(db, company.id, candidate, hit, now())
-      return { found: true, detection: hit, sourceUrl: candidate, fetches: 0 }
-    }
-  }
-
   const origin = `https://${company.canonicalDomain}`
-  const pages = [origin, ...CAREERS_PATHS.map((path) => `${origin}${path}`)].slice(0, maxPages)
+  const storedEmployerCareers = company.careersUrl && canonicalizeDomain(company.careersUrl)
+  const pages = [...new Set([
+    ...(storedEmployerCareers && storedEmployerCareers.ok && storedEmployerCareers.domain === company.canonicalDomain
+      ? [company.careersUrl!] : []),
+    origin, ...CAREERS_PATHS.map((path) => `${origin}${path}`),
+  ])].slice(0, maxPages)
 
   let fetches = 0
   const failures: string[] = []
@@ -117,13 +136,15 @@ export async function detectAtsForCompany(
       continue
     }
 
-    const hit = detectAtsInText(page.body)
-    if (hit) {
+    const hits = employerAtsLinks(page.body, page.url, company.canonicalDomain)
+    const expected = company.careersUrl ? detectAtsInUrl(company.careersUrl) : null
+    const hit = hits.length === 1 ? hits[0] : null
+    if (hit && (!expected || (hit.vendor === expected.vendor && hit.boardToken === expected.boardToken))) {
       // Cite the URL that actually served the markup, not the one we asked for.
       await recordDetectionEvidence(db, company.id, page.url, hit, now())
       return { found: true, detection: hit, sourceUrl: page.url, fetches }
     }
-    failures.push(`${page.url}: no board signature`)
+    failures.push(`${page.url}: ${hits.length > 1 ? 'ambiguous employer boards' : expected && hit ? 'board ownership mismatch' : 'no employer careers board link'}`)
   }
 
   await writeAudit(db, {
@@ -180,12 +201,23 @@ export async function saveDetection(
   detection: AtsDetection,
   careersUrl: string,
 ): Promise<void> {
+  const company = await db.company.findUniqueOrThrow({ where: { id: companyId }, select: { canonicalDomain: true } })
+  const owner = canonicalizeDomain(careersUrl)
+  const evidence = owner.ok && owner.domain === company.canonicalDomain
+    ? await db.evidence.findFirst({
+        where: { companyId, sourceUrl: careersUrl, sourceType: 'company_page',
+          contentHash: contentHashOf({ vendor: detection.vendor, boardToken: detection.boardToken }) },
+        orderBy: { observedAt: 'desc' }, select: { id: true, observedAt: true },
+      }) : null
+  if (!evidence) throw new Error('ATS ownership requires a fetched employer careers link')
   await db.company.update({
     where: { id: companyId },
     data: {
       atsSlug: detection.vendor,
       atsBoardToken: detection.boardToken,
       careersUrl,
+      atsOwnershipEvidenceId: evidence.id,
+      atsOwnershipVerifiedAt: evidence.observedAt,
     },
   })
 }

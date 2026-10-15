@@ -55,6 +55,8 @@ export const SEED_DENY_HOSTS: SeedHostEntry[] = [
  * verified in B6.
  */
 export const SEED_ALLOW_HOSTS: SeedHostEntry[] = [
+  { host: 'startupdb.com', includeSubdomains: false, sourceUrl: 'https://startupdb.com/api', note: 'Public documented GET API; CC BY 4.0 attribution and coverage retained. Website paths still require robots.' },
+  { host: 'hacker-news.firebaseio.com', includeSubdomains: false, sourceUrl: 'https://github.com/HackerNews/API', note: 'Official HN public item and whoishiring user API; requests remain bounded by local policy.' },
   { host: 'boards-api.greenhouse.io', includeSubdomains: false, note: 'Greenhouse public job board API: GET /v1/boards/{token}/jobs, no auth (B6).' },
   { host: 'job-boards.greenhouse.io', includeSubdomains: false, note: 'Hosted board pages; migrated from boards.greenhouse.io — detection signatures updated (B6).' },
   { host: 'boards.greenhouse.io', includeSubdomains: false, note: 'Legacy hosted board host, retained for redirect handling during F1 detection.' },

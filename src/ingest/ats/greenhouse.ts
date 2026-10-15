@@ -50,6 +50,10 @@ export class GreenhouseProvider implements AtsProvider {
   }
 
   async listPostings(boardToken: string): Promise<Posting[]> {
+    return (await this.listSnapshot(boardToken)).postings
+  }
+
+  async listSnapshot(boardToken: string): Promise<{ postings: Posting[]; complete: boolean }> {
     const url = this.boardUrl(boardToken)
     const fetched = await fetchJson(this.fetcher, url, { maxBytes: ATS_FEED_MAX_BYTES })
 
@@ -59,10 +63,11 @@ export class GreenhouseProvider implements AtsProvider {
     }
 
     const postings: Posting[] = []
+    let complete = envelope.data.meta?.total === undefined || envelope.data.meta.total === envelope.data.jobs.length
     for (const raw of envelope.data.jobs) {
       const job = GreenhouseJob.safeParse(raw)
       // One malformed posting must not cost the rest of the board.
-      if (!job.success) continue
+      if (!job.success) { complete = false; continue }
       postings.push({
         externalId: String(job.data.id),
         title: job.data.title,
@@ -76,6 +81,6 @@ export class GreenhouseProvider implements AtsProvider {
         content: job.data.content ?? '',
       })
     }
-    return postings
+    return { postings, complete }
   }
 }

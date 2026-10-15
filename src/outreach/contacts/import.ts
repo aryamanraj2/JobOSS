@@ -8,7 +8,7 @@ import { FETCHED_VIA, verbatimExcerpt, writeEvidence } from '../../core/evidence
 import { canonicalizeDomain } from '../../ingest/domain/canonicalize.js'
 import { cell, missingColumns, parseCsv, type CsvRow } from '../../ingest/file/csv.js'
 import { classifyLocal, isCompanyDomain, normalizeEmail } from './classify.js'
-import { isExecutiveContact } from './executive-filter.js'
+import { recipientSuitability } from './suitability.js'
 
 /**
  * Operator-entered contacts, gathered by hand from a lookup provider's free tier.
@@ -296,33 +296,6 @@ async function importRow(
   }
 
   const title = cell(row, 'title')
-  const exec = isExecutiveContact(email, title)
-  if (exec.isExecutive) {
-    if (opts.dryRun !== true) {
-      await writeAudit(db, {
-        actorType: 'user',
-        actorId: opts.operator,
-        action: IMPORT_REFUSED,
-        subjectType: 'Company',
-        subjectId: company.id,
-        reasonCode: 'executive_only_contact',
-        // The address itself is NOT recorded, for the same reason `curate.ts` does not
-        // record it: handover.md §1.1 says never target them, and storing the address
-        // in an audit row so a later query could find it keeps exactly what the rule
-        // says not to keep.
-        metadata: { matched: exec.matched, where: exec.where },
-      })
-    }
-    return {
-      line: row.line,
-      email,
-      domain: canonical.domain,
-      outcome: 'executive',
-      contactType: null,
-      detail: `${exec.where} matched ${exec.matched}`,
-    }
-  }
-
   const contactType = resolveContactType(row, email, title)
 
   const existing = await db.contact.findUnique({
@@ -379,6 +352,10 @@ async function importRow(
       // read. Null is the honest answer.
       sourcePageKind: null,
       publicTitle: title,
+      fullName: cell(row, 'full_name'),
+      identitySourceUrl: cell(row, 'source_url'),
+      suitability: recipientSuitability({ emailNormalized: email, contactType, publicTitle: title }).category,
+      suitabilityReason: recipientSuitability({ emailNormalized: email, contactType, publicTitle: title }).reason,
       evidenceId: evidence.id,
       capturedAt: now,
     } satisfies Prisma.ContactUncheckedCreateInput,

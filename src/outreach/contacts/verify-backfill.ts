@@ -3,7 +3,7 @@ import { writeAudit } from '../../core/audit/audit-log.js'
 import { MAX_EXCERPT_CHARS } from '../../core/evidence/write-evidence.js'
 import { parseCsv } from '../../ingest/file/csv.js'
 import { normalizeEmail } from './classify.js'
-import { isExecutiveContact } from './executive-filter.js'
+import { recipientSuitability } from './suitability.js'
 import { CONTACT_IMPORT_COLUMNS, providerAttestsDeliverable } from './import.js'
 
 /**
@@ -141,6 +141,7 @@ export async function backfillProviderVerification(
       id: true,
       emailNormalized: true,
       publicTitle: true,
+      contactType: true,
       evidenceId: true,
       company: { select: { displayName: true } },
     },
@@ -164,13 +165,9 @@ export async function backfillProviderVerification(
       ? readProviderVerdict({ excerpt: e.excerpt, sourceUrl: e.sourceUrl, emailNormalized: c.emailNormalized })
       : ({ ok: false, reason: 'unparseable' } as const)
     const provider = e ? providerOf(e.sourceUrl) : 'unknown'
-    const exec = isExecutiveContact(c.emailNormalized, c.publicTitle)
-    const verdict = exec.isExecutive
-      ? 'REFUSED:executive'
-      : reading.ok
-        ? reading.verdict
-        : `REFUSED:${reading.reason}`
-    const flip = !exec.isExecutive && reading.ok && providerAttestsDeliverable(reading.verdict)
+    const suitability = recipientSuitability(c)
+    const verdict = !suitability.suitable ? 'REFUSED:unsuitable' : reading.ok ? reading.verdict : `REFUSED:${reading.reason}`
+    const flip = suitability.suitable && reading.ok && providerAttestsDeliverable(reading.verdict)
 
     const tally = (byProvider[provider] ??= {})
     const key = verdict === '' ? '(blank)' : verdict
@@ -186,22 +183,6 @@ export async function backfillProviderVerification(
       flip,
     })
 
-    if (exec.isExecutive && !dryRun) {
-      await db.$transaction(async (tx) => {
-        const updated = await tx.contact.updateMany({ where: { id: c.id, status: 'active' }, data: { status: 'retired' } })
-        if (updated.count !== 1) return
-        await writeAudit(tx, {
-          actorType: 'user',
-          actorId: opts.operator,
-          action: RETIRE_ACTION,
-          subjectType: 'Contact',
-          subjectId: c.id,
-          reasonCode: 'executive_only_contact',
-          metadata: { matched: exec.matched, where: exec.where, rule: 'executive-filter HEAD_OF_FUNCTION (widened F6)' },
-        })
-      })
-      continue
-    }
     if (!flip || dryRun) continue
     // Conditional update, so a concurrent run or a re-run flips nothing twice and
     // writes no second audit row for a flip it did not make.

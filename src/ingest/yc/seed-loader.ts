@@ -180,7 +180,7 @@ async function upsertSeededCompany(
 ): Promise<{ status: 'created' | 'updated'; evidenceSkipped: boolean }> {
   const existing = await db.company.findUnique({
     where: { canonicalDomain },
-    select: { id: true },
+    select: { id: true, website: true, status: true, tags: true },
   })
 
   const data = {
@@ -203,7 +203,12 @@ async function upsertSeededCompany(
   }
 
   const company = existing
-    ? await db.company.update({ where: { id: existing.id }, data, select: { id: true } })
+    ? await db.company.update({
+        where: { id: existing.id },
+        data: { ...data, status: existing.status, website: existing.website ?? seed.website,
+          tags: [...new Set([...existing.tags, ...data.tags])] },
+        select: { id: true },
+      })
     : await db.company.create({
         data: { canonicalDomain, ...data },
         select: { id: true },

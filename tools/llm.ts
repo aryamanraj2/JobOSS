@@ -69,7 +69,7 @@ async function main(): Promise<number> {
       const id = flag('id')
       const file = flag('file')
       if (!id || !file) {
-        console.error('Usage: npm run llm:fulfil -- --id <task-id> --file <output.json>')
+        console.error('Usage: npm run llm:fulfil -- --id <task-id> --file <output.json> [--claim-token <token from llm:next>]')
         return 2
       }
       let output: unknown
@@ -79,7 +79,7 @@ async function main(): Promise<number> {
         console.error(`Could not read ${file} as JSON: ${(err as Error).message}`)
         return 2
       }
-      const result = await fulfilTask(db, id, output)
+      const result = await fulfilTask(db, id, output, { ...(flag('claim-token') ? { claimToken: flag('claim-token')! } : {}) })
       if (!result.ok) {
         console.error(`REJECTED (${result.problem}): ${result.detail}`)
         return 1
@@ -92,14 +92,14 @@ async function main(): Promise<number> {
       const id = flag('id')
       const reason = flag('reason')
       if (!id || !reason) {
-        console.error('Usage: npm run llm:reject -- --id <task-id> --reason <reason-code>')
+        console.error('Usage: npm run llm:reject -- --id <task-id> --reason <reason-code> [--claim-token <token from llm:next>]')
         return 2
       }
       if (!(ALL_REASON_CODES as string[]).includes(reason)) {
         console.error(`"${reason}" is not in the closed reason-code enum.`)
         return 2
       }
-      const result = await rejectTask(db, id, reason as ReasonCodeValue, flag('detail'))
+      const result = await rejectTask(db, id, reason as ReasonCodeValue, flag('detail'), { ...(flag('claim-token') ? { claimToken: flag('claim-token')! } : {}) })
       if (!result.ok) {
         console.error(`No task ${id}.`)
         return 1

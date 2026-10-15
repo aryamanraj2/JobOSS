@@ -99,6 +99,8 @@ export interface AtsProvider {
    */
   boardUrl(boardToken: string): string
   listPostings(boardToken: string): Promise<Posting[]>
+  /** Only a complete snapshot may close missing roles or establish no posting. */
+  listSnapshot?(boardToken: string): Promise<{ postings: Posting[]; complete: boolean }>
 }
 
 export interface WebResearchProvider {
@@ -174,6 +176,8 @@ export interface MailProvider {
  */
 export type ProviderMessageRef = {
   providerMessageId: string
+  /** The provider's actual stored RFC Message-ID header, never the client's derived reconciliation ID. */
+  rfc822MessageId?: string | null
   threadId?: string | undefined
 }
 

@@ -22,6 +22,8 @@ export type FetchedVia = (typeof FETCHED_VIA)[keyof typeof FETCHED_VIA]
 
 export type EvidenceInput = {
   companyId?: string | null
+  contactId?: string | null
+  publishedAt?: Date | null
   sourceUrl: string
   sourceType: EvidenceSourceType
   /** Verbatim. See `verbatimExcerpt` for the one transformation permitted. */
@@ -57,6 +59,8 @@ export async function writeEvidence(db: Db, input: EvidenceInput): Promise<{ id:
   const row = await db.evidence.create({
     data: {
       companyId: input.companyId ?? null,
+      contactId: input.contactId ?? null,
+      publishedAt: input.publishedAt ?? null,
       sourceUrl: input.sourceUrl,
       sourceType: input.sourceType,
       excerpt,

@@ -1,4 +1,5 @@
 import { registrableDomain } from '../../core/policy/registrable-domain.js'
+import { detectAtsInUrl } from '../../ingest/ats/signatures.js'
 
 /**
  * Which `Evidence` rows a message about a company is allowed to cite.
@@ -54,6 +55,26 @@ const ATS_HOSTS = new Set([
 ])
 
 export type ScopedEvidence = { id: string; sourceUrl: string }
+
+/** New outreach cites verified entity bindings, never a third-party host alone. */
+export function isBoundEvidenceInScope(
+  evidence: { companyId: string | null; contactId: string | null; sourceUrl: string },
+  target: { companyId: string; canonicalDomain: string; contactId?: string | null; verifiedPersonEvidenceIds?: ReadonlySet<string>; atsSlug?: string | null; atsBoardToken?: string | null; atsOwnershipEvidenceId?: string | null; atsOwnershipVerifiedAt?: Date | null },
+  evidenceId: string,
+): boolean {
+  if (evidence.companyId !== target.companyId) return false
+  if (evidence.contactId !== null) {
+    return evidence.contactId === target.contactId && target.verifiedPersonEvidenceIds?.has(evidenceId) === true
+  }
+  let host: string
+  try { host = new URL(evidence.sourceUrl).hostname.toLowerCase() } catch { return false }
+  if (ATS_HOSTS.has(host)) {
+    const board = detectAtsInUrl(evidence.sourceUrl)
+    return Boolean(target.atsOwnershipEvidenceId && target.atsOwnershipVerifiedAt && board && board.vendor === target.atsSlug && board.boardToken === target.atsBoardToken)
+  }
+  const domain = registrableDomain(host)
+  return domain !== null && domain === registrableDomain(target.canonicalDomain)
+}
 
 /** Whether one evidence row may be cited in a message about this company. */
 export function isEvidenceInScope(sourceUrl: string, canonicalDomain: string): boolean {

@@ -93,10 +93,11 @@ if (has('reconcile')) {
     },
     orderBy: { approvedAt: 'asc' },
   })
+  console.log('Offline gate checks only; inbox ingestion has not run and these results do not establish send readiness.')
   console.log(`\n${drafts.length} approved draft(s):\n`)
   for (const d of drafts) {
     const decision = await evaluateSendGate(db, d.id, gateOptions)
-    const verdict = decision.allowed ? 'SENDABLE' : `${decision.reason}: ${decision.detail}`
+    const verdict = decision.allowed ? 'OFFLINE GATE PASSED (inbox unchecked)' : `${decision.reason}: ${decision.detail}`
     console.log(`  ${d.id}`)
     console.log(`    ${d.lead.company.displayName} -> ${d.contact?.emailNormalized ?? '(no contact)'}`)
     console.log(`    ${d.subject ?? '(no subject)'}`)
@@ -106,8 +107,9 @@ if (has('reconcile')) {
 } else {
   const draftId = flag('id')!
   if (has('dry')) {
+    console.log('Offline dry check; outcome ingestion is required again before an actual send.')
     const decision = await evaluateSendGate(db, draftId, gateOptions)
-    console.log(`\ndry run — gate says: ${decision.allowed ? 'SENDABLE' : `${decision.reason}: ${decision.detail}`}`)
+    console.log(`\ndry run — gate says: ${decision.allowed ? 'OFFLINE GATE PASSED (inbox unchecked)' : `${decision.reason}: ${decision.detail}`}`)
     if (decision.allowed) {
       console.log(`  to            ${decision.plan.to}`)
       console.log(`  from          ${decision.plan.fromIdentity}`)
@@ -126,11 +128,12 @@ const counters = await deliverabilityCounters(db)
 console.log(`\nDeliverability (first-party, ${counters.windowDays}d)`)
 console.log(
   `  sent=${counters.sent} in_flight=${counters.inFlight} failed=${counters.failed} ` +
-    `hard=${counters.hardBounces} soft=${counters.softBounces} replies=${counters.replies} opt_outs=${counters.optOuts}`,
+    `hard=${counters.hardBounces} soft=${counters.softBounces} human_replies=${counters.replies} auto_replies=${counters.automaticReplies} wrong_contact=${counters.wrongContactReplies} unclassified=${counters.unclassifiedReplies} opt_outs=${counters.optOuts}`,
 )
 console.log(
   `  hard-bounce rate: ${counters.hardBounceRate === null ? 'n/a (nothing sent)' : `${(counters.hardBounceRate * 100).toFixed(1)}%`}`,
 )
+console.log(`  referrals: ${counters.referralSignal.state}; interviews: ${counters.interviewSignal.state}`)
 console.log(`  complaint signal: ${counters.complaintSignal.state} — ${counters.complaintSignal.state === 'unavailable' ? counters.complaintSignal.why : ''}`)
 console.log(`  ${counters.providerReputationNote}`)
 console.log('')

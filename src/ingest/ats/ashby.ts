@@ -45,6 +45,10 @@ export class AshbyProvider implements AtsProvider {
   }
 
   async listPostings(boardToken: string): Promise<Posting[]> {
+    return (await this.listSnapshot(boardToken)).postings
+  }
+
+  async listSnapshot(boardToken: string): Promise<{ postings: Posting[]; complete: boolean }> {
     const url = this.boardUrl(boardToken)
     const fetched = await fetchJson(this.fetcher, url, { maxBytes: ATS_FEED_MAX_BYTES })
 
@@ -54,9 +58,10 @@ export class AshbyProvider implements AtsProvider {
     }
 
     const postings: Posting[] = []
+    let complete = true
     for (const raw of envelope.data.jobs) {
       const parsed = AshbyJob.safeParse(raw)
-      if (!parsed.success) continue
+      if (!parsed.success) { complete = false; continue }
       const job = parsed.data
       // Ashby returns unlisted postings alongside listed ones. An unlisted req is
       // not a public opportunity, and treating one as an open role is precisely
@@ -72,6 +77,6 @@ export class AshbyProvider implements AtsProvider {
         content: job.descriptionPlain ?? job.descriptionHtml ?? '',
       })
     }
-    return postings
+    return { postings, complete }
   }
 }

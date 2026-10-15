@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import { closeTestDb, testDb, truncateAll } from '../helpers/db.js'
-import { checkBudget, currentPeriodMonth, recordSpend } from '../../src/core/policy/budget.js'
+import { checkBudget, currentPeriodMonth, recordSpend, reserveBudget } from '../../src/core/policy/budget.js'
 
 /**
  * Regression cover for a **latent F2 defect F3 was the first to look at**.
@@ -97,14 +97,14 @@ describe('recordSpend charges every envelope that governs a request', () => {
     // Seeding happens at ingestion; this must stay a no-op rather than quietly
     // inventing a ceiling after the fact.
     const db = testDb()
-    await recordSpend(db, null, 5)
+    await expect(recordSpend(db, null, 5)).rejects.toThrow('Budget accounting refused: global')
     expect(await db.researchBudget.count()).toBe(0)
   })
 })
 
 describe('the vendor-credit split (F2 §4.7)', () => {
   it('counts paid credits alongside the unified counter, not instead of it', async () => {
-    const { db, companyId } = await envelopes({ global: 1000, company: 20 })
+    const { db, companyId } = await envelopes({ global: 1000, company: 20, globalVendor: 1 })
     // A free static fetch.
     await recordSpend(db, companyId, { credits: 1, vendorCredits: 0 })
     // A Firecrawl scrape: one research unit, and one unit of a paid allowance.
@@ -164,9 +164,12 @@ describe('the paid subset has its own ceiling (F5 §4.3)', () => {
     expect((await checkBudget(db, companyId, { credits: 1, vendorCredits: 3 })).allowed).toBe(true)
   })
 
-  it('enforces billedUsdCap, which was decorative before F5', async () => {
+  it('forbids direct billed spending even below an existing cap', async () => {
     const { db, companyId } = await envelopes({ global: 10_000, company: 10_000, billedUsd: 0.5 })
-    expect((await checkBudget(db, companyId, { credits: 0, billedUsd: 0.25 })).allowed).toBe(true)
+    expect(await checkBudget(db, companyId, { credits: 0, billedUsd: 0.25 })).toEqual({ allowed: false, scope: 'billed_usd' })
+    expect(await reserveBudget(db, companyId, { credits: 1, billedUsd: 0.25 })).toEqual({ allowed: false, scope: 'billed_usd' })
+    await expect(recordSpend(db, companyId, { credits: 1, billedUsd: 0.25 })).rejects.toThrow('billed_usd')
+    expect(Number((await globalRow(db)).billedUsdSpent)).toBe(0)
     const over = await checkBudget(db, companyId, { credits: 0, billedUsd: 0.75 })
     expect(over.allowed).toBe(false)
     if (over.allowed) throw new Error('unreachable')

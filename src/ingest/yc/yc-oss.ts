@@ -171,6 +171,14 @@ export function inGrowthBand(record: YcCompanyRecord): boolean {
   )
 }
 
+/** Recent discovery includes founder-led teams and retains unknown size. A batch is not a funding date. */
+export function inRecentStartupBand(record: YcCompanyRecord, now = new Date()): boolean {
+  const year = batchYear(record.batch)
+  return Number.isFinite(year) && year >= now.getUTCFullYear() - 2 && year <= now.getUTCFullYear() &&
+    record.status?.toLowerCase() === 'active' &&
+    (record.team_size == null || (record.team_size >= 1 && record.team_size <= 250))
+}
+
 export type YcOssSeedProviderOptions = {
   /** `hiring` (~1,480 companies) or `all` (~6,200). */
   feed?: YcFeed

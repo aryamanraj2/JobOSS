@@ -50,6 +50,10 @@ export class LeverProvider implements AtsProvider {
   }
 
   async listPostings(boardToken: string): Promise<Posting[]> {
+    return (await this.listSnapshot(boardToken)).postings
+  }
+
+  async listSnapshot(boardToken: string): Promise<{ postings: Posting[]; complete: boolean }> {
     const url = this.boardUrl(boardToken)
     const fetched = await fetchJson(this.fetcher, url, { maxBytes: ATS_FEED_MAX_BYTES })
 
@@ -58,9 +62,10 @@ export class LeverProvider implements AtsProvider {
     }
 
     const postings: Posting[] = []
+    let complete = true
     for (const raw of fetched.value) {
       const parsed = LeverPosting.safeParse(raw)
-      if (!parsed.success) continue
+      if (!parsed.success) { complete = false; continue }
       const job = parsed.data
       const hosted = job.hostedUrl ?? `https://jobs.lever.co/${boardToken}/${job.id}`
       postings.push({
@@ -75,6 +80,6 @@ export class LeverProvider implements AtsProvider {
         content: job.descriptionPlain ?? job.description ?? '',
       })
     }
-    return postings
+    return { postings, complete }
   }
 }

@@ -38,7 +38,7 @@ import { classifyBounce, classifyReply, type ReplyClassification } from './class
 
 export type IngestedOutcome = {
   sendAttemptId: string
-  kind: 'bounce' | 'reply' | 'opt_out' | 'wrong_contact' | 'auto_reply'
+  kind: 'bounce' | 'reply' | 'opt_out' | 'wrong_contact' | 'auto_reply' | 'unclassified'
   reasonCode: ReasonCodeValue | null
   suppressed: boolean
   detail: string
@@ -59,11 +59,9 @@ export type InboundForIngest = {
 /**
  * Finds the `SendAttempt` a received message is about.
  *
- * Three routes, most reliable first. `In-Reply-To` carries our own derived
- * `Message-ID` and is the only one that is unambiguous — which is precisely why A9
- * insists the id be ours and deterministic. The thread id is a good second. The body
- * scan is last and exists because a DSN frequently quotes the original headers inside
- * `message/rfc822` rather than setting `In-Reply-To` at all.
+ * Matches In-Reply-To/References against both actual and client-supplied RFC IDs.
+ * Thread matching is the fallback; a DSN may instead quote the original ID in its
+ * body. Gmail's stored ID differs from the stable local reconciliation handle.
  */
 export async function matchSendAttempt(
   db: Db,
@@ -71,29 +69,27 @@ export async function matchSendAttempt(
 ): Promise<{ id: string; draftId: string; contactId: string; companyId: string } | null> {
   const select = { id: true, draftId: true, contactId: true, companyId: true }
 
-  if (message.inReplyTo) {
-    const byHeader = await db.sendAttempt.findFirst({
-      where: { rfc822MessageId: message.inReplyTo.trim() },
-      select,
+  const ids = new Set([
+    ...(message.inReplyTo?.match(/<[^<>\s]+>/g) ?? []),
+    ...(message.headers?.['references']?.match(/<[^<>\s]+>/g)?.reverse() ?? []),
+  ])
+  for (const id of ids) {
+    const hit = await db.sendAttempt.findFirst({
+      where: { OR: [{ providerRfc822MessageId: id }, { rfc822MessageId: id }] }, select,
     })
-    if (byHeader) return byHeader
+    if (hit) return hit
+  }
+  if (message.threadId) {
+    const byThread = await db.sendAttempt.findFirst({ where: { providerThreadId: message.threadId }, select })
+    if (byThread) return byThread
   }
 
-  const byThread = await db.sendAttempt.findFirst({
-    where: { providerThreadId: message.threadId },
-    select,
-  })
-  if (byThread) return byThread
-
-  // A DSN quotes the original message's headers in its body. Our Message-ID is
-  // distinctive enough to find by substring — it carries a fixed prefix and a
-  // 32-character hex digest on the owned domain.
-  const quoted = /<oi\.[0-9a-f]{32}@[^>]+>/.exec(message.bodyText)
-  if (quoted) {
-    const byQuote = await db.sendAttempt.findFirst({ where: { rfc822MessageId: quoted[0] }, select })
-    if (byQuote) return byQuote
+  for (const id of message.bodyText.match(/<[^<>\s]+@[^<>\s]+>/g) ?? []) {
+    const hit = await db.sendAttempt.findFirst({
+      where: { OR: [{ providerRfc822MessageId: id }, { rfc822MessageId: id }] }, select,
+    })
+    if (hit) return hit
   }
-
   return null
 }
 
@@ -102,13 +98,44 @@ export async function ingestInboundMessage(
   message: InboundForIngest,
   opts: { suppressionSalt: string; now?: Date },
 ): Promise<IngestedOutcome | { kind: 'unmatched'; detail: string }> {
+  if (!message.providerMessageId.trim()) throw new Error('inbound provider identity is required')
+  return inTransaction(db, async (tx) => {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`inbox:${message.providerMessageId}`}, 0))::text`
+    const existingBounce = await tx.bounce.findUnique({ where: { providerMessageId: message.providerMessageId } })
+    if (existingBounce) return {
+      sendAttemptId: existingBounce.sendAttemptId, kind: 'bounce' as const,
+      reasonCode: existingBounce.hardness === 'hard' ? 'hard_bounce' as const : 'soft_bounce' as const,
+      suppressed: existingBounce.hardness === 'hard', detail: 'duplicate provider message; unchanged',
+    }
+    const existingReply = await tx.reply.findUnique({ where: { providerMessageId: message.providerMessageId } })
+    if (existingReply) {
+      if (!['reply', 'auto_reply', 'opt_out', 'wrong_contact'].includes(existingReply.classification ?? '')) {
+        return { sendAttemptId: existingReply.sendAttemptId, kind: 'unclassified', reasonCode: null, suppressed: false, detail: 'existing provider message has no observable reply classification' }
+      }
+      const kind = existingReply.classification as ReplyClassification
+      return { sendAttemptId: existingReply.sendAttemptId, kind,
+        reasonCode: kind === 'auto_reply' ? null : kind === 'opt_out' ? 'opt_out' as const : kind === 'wrong_contact' ? 'wrong_contact' as const : 'replied' as const,
+        suppressed: kind === 'opt_out' || kind === 'wrong_contact', detail: 'duplicate provider message; unchanged' }
+    }
+    return ingestOnce(tx, message, opts)
+  })
+}
+
+async function inTransaction<T>(db: Db, work: (tx: Db) => Promise<T>): Promise<T> {
+  return '$transaction' in db && typeof db.$transaction === 'function' ? db.$transaction(work, { timeout: 30_000 }) : work(db)
+}
+
+async function ingestOnce(
+  db: Db, message: InboundForIngest, opts: { suppressionSalt: string; now?: Date },
+): Promise<IngestedOutcome | { kind: 'unmatched'; detail: string }> {
   const now = opts.now ?? new Date()
   const attempt = await matchSendAttempt(db, message)
   if (!attempt) {
     // Recorded rather than dropped. A bounce we cannot attribute is still a fact about
     // deliverability, and silently discarding it is how "nothing is bouncing" becomes
     // a belief rather than a measurement (B3).
-    await writeAudit(db, {
+    const recorded = await db.auditLog.findFirst({ where: { action: 'inbox.unmatched', subjectId: message.providerMessageId }, select: { id: true } })
+    if (!recorded) await writeAudit(db, {
       actorType: 'system',
       actorId: 'inbox',
       action: 'inbox.unmatched',
@@ -119,6 +146,7 @@ export async function ingestInboundMessage(
     return { kind: 'unmatched', detail: 'no SendAttempt matched this message' }
   }
 
+  await db.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`outcome:${attempt.id}`}, 0))::text`
   const contact = await db.contact.findUniqueOrThrow({
     where: { id: attempt.contactId },
     select: { emailNormalized: true },
@@ -129,6 +157,7 @@ export async function ingestInboundMessage(
     await db.bounce.create({
       data: {
         sendAttemptId: attempt.id,
+        providerMessageId: message.providerMessageId,
         hardness: bounce.hardness,
         providerCode: bounce.providerCode,
         diagnostic: bounce.diagnostic?.slice(0, 1000) ?? null,
@@ -176,16 +205,14 @@ export async function ingestInboundMessage(
     ...(message.headers ? { headers: message.headers } : {}),
   })
 
-  await db.reply.upsert({
-    where: { providerMessageId: message.providerMessageId },
-    create: {
+  await db.reply.create({
+    data: {
       sendAttemptId: attempt.id,
       providerMessageId: message.providerMessageId,
       classification,
       snippet: message.bodyText.slice(0, 500),
       receivedAt: message.receivedAt,
     },
-    update: { classification },
   })
 
   if (classification === 'auto_reply') {
@@ -218,6 +245,7 @@ export async function ingestInboundMessage(
     await db.optOut.create({
       data: {
         sendAttemptId: attempt.id,
+        providerMessageId: message.providerMessageId,
         emailHmac: emailHmac(contact.emailNormalized, opts.suppressionSalt),
         occurredAt: message.receivedAt,
       },
@@ -261,20 +289,21 @@ async function stopConversation(
   reasonCode: ReasonCodeValue,
   draftStatus: 'bounced_hard' | 'bounced_soft' | 'replied' | 'opted_out' | 'closed',
 ): Promise<void> {
-  await db.$transaction(async (tx) => {
-    const draft = await tx.draft.update({
-      where: { id: attempt.draftId },
-      data: { status: draftStatus, statusReason: reasonCode },
-      select: { leadId: true },
-    })
-    await tx.lead.update({
-      where: { id: draft.leadId },
-      data: { statusReason: reasonCode },
-    })
-    await tx.sendAttempt.update({
-      where: { id: attempt.id },
-      data: { statusReason: reasonCode },
-    })
+  const current = await db.draft.findUniqueOrThrow({ where: { id: attempt.draftId }, select: { statusReason: true } })
+  const priority: Partial<Record<ReasonCodeValue, number>> = { soft_bounce: 1, replied: 2, wrong_contact: 3, hard_bounce: 4, opt_out: 5 }
+  if ((priority[current.statusReason ?? 'replied'] ?? 0) > (priority[reasonCode] ?? 0) && current.statusReason) return
+  const draft = await db.draft.update({
+    where: { id: attempt.draftId },
+    data: { status: draftStatus, statusReason: reasonCode },
+    select: { leadId: true },
+  })
+  await db.lead.update({
+    where: { id: draft.leadId },
+    data: { statusReason: reasonCode },
+  })
+  await db.sendAttempt.update({
+    where: { id: attempt.id },
+    data: { statusReason: reasonCode },
   })
 }
 
@@ -317,6 +346,12 @@ export async function markWrongContact(
   db: Db,
   contactId: string,
   opts: { suppressionSalt: string; actorId?: string; now?: Date },
+): Promise<void> {
+  return inTransaction(db, (tx) => markWrongContactOnce(tx, contactId, opts))
+}
+
+async function markWrongContactOnce(
+  db: Db, contactId: string, opts: { suppressionSalt: string; actorId?: string; now?: Date },
 ): Promise<void> {
   const now = opts.now ?? new Date()
   const contact = await db.contact.findUniqueOrThrow({

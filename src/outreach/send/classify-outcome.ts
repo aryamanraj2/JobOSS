@@ -159,9 +159,9 @@ export function classifyReply(message: {
   // RFC 3834 and the de-facto Microsoft header. Trusted before any text matching:
   // a vacation responder that happens to contain "not interested" in a signature
   // would otherwise read as an opt-out from someone who never saw the message.
-  const headers = message.headers ?? {}
+  const headers = Object.fromEntries(Object.entries(message.headers ?? {}).map(([key, value]) => [key.toLowerCase(), value]))
   const autoSubmitted = headers['auto-submitted'] ?? headers['Auto-Submitted']
-  if (autoSubmitted && autoSubmitted.toLowerCase() !== 'no') return 'auto_reply'
+  if (autoSubmitted && autoSubmitted.trim().split(';')[0]?.toLowerCase() !== 'no') return 'auto_reply'
   if (headers['x-autoreply'] ?? headers['x-autorespond'] ?? headers['X-Autoreply']) return 'auto_reply'
 
   const text = `${message.subject}\n${message.bodyText}`

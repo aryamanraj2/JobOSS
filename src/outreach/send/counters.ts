@@ -34,7 +34,13 @@ export type DeliverabilityCounters = {
   aborted: number
   hardBounces: number
   softBounces: number
+  /** Useful human replies only; other classes are separate. */
   replies: number
+  automaticReplies: number
+  wrongContactReplies: number
+  unclassifiedReplies: number
+  referralSignal: { state: 'unavailable'; why: string }
+  interviewSignal: { state: 'unavailable'; why: string }
   optOuts: number
   /** Of `sent`. Null when nothing was sent, because 0/0 is not 0% (B3's own point). */
   hardBounceRate: number | null
@@ -55,7 +61,7 @@ export async function deliverabilityCounters(
   const now = opts.now ?? new Date()
   const since = new Date(now.getTime() - windowDays * 24 * 60 * 60 * 1000)
 
-  const [sent, inFlight, failed, aborted, hardBounces, softBounces, replies, optOuts] =
+  const [sent, inFlight, failed, aborted, hardBounces, softBounces, replies, optOuts, automaticReplies, wrongContactReplies, unclassifiedReplies] =
     await Promise.all([
       db.sendAttempt.count({ where: { status: 'sent', attemptedAt: { gte: since } } }),
       db.sendAttempt.count({ where: { status: 'in_flight', attemptedAt: { gte: since } } }),
@@ -63,8 +69,11 @@ export async function deliverabilityCounters(
       db.sendAttempt.count({ where: { status: 'aborted', attemptedAt: { gte: since } } }),
       db.bounce.count({ where: { hardness: 'hard', occurredAt: { gte: since } } }),
       db.bounce.count({ where: { hardness: 'soft', occurredAt: { gte: since } } }),
-      db.reply.count({ where: { receivedAt: { gte: since } } }),
+      db.reply.count({ where: { classification: 'reply', receivedAt: { gte: since } } }),
       db.optOut.count({ where: { occurredAt: { gte: since } } }),
+      db.reply.count({ where: { classification: 'auto_reply', receivedAt: { gte: since } } }),
+      db.reply.count({ where: { classification: 'wrong_contact', receivedAt: { gte: since } } }),
+      db.reply.count({ where: { OR: [{ classification: null }, { classification: { notIn: ['reply', 'auto_reply', 'opt_out', 'wrong_contact'] } }], receivedAt: { gte: since } } }),
     ])
 
   return {
@@ -77,6 +86,11 @@ export async function deliverabilityCounters(
     softBounces,
     replies,
     optOuts,
+    automaticReplies,
+    wrongContactReplies,
+    unclassifiedReplies,
+    referralSignal: { state: 'unavailable', why: 'Referral outcomes are not explicitly recorded; human replies do not prove referrals.' },
+    interviewSignal: { state: 'unavailable', why: 'Interview outcomes are not explicitly recorded; human replies do not prove interviews.' },
     hardBounceRate: sent === 0 ? null : hardBounces / sent,
     complaintSignal: {
       state: 'unavailable',

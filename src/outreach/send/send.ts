@@ -1,6 +1,11 @@
 import type { Db } from '../../core/audit/audit-log.js'
 import { writeAudit } from '../../core/audit/audit-log.js'
 import type { MailProvider } from '../../core/interfaces/providers.js'
+import { resolveSendingEnabled } from '../../core/config/config.js'
+import { MILESTONE_STAGE } from '../../core/config/stage.js'
+import { z } from 'zod'
+import { isInboxProvider } from '../inbox/contracts.js'
+import { syncInbox } from '../inbox/sync.js'
 import type { ReasonCodeValue } from '../../core/reason-codes/registry.js'
 import { AmbiguousSendError } from '../mail/gmail.js'
 import { deriveIdempotencyKey } from '../mail/message-id.js'
@@ -34,9 +39,8 @@ import { evaluateSendGate, type SendGateOptions, type SendPlan } from './gate.js
  *
  * `AmbiguousSendError` means the outcome is unknown: a timeout, a reset, a 5xx, a 429,
  * or a 200 whose body we could not read. The response is **never** another send. The
- * reconciliation runs first, and only a miss permits the attempt to be recorded
- * as failed — at which point a human, or a later retry, may try again against a
- * row that now truthfully says nothing was delivered.
+ * reconciliation runs first. A miss ends this attempt with a failure report; it
+ * does not prove non-delivery and does not license another send under its key.
  *
  * A non-ambiguous error (a 4xx that is not 429, a gate refusal) means the request was
  * rejected and no message exists. Those are recorded `failed` without a search,
@@ -91,10 +95,8 @@ export async function sendApprovedDraft(
     if (existingKey.status === 'in_flight') {
       return await reconcileAttempt(db, mail, existingKey.id, existingKey.rfc822MessageId)
     }
-    // `failed` or `aborted`: the row records that nothing landed, so a fresh attempt is
-    // legitimate — but it would need its own key, and deriving the same one again
-    // collides. Surfacing this rather than silently mutating a terminal row keeps the
-    // history of what was tried intact.
+    // Terminal attempts are never reused. An ambiguous reconciliation miss does
+    // not prove that nothing landed; surfacing the record keeps that uncertainty.
     return {
       status: 'failed',
       attemptId: existingKey.id,
@@ -102,14 +104,33 @@ export async function sendApprovedDraft(
     }
   }
 
-  const decision = await evaluateSendGate(db, draftId, opts)
-  if (!decision.allowed) {
-    return { status: 'refused', reason: decision.reason, detail: decision.detail }
+  const sending = resolveSendingEnabled({ stage: opts.stage ?? MILESTONE_STAGE,
+    ...(opts.envFlag === undefined ? {} : { envFlag: opts.envFlag }) })
+  if (!sending.enabled) return { status: 'refused', reason: sending.reason, detail: 'sending disabled; inbox not read' }
+  if (!isInboxProvider(mail)) {
+    return { status: 'refused', reason: 'weak_evidence', detail: 'incomplete outcome ingestion: provider cannot read inbox' }
   }
-  const plan = decision.plan
+  let ingestion = await syncInbox(db, mail, {
+    suppressionSalt: opts.suppressionSalt, checkpointKey: `pre-send:${opts.sendingAccount ?? 'default'}`,
+  })
+  // A resumed scan may have skipped mail arriving on its already-read first pages.
+  // Drain the old cursor, then require a fresh complete scan for this invocation.
+  if (ingestion.complete && ingestion.resumed) ingestion = await syncInbox(db, mail, {
+    suppressionSalt: opts.suppressionSalt, checkpointKey: `pre-send:${opts.sendingAccount ?? 'default'}`,
+  })
+  if (!ingestion.complete) {
+    await writeAudit(db, { actorType: 'system', actorId: 'send', action: 'send.inbox_incomplete',
+      subjectType: 'Draft', subjectId: draftId, metadata: ingestion })
+    return { status: 'refused', reason: 'weak_evidence', detail: `incomplete outcome ingestion: ${ingestion.detail}` }
+  }
 
-  // --- Step 2: the row, before the call. -----------------------------------
-  const attempt = await db.$transaction(async (tx) => {
+  // Serialize gate + reservation so concurrent sends cannot both consume the last
+  // cap or the same dedup slot. The provider call remains outside the transaction.
+  const reservation = await db.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended('outreach-send-reservation', 0))::text`
+    const decision = await evaluateSendGate(tx, draftId, opts)
+    if (!decision.allowed) return decision
+    const plan = decision.plan
     const row = await tx.sendAttempt.create({
       data: {
         draftId: plan.draftId,
@@ -131,8 +152,10 @@ export async function sendApprovedDraft(
       select: { id: true },
     })
     await tx.draft.update({ where: { id: plan.draftId }, data: { status: 'sending' } })
-    return row
-  })
+    return { allowed: true as const, attempt: row, plan }
+  }, { timeout: 30_000 })
+  if (!reservation.allowed) return { status: 'refused', reason: reservation.reason, detail: reservation.detail }
+  const { attempt, plan } = reservation
 
   await writeAudit(db, {
     actorType: 'system',
@@ -149,7 +172,7 @@ export async function sendApprovedDraft(
   })
 
   // --- Step 3: the provider call. ------------------------------------------
-  let ref: { providerMessageId: string; threadId?: string | undefined }
+  let ref: Awaited<ReturnType<MailProvider['send']>>
   try {
     ref = await mail.send(
       {
@@ -178,7 +201,7 @@ export async function sendApprovedDraft(
   await opts.onAfterProviderCall?.()
 
   // --- Step 4: record the outcome. -----------------------------------------
-  await markSent(db, attempt.id, plan.draftId, ref.providerMessageId, ref.threadId ?? null, false)
+  await markSent(db, attempt.id, plan.draftId, ref.providerMessageId, ref.threadId ?? null, false, storedMessageId(ref))
   return { status: 'sent', attemptId: attempt.id, providerMessageId: ref.providerMessageId, reconciled: false }
 }
 
@@ -244,7 +267,7 @@ export async function reconcileAttempt(
   })
   if (found) {
     // The send landed and the response was lost. Record it and stop.
-    await markSent(db, attemptId, attempt.draftId, found.providerMessageId, found.threadId ?? null, true)
+    await markSent(db, attemptId, attempt.draftId, found.providerMessageId, found.threadId ?? null, true, storedMessageId(found))
     await writeAudit(db, {
       actorType: 'system',
       actorId: 'send',
@@ -305,6 +328,7 @@ async function markSent(
   providerMessageId: string,
   threadId: string | null,
   reconciled: boolean,
+  providerRfc822MessageId: string | null,
 ): Promise<void> {
   await db.$transaction(async (tx) => {
     await tx.sendAttempt.update({
@@ -313,10 +337,11 @@ async function markSent(
         status: 'sent',
         providerMessageId,
         providerThreadId: threadId,
+        providerRfc822MessageId,
         ...(reconciled ? { reconciledAt: new Date() } : {}),
       },
     })
-    await tx.draft.update({ where: { id: draftId }, data: { status: 'sent' } })
+    await tx.draft.updateMany({ where: { id: draftId, status: 'sending' }, data: { status: 'sent' } })
     await tx.deliveryEvent.create({
       data: {
         sendAttemptId: attemptId,
@@ -347,3 +372,8 @@ async function markFailed(db: Db, attemptId: string, draftId: string, detail: st
 }
 
 export type { SendPlan }
+
+function storedMessageId(ref: unknown): string | null {
+  const parsed = z.object({ rfc822MessageId: z.string().min(1).nullable().optional() }).safeParse(ref)
+  return parsed.success ? parsed.data.rfc822MessageId ?? null : null
+}

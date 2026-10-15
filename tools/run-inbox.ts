@@ -25,7 +25,7 @@ import { KeychainKeyProvider } from '../src/core/crypto/keychain-key-provider.js
 import { EnvKeyProvider } from '../src/core/crypto/env-key-provider.js'
 import { GmailTokenProvider } from '../src/outreach/mail/oauth.js'
 import { GmailProvider } from '../src/outreach/mail/gmail.js'
-import { ingestInboundMessage, type InboundForIngest } from '../src/outreach/send/ingest-outcomes.js'
+import { syncInbox } from '../src/outreach/inbox/sync.js'
 import { deliverabilityCounters } from '../src/outreach/send/counters.js'
 
 function flag(name: string): string | undefined {
@@ -43,7 +43,12 @@ async function printCounters(): Promise<void> {
   console.log(`  in flight       ${counters.inFlight}`)
   console.log(`  hard bounces    ${counters.hardBounces}`)
   console.log(`  soft bounces    ${counters.softBounces}`)
-  console.log(`  replies         ${counters.replies}`)
+  console.log(`  human replies   ${counters.replies}`)
+  console.log(`  automatic       ${counters.automaticReplies}`)
+  console.log(`  wrong contact   ${counters.wrongContactReplies}`)
+  console.log(`  unclassified    ${counters.unclassifiedReplies}`)
+  console.log(`  referrals       ${counters.referralSignal.state}`)
+  console.log(`  interviews      ${counters.interviewSignal.state}`)
   console.log(`  opt-outs        ${counters.optOuts}`)
   console.log(
     `  hard-bounce rate ${counters.hardBounceRate === null ? 'n/a (nothing sent — not 0%)' : `${(counters.hardBounceRate * 100).toFixed(1)}%`}`,
@@ -57,7 +62,6 @@ if (process.argv.includes('--counters')) {
   await printCounters()
   await disconnectPrisma()
 } else {
-  const days = Number(flag('days') ?? 7)
   const clientId = config.GMAIL_OAUTH_CLIENT_ID
   const clientSecret = config.GMAIL_OAUTH_CLIENT_SECRET
   if (!clientId || !clientSecret) {
@@ -79,36 +83,18 @@ if (process.argv.includes('--counters')) {
   const tokens = new GmailTokenProvider(gate, secrets, { clientId, clientSecret })
   const mail = new GmailProvider(gate, tokens, { messageIdDomain: config.MESSAGE_ID_DOMAIN })
 
-  // Everything received recently, not only what is in a known thread. A bounce often
-  // arrives outside the thread, and a reply that broke threading is still a reply.
-  const query = `newer_than:${days}d -in:sent`
-  const ids = await mail.listInbox(query, 50)
-  console.log(`\ninbox:sync — ${ids.length} message(s) matching "${query}"\n`)
-
-  let matched = 0
-  for (const { id } of ids) {
-    const message = await mail.getMessage(id)
-    if (message.fromIsSelf) continue
-    const inbound: InboundForIngest = {
-      providerMessageId: message.id,
-      threadId: message.threadId,
-      from: message.from,
-      subject: message.subject,
-      bodyText: message.bodyText,
-      inReplyTo: message.inReplyTo,
-      receivedAt: message.receivedAt,
-    }
-    const result = await ingestInboundMessage(db, inbound, {
-      suppressionSalt: config.SUPPRESSION_HMAC_SALT,
-    })
-    if (result.kind === 'unmatched') continue
-    matched += 1
-    console.log(
-      `  ${result.kind.padEnd(14)} ${result.reasonCode ?? '-'}  ` +
-        `${result.suppressed ? 'SUPPRESSED' : 'no suppression'}  ${result.detail}`,
-    )
-  }
-  console.log(`\n  ${matched} message(s) matched a SendAttempt.`)
+  const daysFlag = flag('days')
+  const days = Number(daysFlag ?? 7)
+  if (daysFlag && (!Number.isInteger(days) || days < 1)) throw new Error('--days must be a positive integer')
+  const query = daysFlag ? `newer_than:${days}d -in:sent` : '-in:sent'
+  const result = await syncInbox(db, mail, {
+    suppressionSalt: config.SUPPRESSION_HMAC_SALT,
+    checkpointKey: `inbox:${config.GMAIL_SENDING_ACCOUNT ?? 'default'}:${daysFlag ? `diagnostic-${days}d` : 'full'}`,
+    query,
+  })
+  console.log(`inbox:sync — ${JSON.stringify(result)}`)
+  if (daysFlag) console.log('Bounded diagnostic coverage; this does not establish pre-send completeness.')
+  if (!result.complete) process.exitCode = 1
   await printCounters()
   await disconnectPrisma()
 }

@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { config as loadDotenv } from 'dotenv'
+import { configuredTestTarget, verifyTestTarget } from './helpers/test-target.js'
 
 /**
  * Applies migrations to the test database once per run.
@@ -9,13 +10,19 @@ import { config as loadDotenv } from 'dotenv'
  * and db push would report them as drift and offer to drop them. Running deploy
  * here means the suite exercises exactly the migration path production uses.
  */
-export default function setup(): void {
-  loadDotenv({ quiet: true })
-  const url = process.env.TEST_DATABASE_URL
-  if (!url) throw new Error('TEST_DATABASE_URL is not set; see .env.example')
-
-  execFileSync('npx', ['prisma', 'migrate', 'deploy'], {
-    env: { ...process.env, DATABASE_URL: url },
-    stdio: 'pipe',
+export async function deployTestMigrations(
+  source: NodeJS.ProcessEnv = process.env,
+  deploy: typeof execFileSync = execFileSync,
+  verify: typeof verifyTestTarget = verifyTestTarget,
+): Promise<void> {
+  const target = configuredTestTarget(source)
+  await verify(target)
+  deploy('npx', ['prisma', 'migrate', 'deploy'], {
+    env: { ...source, DATABASE_URL: target.url }, stdio: 'pipe', timeout: 120_000,
   })
+}
+
+export default async function setup(): Promise<void> {
+  loadDotenv({ quiet: true })
+  await deployTestMigrations()
 }

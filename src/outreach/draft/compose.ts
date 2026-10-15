@@ -20,7 +20,8 @@ import { renderTemplate, TEMPLATE_IDS, type TemplateVars } from './templates.js'
 import { GATE_VERSION, runQualityGate } from './quality-gate.js'
 import { INTRO, WINDOW, type PitchSentence } from './pitch.js'
 import { recipientFirstName } from './greeting.js'
-import { partitionEvidenceByScope } from './evidence-scope.js'
+import { isBoundEvidenceInScope, partitionEvidenceByScope } from './evidence-scope.js'
+import { draftSupportStatus, queueDraftSupport } from './support.js'
 
 /**
  * The composer — F4's payload, and the milestone where three mechanisms that have
@@ -552,8 +553,10 @@ export async function gateDraft(
       bodyText: true,
       composition: true,
       approvedAt: true,
+      promptVersion: true,
+      contact: { select: { id: true, companyId: true, contactType: true, identityVerifiedAt: true, verified: true, status: true, emailNormalized: true, publicTitle: true } },
       citedEvidenceIds: true,
-      lead: { select: { company: { select: { displayName: true, canonicalDomain: true } } } },
+      lead: { select: { company: { select: { id: true, displayName: true, canonicalDomain: true, atsSlug: true, atsBoardToken: true, atsOwnershipEvidenceId: true, atsOwnershipVerifiedAt: true } } } },
     },
   })
 
@@ -580,9 +583,11 @@ export async function gateDraft(
   // have cited — including one composed before the filter existed, or edited by hand.
   const cited = await db.evidence.findMany({
     where: { id: { in: draft.citedEvidenceIds } },
-    select: { id: true, sourceUrl: true },
+    select: { id: true, sourceUrl: true, companyId: true, contactId: true },
   })
-  const { foreign } = partitionEvidenceByScope(cited, draft.lead.company.canonicalDomain)
+  const person = draft.promptVersion === 'outreach_draft@5' && draft.contact ? await db.contactResearch.findUnique({ where: { contactId: draft.contact.id } }) : null
+  const personVerified = Boolean(person?.identityStatus === 'verified' && person.verifiedAt && person.companyId === draft.lead.company.id && draft.contact?.companyId === draft.lead.company.id && draft.contact.identityVerifiedAt)
+  const foreign = draft.promptVersion === 'outreach_draft@5' ? cited.filter((row) => !isBoundEvidenceInScope(row, { ...draft.lead.company, companyId: draft.lead.company.id, contactId: draft.contact?.id, verifiedPersonEvidenceIds: new Set(personVerified ? person!.citedEvidenceIds : []) }, row.id)) : partitionEvidenceByScope(cited, draft.lead.company.canonicalDomain).foreign
   if (foreign.length > 0) {
     await db.draft.update({
       where: { id: draftId },
@@ -604,6 +609,21 @@ export async function gateDraft(
       ok: false,
       reason: 'weak_evidence',
       detail: `foreign_evidence: cites rows about another company (${foreign.map((e) => e.sourceUrl).slice(0, 2).join(', ')})`,
+    }
+  }
+
+  if (draft.promptVersion === 'outreach_draft@5') {
+    const assessment = await db.outreachAssessment.findUnique({ where: { companyId: draft.lead.company.id } })
+    const ready = assessment?.status === 'draft_ready' && (assessment.fit as { supported?: boolean } | null)?.supported && assessment.selectedContactId === draft.contact?.id && draft.contact?.verified && draft.contact.status === 'active' && contactSlotRefusal(draft.contact) === null && (!draft.contact.contactType.startsWith('named') || personVerified)
+    if (!ready) {
+      await db.draft.update({ where: { id: draft.id }, data: { status: 'gate_failed', statusReason: 'weak_evidence', gateResult: { version: 'outreach-readiness@1', passed: false, detail: 'Supported fit, suitable verified route and recipient identity must be ready.' } } })
+      return { ok: false, reason: 'weak_evidence', detail: 'Outreach readiness is incomplete.' }
+    }
+    await queueDraftSupport(db, draft.id)
+    const support = await draftSupportStatus(db, draft)
+    if (!support.supported) {
+      await db.draft.update({ where: { id: draft.id }, data: { status: 'quality_gate', statusReason: 'weak_evidence', gateResult: { version: 'draft-support@1', passed: false, detail: support.detail, taskId: support.taskId ?? null } } })
+      return { ok: false, reason: 'weak_evidence', detail: support.detail }
     }
   }
 

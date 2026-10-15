@@ -15,7 +15,8 @@ import {
   isCompanyDomain,
   normalizeEmail,
 } from './classify.js'
-import { isExecutiveContact } from './executive-filter.js'
+import { recipientSuitability } from './suitability.js'
+import { publishedIdentity } from './person-research.js'
 
 /**
  * Tier A — the contact curator, and the only tier F4 exercises.
@@ -234,25 +235,8 @@ export async function curateCompanyContacts(
         continue
       }
 
-      const title = titleNear(text, email)
-      const exec = isExecutiveContact(email, title)
-      if (exec.isExecutive) {
-        out.executivesRejected += 1
-        await writeAudit(db, {
-          actorType: 'system',
-          actorId: 'contact-curator',
-          action: 'contact.refused',
-          subjectType: 'Company',
-          subjectId: company.id,
-          reasonCode: 'executive_only_contact',
-          // The address itself is NOT recorded. handover.md §1.1 says never target
-          // them; storing the address in an audit row so a later query could find it
-          // would be keeping exactly what the rule says not to keep.
-          metadata: { url: page.url, matched: exec.matched, where: exec.where },
-        })
-        continue
-      }
-
+      const identity = publishedIdentity(page.body, email)
+      const title = identity?.title ?? titleNear(text, email)
       const classification = classifyLocal(email)
       const contactType: ContactType =
         classification.kind === 'named'
@@ -273,7 +257,7 @@ export async function curateCompanyContacts(
       // what the operator's Tier B amendment was about either. §10.5 keeps Tier B a
       // seam this milestone, so a page-read address that is not a recruiting route is
       // simply not stored.
-      if (contactType === 'named_employee') {
+      if (!recipientSuitability({ emailNormalized: email, contactType, publicTitle: title }).suitable) {
         out.refusals.push({ reason: 'not_recruiting_route', detail: email })
         continue
       }
@@ -283,6 +267,7 @@ export async function curateCompanyContacts(
         email,
         contactType,
         title,
+        fullName: identity?.fullName ?? null,
         pageKind: candidate.kind,
         sourceUrl: page.url,
         excerptSource: text,
@@ -341,6 +326,7 @@ async function storeContact(
     email: string
     contactType: ContactType
     title: string | null
+    fullName: string | null
     pageKind: ContactSourcePageKind
     sourceUrl: string
     excerptSource: string
@@ -375,6 +361,10 @@ async function storeContact(
       discoveryMethod: 'page_published',
       sourcePageKind: input.pageKind,
       publicTitle: input.title,
+      fullName: input.fullName,
+      identitySourceUrl: input.fullName ? input.sourceUrl : null,
+      suitability: recipientSuitability({ emailNormalized: input.email, contactType: input.contactType, publicTitle: input.title }).category,
+      suitabilityReason: recipientSuitability({ emailNormalized: input.email, contactType: input.contactType, publicTitle: input.title }).reason,
       evidenceId: evidence.id,
       capturedAt: input.now,
     } satisfies Prisma.ContactUncheckedCreateInput,

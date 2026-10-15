@@ -227,10 +227,56 @@ const OutreachDraftResponseV4 = z.object({
 
 export type OutreachDraftResponseV4 = z.infer<typeof OutreachDraftResponseV4>
 
+/** @5 retains the detailed @4 email and adds an optional verified person hook. */
+const OutreachDraftResponseV5 = OutreachDraftResponseV4.extend({
+  personHook: Grounded(400).extend({ contactId: z.string().min(1) }).optional(),
+})
+export type OutreachDraftResponseV5 = z.infer<typeof OutreachDraftResponseV5>
+
+const DraftSupportResponse = z.object({
+  claims: z.array(z.object({
+    text: z.string().min(1).max(2000),
+    kind: z.enum(['company', 'person', 'candidate', 'hypothetical']),
+    evidenceIds: z.array(z.string().min(1)),
+    approvedClaimIds: z.array(z.string().min(1)),
+    verdict: z.enum(['supported', 'unsupported', 'uncertain']),
+    reason: z.string().min(1).max(1000),
+  })).min(1).max(40),
+  overall: z.enum(['supported', 'needs_research']),
+  limitations: z.array(z.string().max(1000)).max(20),
+})
+export type DraftSupportResponse = z.infer<typeof DraftSupportResponse>
+
+/** URLs are research candidates only. Gated capture and identity validation follow. */
+const ResearchUrlsResponse = z.object({
+  urls: z.array(z.object({
+    url: z.url({ protocol: /^https?$/ }).refine((value) => {
+      const url = new URL(value)
+      return !url.username && !url.password
+    }, 'Research candidate URLs must not contain credentials'),
+    purpose: z.string().min(1).max(500),
+    personName: z.string().min(1).max(200).optional(),
+    identityHint: z.string().min(1).max(500).optional(),
+  })).max(10),
+  limitations: z.array(z.string().max(1000)).max(20),
+})
+export type ResearchUrlsResponse = z.infer<typeof ResearchUrlsResponse>
+
+const ContactResearchResponse = z.object({
+  identityStatus: z.enum(['verified', 'uncertain', 'unverified']),
+  facts: z.array(Grounded(500)).max(10),
+  hooks: z.array(Grounded(400).extend({ authorshipVerified: z.boolean() })).max(5),
+  limitations: z.array(z.string().max(1000)).max(20),
+})
+export type ContactResearchResponse = z.infer<typeof ContactResearchResponse>
+
 export const LLM_TASK_KINDS = {
   researchBrief: 'research_brief',
   packetAnswers: 'packet_answers',
   outreachDraft: 'outreach_draft',
+  researchUrls: 'research_urls',
+  contactResearch: 'contact_research',
+  draftSupport: 'draft_support',
 } as const
 
 export type LlmTaskKind = (typeof LLM_TASK_KINDS)[keyof typeof LLM_TASK_KINDS]
@@ -244,6 +290,14 @@ export type LlmTaskSchemaEntry = {
 }
 
 export const LLM_TASK_SCHEMAS: LlmTaskSchemaEntry[] = [
+  { kind: LLM_TASK_KINDS.outreachDraft, promptVersion: 'outreach_draft@5', schema: OutreachDraftResponseV5,
+    description: 'Detailed @4 email plus an optional person hook bound to the verified recipient and person evidence.' },
+  { kind: LLM_TASK_KINDS.draftSupport, promptVersion: 'draft_support@1', schema: DraftSupportResponse,
+    description: 'Independent semantic support review of every generated sentence. Citation membership alone does not establish support.' },
+  { kind: LLM_TASK_KINDS.researchUrls, promptVersion: 'research_urls@1', schema: ResearchUrlsResponse,
+    description: 'Candidate public URLs and their purpose/identity hints. No accepted facts; capture through the fetch gate first.' },
+  { kind: LLM_TASK_KINDS.contactResearch, promptVersion: 'contact_research@1', schema: ContactResearchResponse,
+    description: 'Recipient identity, evidence-backed facts and hooks, with explicit authorship and limitations.' },
   {
     kind: LLM_TASK_KINDS.researchBrief,
     promptVersion: 'research_brief@1',

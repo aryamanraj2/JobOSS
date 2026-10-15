@@ -1,10 +1,12 @@
 import { MockAgent, setGlobalDispatcher } from 'undici'
 import { beforeAll, afterAll } from 'vitest'
 import { config as loadDotenv } from 'dotenv'
+import { configuredTestTarget, verifyTestTarget } from './helpers/test-target.js'
 
 loadDotenv({ quiet: true })
+const target = configuredTestTarget()
 process.env.NODE_ENV = 'test'
-process.env.DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL
+process.env.DATABASE_URL = target.url
 
 /**
  * handover.md §11: never run uncontrolled live-source tests.
@@ -21,7 +23,8 @@ process.env.DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE
  */
 export const mockAgent = new MockAgent()
 
-beforeAll(() => {
+beforeAll(async () => {
+  await verifyTestTarget(target)
   mockAgent.disableNetConnect()
   setGlobalDispatcher(mockAgent)
 })

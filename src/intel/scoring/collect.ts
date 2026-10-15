@@ -4,6 +4,7 @@ import { resolveCountries } from '../country/normalize.js'
 import { matchTracks, type TextField } from '../taxonomy/matcher.js'
 import { latestJobCountDelta } from '../signals/job-count-delta.js'
 import { EVIDENCE_FRESH_DAYS, POSTING_STALE_DAYS, type ScoreInput } from './score.js'
+import { canonicalizeDomain } from '../../ingest/domain/canonicalize.js'
 
 /**
  * Gathers everything the scorer needs from rows we already hold.
@@ -96,6 +97,7 @@ export type CompanyForScoring = {
   ycStatus: string | null
   atsBoardToken: string | null
   careersUrl: string | null
+  atsOwnershipVerifiedAt?: Date | null
 }
 
 export const COMPANY_SCORING_SELECT = {
@@ -111,6 +113,7 @@ export const COMPANY_SCORING_SELECT = {
   ycStatus: true,
   atsBoardToken: true,
   careersUrl: true,
+  atsOwnershipVerifiedAt: true,
 } as const
 
 function ageInDays(from: Date, now: Date): number {
@@ -238,7 +241,8 @@ export async function collectScoreInput(
 ): Promise<CollectedScoreInput> {
   const [opportunities, evidence, boardFailure] = await Promise.all([
     db.opportunity.findMany({
-      where: { companyId: company.id },
+      where: { companyId: company.id, status: 'open',
+        lastSeenAt: { gte: new Date(now.getTime() - POSTING_STALE_DAYS * 86_400_000) } },
       select: {
         id: true,
         title: true,
@@ -253,7 +257,7 @@ export async function collectScoreInput(
     db.evidence.findMany({
       where: { companyId: company.id },
       orderBy: { observedAt: 'desc' },
-      select: { id: true, sourceType: true, excerpt: true, sourceUrl: true, observedAt: true },
+      select: { id: true, sourceType: true, excerpt: true, sourceUrl: true, observedAt: true, contactId: true },
     }),
     db.auditLog.findFirst({
       where: { subjectId: company.id, action: 'ats.board_failed' },
@@ -270,7 +274,8 @@ export async function collectScoreInput(
   }
   if (company.tags.length > 0) fields.push({ field: `${FIELD_PREFIX.seed}tags`, text: company.tags.join(', ') })
 
-  for (const opportunity of opportunities) {
+  const usableOpportunities = company.atsBoardToken && !company.atsOwnershipVerifiedAt ? [] : opportunities
+  for (const opportunity of usableOpportunities) {
     const text = [opportunity.title, opportunity.location].filter(Boolean).join(' — ')
     if (text) fields.push({ field: `${FIELD_PREFIX.posting}${opportunity.title ?? opportunity.id}`, text })
   }
@@ -281,7 +286,7 @@ export async function collectScoreInput(
   // distinction the weight depends on and would also mislabel every snippet's
   // provenance, since `MatchedSnippet.field` is what the F3 evidence viewer shows
   // the operator as the source of a claim.
-  for (const opportunity of bodyFieldsFor(opportunities)) {
+  for (const opportunity of bodyFieldsFor(usableOpportunities)) {
     fields.push({
       field: `${FIELD_PREFIX.postingBody}${opportunity.title ?? opportunity.id}`,
       text: opportunity.description!,
@@ -291,6 +296,8 @@ export async function collectScoreInput(
 
   for (const row of evidence) {
     if (row.sourceType !== 'company_page') continue
+    const owner = canonicalizeDomain(row.sourceUrl)
+    if (row.contactId || !owner.ok || owner.domain !== company.canonicalDomain || ageInDays(row.observedAt, now) > EVIDENCE_FRESH_DAYS) continue
     fields.push({ field: `${FIELD_PREFIX.page}${row.sourceUrl}`, text: row.excerpt })
   }
 
@@ -299,12 +306,12 @@ export async function collectScoreInput(
   const matchedNonSeed = [...matchedFields].some((f) => !f.startsWith(FIELD_PREFIX.seed))
 
   // --- hiring --------------------------------------------------------------
-  const openOpportunities = opportunities.filter((o) => o.status === 'open')
+  const openOpportunities = usableOpportunities.filter((o) => o.status === 'open')
   const primaryTrack = match.primary?.track ?? null
 
   // Matched once per posting and reused: the same computation answers "how many
   // open roles match the primary track" and "which track is this posting".
-  const opportunityTracks = opportunities.map((o) => matchOnePosting(o))
+  const opportunityTracks = usableOpportunities.map((o) => matchOnePosting(o))
   const trackByOpportunity = new Map(opportunityTracks.map((t) => [t.opportunityId, t]))
   const relevantOpenRoles = primaryTrack
     ? openOpportunities.filter((o) => (trackByOpportunity.get(o.id)?.tracks ?? []).includes(primaryTrack)).length
@@ -317,11 +324,14 @@ export async function collectScoreInput(
   })
 
   // --- personalization: recent, employer-published sources (§8) ------------
-  const recentEmployerEvidence = evidence.filter(
+  const recentEmployerEvidence = [...new Map(evidence.filter(
     (e) =>
-      (e.sourceType === 'ats' || e.sourceType === 'company_page') &&
+      !e.contactId &&
+      ((e.sourceType === 'ats' && !!company.atsOwnershipVerifiedAt) ||
+        (e.sourceType === 'company_page' && canonicalizeDomain(e.sourceUrl).ok &&
+          (canonicalizeDomain(e.sourceUrl) as { ok: true; domain: string }).domain === company.canonicalDomain)) &&
       ageInDays(e.observedAt, now) <= EVIDENCE_FRESH_DAYS,
-  )
+  ).reverse().map((e) => [e.sourceUrl, e])).values()].sort((a, b) => b.observedAt.getTime() - a.observedAt.getTime())
   const distinctSourceTypes = new Set(recentEmployerEvidence.map((e) => e.sourceType)).size
 
   // --- freshness -----------------------------------------------------------
@@ -347,8 +357,8 @@ export async function collectScoreInput(
       ycIsHiring: company.ycIsHiring,
     },
     applicationRoute: {
-      hasBoardToken: company.atsBoardToken !== null,
-      hasRoleUrl: opportunities.some((o) => o.roleUrl !== null),
+      hasBoardToken: company.atsBoardToken !== null && !!company.atsOwnershipVerifiedAt,
+      hasRoleUrl: usableOpportunities.some((o) => o.roleUrl !== null),
       hasCareersUrl: company.careersUrl !== null,
       // A board the employer links and the vendor 404s is a dead board, not an
       // absent ATS (F1 §8.3). It costs points; it does not remove the route.

@@ -1,8 +1,10 @@
 import { z } from 'zod'
+import { isUtf8 } from 'node:buffer'
 import type { FetchPolicyGate } from '../../core/policy/fetch-policy-gate.js'
 import type { InboundMessage, MailProvider, OutboundMessage, ProviderMessageRef } from '../../core/interfaces/providers.js'
 import { buildRawMessage, toBase64Url, OUTREACH_REF_HEADER } from './mime.js'
 import { deriveMessageId, deriveOutreachRef, outreachRefOf, rfc822MsgIdQuery } from './message-id.js'
+import type { DeliveryMessageRef, InboxPage } from '../inbox/contracts.js'
 import type { GmailTokenProvider } from './oauth.js'
 
 /**
@@ -50,24 +52,26 @@ const SendResponse = z.object({
 })
 
 const ListResponse = z.object({
-  messages: z.array(z.object({ id: z.string(), threadId: z.string() })).optional(),
-  resultSizeEstimate: z.number().optional(),
+  messages: z.array(z.object({ id: z.string().min(1), threadId: z.string().min(1) })).optional(),
+  nextPageToken: z.string().min(1).optional(),
+  resultSizeEstimate: z.number().int().nonnegative().optional(),
 })
 
+type MimePart = {
+  headers?: Array<{ name: string; value: string }> | undefined
+  mimeType?: string | undefined
+  body?: { data?: string | undefined; size?: number | undefined; attachmentId?: string | undefined } | undefined
+  parts?: MimePart[] | undefined
+}
+const PartBody = z.object({ data: z.string().optional(), size: z.number().int().nonnegative().optional(), attachmentId: z.string().min(1).optional() })
+const MessagePart: z.ZodType<MimePart> = z.lazy(() => z.object({
+  headers: z.array(z.object({ name: z.string().min(1), value: z.string() })).optional(),
+  mimeType: z.string().optional(), body: PartBody.optional(), parts: z.array(MessagePart).optional(),
+}))
 const MessageResponse = z.object({
-  id: z.string(),
-  threadId: z.string(),
-  labelIds: z.array(z.string()).optional(),
-  snippet: z.string().optional(),
-  internalDate: z.string().optional(),
-  payload: z
-    .object({
-      headers: z.array(z.object({ name: z.string(), value: z.string() })).optional(),
-      mimeType: z.string().optional(),
-      body: z.object({ data: z.string().optional(), size: z.number().optional() }).optional(),
-      parts: z.array(z.unknown()).optional(),
-    })
-    .optional(),
+  id: z.string().min(1), threadId: z.string().min(1),
+  labelIds: z.array(z.string()).optional(), snippet: z.string().optional(), internalDate: z.string().optional(),
+  payload: MessagePart.optional(),
 })
 
 export class GmailApiError extends Error {
@@ -206,7 +210,7 @@ export class GmailProvider implements MailProvider {
   async send(
     m: OutboundMessage,
     idempotencyKey: string,
-  ): Promise<{ providerMessageId: string; threadId?: string }> {
+  ): Promise<DeliveryMessageRef> {
     const messageId = deriveMessageId(idempotencyKey, this.opts.messageIdDomain)
     const raw = buildRawMessage({
       to: m.to,
@@ -251,13 +255,19 @@ export class GmailProvider implements MailProvider {
       throw new GmailApiError(`gmail returned ${statusCode}`, statusCode, body.slice(0, 400))
     }
 
-    const parsed = SendResponse.safeParse(JSON.parse(body))
+    const parsed = SendResponse.safeParse(parseJson(body))
     if (!parsed.success) {
       // A 200 whose body we cannot read means the message very likely went out and we
       // cannot say what its id is. Ambiguous, not a plain failure.
       throw new AmbiguousSendError('gmail returned 200 with an unrecognised body', body.slice(0, 400))
     }
-    return { providerMessageId: parsed.data.id, threadId: parsed.data.threadId }
+    // A successful POST followed by a failed read is still an ambiguous send.
+    try {
+      const stored = await this.getMessage(parsed.data.id)
+      return { providerMessageId: stored.id, threadId: stored.threadId, rfc822MessageId: stored.rfc822MessageId }
+    } catch (err) {
+      throw new AmbiguousSendError('sent message metadata could not be read', err)
+    }
   }
 
   /**
@@ -304,7 +314,7 @@ export class GmailProvider implements MailProvider {
   async findByMessageId(
     messageId: string,
     hint: { to?: string | undefined; withinDays?: number } = {},
-  ): Promise<ProviderMessageRef | null> {
+  ): Promise<DeliveryMessageRef | null> {
     const ref = outreachRefOf(messageId)
     const days = hint.withinDays ?? this.opts.reconcileWindowDays ?? 2
     const parts = ['in:sent', `newer_than:${days}d`]
@@ -312,33 +322,12 @@ export class GmailProvider implements MailProvider {
     // person", which is the difference between a handful of reads and forty.
     if (hint.to) parts.push(`to:${hint.to}`)
 
-    const params = new URLSearchParams({ q: parts.join(' '), maxResults: '25' })
-    await this.spaceRequests()
-    const result = await this.gate.fetchText(`${API_BASE}/messages?${params.toString()}`, {
-      companyId: null,
-      cost: 0,
-      headers: await this.authHeaders(),
-    })
-    this.markRequestDone()
-    if (!result.ok) {
-      // Never report "not found" from a refusal. A null here licenses another send, so
-      // the only safe answer to "we could not look" is to raise.
-      throw new GmailApiError(`reconciliation search refused by FetchPolicyGate: ${result.reason}`, null)
-    }
-    if (result.response.statusCode !== 200) {
-      throw new GmailApiError(
-        `reconciliation search returned ${result.response.statusCode}`,
-        result.response.statusCode,
-        result.response.body.slice(0, 400),
-      )
-    }
-    const parsed = ListResponse.safeParse(JSON.parse(result.response.body))
-    if (!parsed.success) throw new GmailApiError('unrecognised list response', 200)
+    const candidates = await this.listInbox(parts.join(' '), 25)
 
-    for (const candidate of parsed.data.messages ?? []) {
+    for (const candidate of candidates) {
       const message = await this.getMessage(candidate.id)
       if (message.headers[OUTREACH_REF_HEADER.toLowerCase()] === ref) {
-        return { providerMessageId: message.id, threadId: message.threadId }
+        return { providerMessageId: message.id, threadId: message.threadId, rfc822MessageId: message.rfc822MessageId }
       }
     }
     return null
@@ -353,22 +342,7 @@ export class GmailProvider implements MailProvider {
    * in a comment.
    */
   async findByRfc822MsgId(messageId: string): Promise<ProviderMessageRef[]> {
-    const params = new URLSearchParams({
-      q: rfc822MsgIdQuery(messageId),
-      maxResults: '10',
-      includeSpamTrash: 'true',
-    })
-    await this.spaceRequests()
-    const result = await this.gate.fetchText(`${API_BASE}/messages?${params.toString()}`, {
-      companyId: null,
-      cost: 0,
-      headers: await this.authHeaders(),
-    })
-    this.markRequestDone()
-    if (!result.ok || result.response.statusCode !== 200) return []
-    const parsed = ListResponse.safeParse(JSON.parse(result.response.body))
-    if (!parsed.success) return []
-    return (parsed.data.messages ?? []).map((m) => ({ providerMessageId: m.id, threadId: m.threadId }))
+    return (await this.listInbox(rfc822MsgIdQuery(messageId), 50)).map((m) => ({ providerMessageId: m.id, threadId: m.threadId }))
   }
 
   /**
@@ -389,23 +363,10 @@ export class GmailProvider implements MailProvider {
     const parts = [`newer_than:${days}d`]
     if (hint.to) parts.push(`to:${hint.to}`)
 
-    const params = new URLSearchParams({ q: parts.join(' '), maxResults: '25', includeSpamTrash: 'true' })
-    await this.spaceRequests()
-    const result = await this.gate.fetchText(`${API_BASE}/messages?${params.toString()}`, {
-      companyId: null,
-      cost: 0,
-      headers: await this.authHeaders(),
-    })
-    this.markRequestDone()
-    if (!result.ok) throw new GmailApiError(`search refused by FetchPolicyGate: ${result.reason}`, null)
-    if (result.response.statusCode !== 200) {
-      throw new GmailApiError(`search returned ${result.response.statusCode}`, result.response.statusCode)
-    }
-    const parsed = ListResponse.safeParse(JSON.parse(result.response.body))
-    if (!parsed.success) throw new GmailApiError('unrecognised list response', 200)
+    const candidates = await this.listInbox(parts.join(' '), 25)
 
     const out: ProviderMessageRef[] = []
-    for (const candidate of parsed.data.messages ?? []) {
+    for (const candidate of candidates) {
       const message = await this.getMessage(candidate.id)
       if (message.headers[OUTREACH_REF_HEADER.toLowerCase()] === ref) {
         out.push({ providerMessageId: message.id, threadId: message.threadId })
@@ -436,9 +397,37 @@ export class GmailProvider implements MailProvider {
       // Classifying a bounce from half a message is how a hard bounce reads as soft.
       throw new GmailApiError('message body exceeded the byte ceiling and was truncated', 200)
     }
-    const parsed = MessageResponse.safeParse(JSON.parse(result.response.body))
-    if (!parsed.success) throw new GmailApiError('unrecognised message response', 200)
+    const parsed = MessageResponse.safeParse(parseJson(result.response.body))
+    if (!parsed.success || parsed.data.id !== providerMessageId) throw new GmailApiError('unrecognised message response', 200)
+    if (parsed.data.payload) await this.loadClassificationBodies(providerMessageId, parsed.data.payload)
     return toGmailMessage(parsed.data)
+  }
+
+  /** Gmail can move textual/DSN parts into the attachments endpoint. Binary files are irrelevant. */
+  private async loadClassificationBodies(messageId: string, root: MimePart): Promise<void> {
+    let bytes = 0
+    const visit = async (part: MimePart, depth: number): Promise<void> => {
+      if (depth > 30) throw new GmailApiError('MIME nesting coverage cap reached', 200)
+      const readable = !part.mimeType || /^(text|message)\//.test(part.mimeType)
+      if (readable && part.body?.attachmentId && !part.body.data) {
+        if ((part.body.size ?? 0) > (this.opts.maxBytes ?? 1024 * 1024)) throw new GmailApiError('classification attachment exceeds byte ceiling', 200)
+        await this.spaceRequests()
+        const result = await this.gate.fetchText(`${API_BASE}/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(part.body.attachmentId)}`, {
+          companyId: null, cost: 0, headers: await this.authHeaders(), maxBytes: this.opts.maxBytes ?? 1024 * 1024,
+        })
+        this.markRequestDone()
+        if (!result.ok || result.response.statusCode !== 200 || result.response.truncated) throw new GmailApiError('classification attachment read failed', null)
+        const body = PartBody.safeParse(parseJson(result.response.body))
+        if (!body.success || body.data.data === undefined) throw new GmailApiError('malformed classification attachment', 200)
+        part.body = body.data
+      }
+      if (readable && part.body?.data) {
+        bytes += Buffer.byteLength(decodeBase64Url(part.body.data))
+        if (bytes > (this.opts.maxBytes ?? 1024 * 1024)) throw new GmailApiError('classification bodies exceed byte ceiling', 200)
+      }
+      for (const child of part.parts ?? []) await visit(child, depth + 1)
+    }
+    await visit(root, 0)
   }
 
   /**
@@ -451,18 +440,8 @@ export class GmailProvider implements MailProvider {
   async listReplies(threadIds: string[]): Promise<InboundMessage[]> {
     const out: InboundMessage[] = []
     for (const threadId of threadIds) {
-      const params = new URLSearchParams({ q: `thread:${threadId}`, maxResults: '20' })
-      await this.spaceRequests()
-      const result = await this.gate.fetchText(`${API_BASE}/messages?${params.toString()}`, {
-        companyId: null,
-        cost: 0,
-        headers: await this.authHeaders(),
-      })
-      this.markRequestDone()
-      if (!result.ok || result.response.statusCode !== 200) continue
-      const parsed = ListResponse.safeParse(JSON.parse(result.response.body))
-      if (!parsed.success) continue
-      for (const hit of parsed.data.messages ?? []) {
+      const hits = await this.listInbox(`thread:${threadId}`, 50)
+      for (const hit of hits) {
         const message = await this.getMessage(hit.id)
         if (message.fromIsSelf) continue
         out.push({
@@ -477,28 +456,44 @@ export class GmailProvider implements MailProvider {
     return out
   }
 
-  /**
-   * Everything that has arrived since a given history id, which is how the inbox is
-   * polled without re-reading the mailbox. Kept as a thin list-by-query for F5: the
-   * pilot's volume makes a full `history.list` cursor more machinery than the problem
-   * needs, and F6 can add one when there is traffic to justify it.
-   */
-  async listInbox(query: string, maxResults = 25): Promise<Array<{ id: string; threadId: string }>> {
-    const params = new URLSearchParams({ q: query, maxResults: String(maxResults) })
+  /** One Gmail page. The caller must consume nextPageToken before declaring completeness. */
+  async listInboxPage(query: string, pageToken?: string, maxResults = 50): Promise<InboxPage> {
+    if (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 500) {
+      throw new GmailApiError('invalid inbox page size', null)
+    }
+    const params = new URLSearchParams({ q: query, maxResults: String(maxResults), includeSpamTrash: 'true' })
+    if (pageToken) params.set('pageToken', pageToken)
     await this.spaceRequests()
     const result = await this.gate.fetchText(`${API_BASE}/messages?${params.toString()}`, {
-      companyId: null,
-      cost: 0,
-      headers: await this.authHeaders(),
+      companyId: null, cost: 0, headers: await this.authHeaders(),
     })
     this.markRequestDone()
     if (!result.ok) throw new GmailApiError(`inbox list refused: ${result.reason}`, null)
-    if (result.response.statusCode !== 200) {
-      throw new GmailApiError(`inbox list returned ${result.response.statusCode}`, result.response.statusCode)
+    if (result.response.statusCode !== 200 || result.response.truncated) {
+      throw new GmailApiError('inbox list failed or was truncated', result.response.statusCode)
     }
-    const parsed = ListResponse.safeParse(JSON.parse(result.response.body))
+    const parsed = ListResponse.safeParse(parseJson(result.response.body))
     if (!parsed.success) throw new GmailApiError('unrecognised list response', 200)
-    return parsed.data.messages ?? []
+    if ((!parsed.data.messages || parsed.data.messages.length === 0) && !parsed.data.nextPageToken && (parsed.data.resultSizeEstimate ?? 0) > 0) {
+      throw new GmailApiError('list claims messages but omits them', 200)
+    }
+    return { messages: parsed.data.messages ?? [], nextPageToken: parsed.data.nextPageToken ?? null }
+  }
+
+  /** Complete listing; caps/loops/failures throw instead of returning a partial miss. */
+  async listInbox(query: string, maxResults = 50): Promise<Array<{ id: string; threadId: string }>> {
+    const out: Array<{ id: string; threadId: string }> = []
+    const seen = new Set<string>()
+    let token: string | undefined
+    for (let pageNumber = 0; pageNumber < 200; pageNumber += 1) {
+      const page = await this.listInboxPage(query, token, maxResults)
+      out.push(...page.messages)
+      if (!page.nextPageToken) return out
+      if (seen.has(page.nextPageToken)) throw new GmailApiError('inbox pagination loop', null)
+      seen.add(page.nextPageToken)
+      token = page.nextPageToken
+    }
+    throw new GmailApiError('inbox coverage cap reached', null)
   }
 }
 
@@ -531,8 +526,11 @@ function headerValue(
 
 /** base64url -> utf8, tolerating the padding Gmail omits. */
 export function decodeBase64Url(data: string): string {
+  if (!/^[A-Za-z0-9_+\/=-]*$/.test(data) || data.replace(/=+$/, '').length % 4 === 1) throw new GmailApiError('invalid base64 body', 200)
   const normalized = data.replace(/-/g, '+').replace(/_/g, '/')
-  return Buffer.from(normalized, 'base64').toString('utf8')
+  const bytes = Buffer.from(normalized, 'base64')
+  if (!isUtf8(bytes)) throw new GmailApiError('classification body is not valid UTF-8', 200)
+  return bytes.toString('utf8')
 }
 
 /**
@@ -544,22 +542,34 @@ export function decodeBase64Url(data: string): string {
  * which is the single most informative field in a delivery status notification.
  */
 function collectText(node: unknown, out: string[]): void {
-  if (node === null || typeof node !== 'object') return
+  if (node === null || typeof node !== 'object' || Array.isArray(node)) throw new GmailApiError('malformed MIME part', 200)
   const part = node as {
-    mimeType?: string
-    body?: { data?: string }
+    mimeType?: string | undefined
+    body?: { data?: string | undefined; size?: number | undefined; attachmentId?: string | undefined } | undefined
     parts?: unknown[]
   }
-  if (part.body?.data && (part.mimeType === undefined || part.mimeType.startsWith('text/') || part.mimeType.startsWith('message/'))) {
+  if (part.parts !== undefined && !Array.isArray(part.parts)) throw new GmailApiError('malformed MIME children', 200)
+  const readable = !part.mimeType || /^(text|message)\//.test(part.mimeType)
+  if (readable && part.body && !part.body.data && (part.body.attachmentId || (part.body.size ?? 0) > 0)) {
+    throw new GmailApiError('classification body is not inline; ingestion incomplete', 200)
+  }
+  if (part.body && part.body.data === undefined && part.body.size === 0 && readable) out.push('')
+  if (part.body?.data !== undefined && (part.mimeType === undefined || part.mimeType.startsWith('text/') || part.mimeType.startsWith('message/'))) {
     out.push(decodeBase64Url(part.body.data))
   }
   for (const child of part.parts ?? []) collectText(child, out)
 }
 
 function toGmailMessage(raw: z.infer<typeof MessageResponse>): GmailMessage {
-  const headers = raw.payload?.headers
+  if (!raw.payload || !raw.payload.headers || !headerValue(raw.payload.headers, 'From') ||
+      !raw.internalDate || !Number.isFinite(Number(raw.internalDate)) ||
+      Number(raw.internalDate) < 0 || !Number.isFinite(new Date(Number(raw.internalDate)).getTime())) {
+    throw new GmailApiError('message lacks readable payload, sender or date', 200)
+  }
+  const headers = raw.payload.headers
   const text: string[] = []
   if (raw.payload) collectText(raw.payload, text)
+  if (text.length === 0) throw new GmailApiError('message has no readable classification body', 200)
   const labelIds = raw.labelIds ?? []
   const allHeaders: Record<string, string> = {}
   for (const h of headers ?? []) allHeaders[h.name.toLowerCase()] = h.value
@@ -575,10 +585,14 @@ function toGmailMessage(raw: z.infer<typeof MessageResponse>): GmailMessage {
     snippet: raw.snippet ?? '',
     bodyText: text.join('\n'),
     labelIds,
-    receivedAt: raw.internalDate ? new Date(Number(raw.internalDate)) : new Date(),
+    receivedAt: new Date(Number(raw.internalDate)),
     // Gmail labels our own messages SENT. Cheaper and more reliable than parsing the
     // From header and comparing it to a configured address, which gets display names,
     // aliases and plus-tags wrong.
     fromIsSelf: labelIds.includes('SENT'),
   }
+}
+
+function parseJson(body: string): unknown {
+  try { return JSON.parse(body) } catch { return null }
 }

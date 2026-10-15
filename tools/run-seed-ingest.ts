@@ -38,7 +38,7 @@ import { resolve } from 'node:path'
 import { prisma, disconnectPrisma } from '../src/core/db/client.js'
 import { env } from '../src/core/config/config.js'
 import { FetchPolicyGate } from '../src/core/policy/fetch-policy-gate.js'
-import { GROWTH_BAND, YcOssSeedProvider, batchYear, inGrowthBand, type YcFeed } from '../src/ingest/yc/yc-oss.js'
+import { GROWTH_BAND, YcOssSeedProvider, batchYear, inGrowthBand, inRecentStartupBand, type YcFeed } from '../src/ingest/yc/yc-oss.js'
 import { resolveCountries } from '../src/intel/country/normalize.js'
 import { runSeedIngest, type SeedRunResult } from '../src/ingest/yc/seed-loader.js'
 import { canonicalizeDomain } from '../src/ingest/domain/canonicalize.js'
@@ -63,6 +63,7 @@ const fromFile = flag('from-file')
  * operator-seeded row that would also replace its `seed-track:` tags.
  */
 const backfillBand = process.argv.includes('--backfill-band')
+const recentStartups = process.argv.includes('--recent-startups')
 const limit = Number(flag('limit') ?? (backfillBand ? Infinity : 150))
 const feed = (flag('feed') ?? 'hiring') as YcFeed
 const seedOnly = process.argv.includes('--seed-only')
@@ -207,7 +208,10 @@ if (detectBandScored) {
     console.log(`  by region: ${[...byRegion].map(([r, n]) => `${r} ${n}`).join(' · ')}`)
   } else {
     console.log(`\nSeeding from yc-oss "${feed}" feed, limit ${limit}...`)
-    seedResult = await runSeedIngest(db, new YcOssSeedProvider(gate, { feed, limit }))
+    seedResult = await runSeedIngest(db, new YcOssSeedProvider(gate, {
+      feed: recentStartups ? 'all' : feed, limit,
+      ...(recentStartups ? { filter: inRecentStartupBand } : {}),
+    }))
   }
 
   if (seedResult.sourceFailure) {
@@ -263,6 +267,7 @@ if (!seedOnly) {
       website: true,
       atsSlug: true,
       atsBoardToken: true,
+      atsOwnershipVerifiedAt: true,
     },
     orderBy: { createdAt: 'asc' },
   })

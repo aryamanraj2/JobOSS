@@ -1,10 +1,13 @@
+import { isStandaloneDatabaseClient } from '../joboss/database-scope.js'
+import { isZeroCostMailOperation, type NetworkOperation } from './zero-cost-operations.js'
 import type { Db } from '../audit/audit-log.js'
 import { writeAudit } from '../audit/audit-log.js'
 import type { ReasonCodeValue } from '../reason-codes/registry.js'
 import { normalizeHost } from './host-lists.js'
 import { resolveHostPolicy } from './host-policy.js'
 import { checkRobots } from './robots.js'
-import { checkBudget, recordSpend, type BudgetSpend } from './budget.js'
+import { matchApiContract } from './api-contracts.js'
+import { checkBudget, reserveBudget, validateBudgetSpend, type BudgetSpend } from './budget.js'
 import { HostRateLimiter, effectiveDelayMs } from './rate-limit.js'
 import { rawGet, rawPostForm, rawPostJson, type RawResponse } from './http/raw-client.js'
 
@@ -24,8 +27,8 @@ export type GateContext = {
   /**
    * Credits this request consumes against the research budget.
    *
-   * Defaults to 1. **Zero is meaningful and is not the same as the default**: a
-   * zero-cost request is never refused by the budget step and never charged. That is
+   * Defaults to 1. **Zero is allowed only for exact existing HTTPS mail/OAuth operations**;
+   * research must declare positive integer base credits. That is
    * how the mail transport passes through this gate — it is here because
    * `FetchPolicyGate` is the only path to the network, not because it consumes a
    * research allowance, and a research cap must never be able to abort an approved
@@ -113,6 +116,15 @@ export class FetchPolicyGate {
   }
 
   async check(url: string, ctx: GateContext = {}): Promise<PreflightResult> {
+    return this.preflight(url, ctx, 'get')
+  }
+
+  private async preflight(url: string, ctx: GateContext, operation: NetworkOperation, body?: unknown): Promise<PreflightResult> {
+    if (!isStandaloneDatabaseClient(this.db)) {
+      await this.recordRefusal(url, 'budget_exhausted', { detail: 'transaction_client_network_forbidden' })
+      return { allowed: false, reason: 'budget_exhausted' }
+    }
+    const method = operation === 'get' ? 'GET' : 'POST'
     let parsed: URL
     try {
       parsed = new URL(url)
@@ -145,8 +157,16 @@ export class FetchPolicyGate {
       return { allowed: false, reason: 'terms_prohibited' }
     }
 
-    // 2. robots.txt.
-    const robots = await checkRobots(this.db, url, {
+    const validated = validateBudgetSpend(spendOf(ctx))
+    if (!validated.allowed || (validated.cost.credits === 0 &&
+        (ctx.companyId != null || !isZeroCostMailOperation(url, operation, body)))) {
+      await this.recordRefusal(url, 'budget_exhausted', { detail: validated.allowed ? 'positive_research_credits_required' : validated.scope })
+      return { allowed: false, reason: 'budget_exhausted' }
+    }
+
+    // Documented API contracts govern exact API requests. Website paths retain robots.
+    const contract = matchApiContract(url, method)
+    const robots = contract ? { allowed: true, crawlDelaySeconds: undefined } : await checkRobots(this.db, url, {
       userAgent: this.opts.userAgent,
       ttlSeconds: this.opts.robotsTtlSeconds,
       hostExplicitlyAllowed: true,
@@ -155,8 +175,8 @@ export class FetchPolicyGate {
     if (!robots.allowed) {
       await this.recordRefusal(url, 'robots_disallowed', {
         host,
-        parseOk: robots.parseOk,
-        source: robots.source,
+        parseOk: 'parseOk' in robots ? robots.parseOk : true,
+        source: 'source' in robots ? robots.source : 'api_contract',
       })
       return { allowed: false, reason: 'robots_disallowed' }
     }
@@ -181,7 +201,7 @@ export class FetchPolicyGate {
       this.opts.now?.() ?? new Date(),
     )
     if (!budget.allowed) {
-      await this.recordRefusal(url, 'budget_exhausted', { host, scope: budget.scope })
+      await this.recordRefusal(url, 'budget_exhausted', { host, scope: budget.scope, detail: budget.detail })
       return { allowed: false, reason: 'budget_exhausted' }
     }
 
@@ -202,14 +222,25 @@ export class FetchPolicyGate {
     const pre = await this.check(url, ctx)
     if (!pre.allowed) return { ok: false, reason: pre.reason }
 
+    const reserved = await reserveBudget(this.db, ctx.companyId ?? null, spendOf(ctx), this.opts.now?.() ?? new Date())
+    if (!reserved.allowed) {
+      await this.recordRefusal(url, 'budget_exhausted', { scope: reserved.scope, phase: 'reservation' })
+      return { ok: false, reason: 'budget_exhausted' }
+    }
     const host = normalizeHost(new URL(url).host)
+    // Preflight is advisory: another request may have used this gate while the
+    // database reservation waited. Recheck synchronously before opening a socket.
+    const rate = this.limiter.check(host, pre.rateDelayMs)
+    if (!rate.allowed) {
+      await this.recordRefusal(url, 'rate_limited', { host, retryAfterMs: rate.retryAfterMs, reserved: true })
+      return { ok: false, reason: 'rate_limited' }
+    }
     this.limiter.record(host)
     const response = await rawGet(url, {
       userAgent: this.opts.userAgent,
       ...(ctx.maxBytes === undefined ? {} : { maxBytes: ctx.maxBytes }),
       ...(ctx.headers === undefined ? {} : { headers: ctx.headers }),
     })
-    await recordSpend(this.db, ctx.companyId ?? null, spendOf(ctx), this.opts.now?.() ?? new Date())
 
     await writeAudit(this.db, {
       actorType: 'system',
@@ -247,10 +278,22 @@ export class FetchPolicyGate {
     body: unknown,
     ctx: GateContext & { headers?: Record<string, string>; redactedBodyKeys?: string[] } = {},
   ): Promise<{ ok: true; response: RawResponse } | { ok: false; reason: PreflightRefusal['reason'] }> {
-    const pre = await this.check(url, ctx)
+    const pre = await this.preflight(url, ctx, 'json_post', body)
     if (!pre.allowed) return { ok: false, reason: pre.reason }
 
+    const reserved = await reserveBudget(this.db, ctx.companyId ?? null, spendOf(ctx), this.opts.now?.() ?? new Date())
+    if (!reserved.allowed) {
+      await this.recordRefusal(url, 'budget_exhausted', { scope: reserved.scope, phase: 'reservation' })
+      return { ok: false, reason: 'budget_exhausted' }
+    }
     const host = normalizeHost(new URL(url).host)
+    // Preflight is advisory: another request may have used this gate while the
+    // database reservation waited. Recheck synchronously before opening a socket.
+    const rate = this.limiter.check(host, pre.rateDelayMs)
+    if (!rate.allowed) {
+      await this.recordRefusal(url, 'rate_limited', { host, retryAfterMs: rate.retryAfterMs, reserved: true })
+      return { ok: false, reason: 'rate_limited' }
+    }
     this.limiter.record(host)
     const response = await rawPostJson(url, {
       userAgent: this.opts.userAgent,
@@ -258,7 +301,6 @@ export class FetchPolicyGate {
       ...(ctx.headers === undefined ? {} : { headers: ctx.headers }),
       ...(ctx.maxBytes === undefined ? {} : { maxBytes: ctx.maxBytes }),
     })
-    await recordSpend(this.db, ctx.companyId ?? null, spendOf(ctx), this.opts.now?.() ?? new Date())
 
     const redacted = new Set(ctx.redactedBodyKeys ?? [])
     const safeBody =
@@ -308,10 +350,22 @@ export class FetchPolicyGate {
     form: Record<string, string>,
     ctx: GateContext = {},
   ): Promise<{ ok: true; response: RawResponse } | { ok: false; reason: PreflightRefusal['reason'] }> {
-    const pre = await this.check(url, ctx)
+    const pre = await this.preflight(url, ctx, 'form_post', form)
     if (!pre.allowed) return { ok: false, reason: pre.reason }
 
+    const reserved = await reserveBudget(this.db, ctx.companyId ?? null, spendOf(ctx), this.opts.now?.() ?? new Date())
+    if (!reserved.allowed) {
+      await this.recordRefusal(url, 'budget_exhausted', { scope: reserved.scope, phase: 'reservation' })
+      return { ok: false, reason: 'budget_exhausted' }
+    }
     const host = normalizeHost(new URL(url).host)
+    // Preflight is advisory: another request may have used this gate while the
+    // database reservation waited. Recheck synchronously before opening a socket.
+    const rate = this.limiter.check(host, pre.rateDelayMs)
+    if (!rate.allowed) {
+      await this.recordRefusal(url, 'rate_limited', { host, retryAfterMs: rate.retryAfterMs, reserved: true })
+      return { ok: false, reason: 'rate_limited' }
+    }
     this.limiter.record(host)
     const response = await rawPostForm(url, {
       userAgent: this.opts.userAgent,
@@ -319,7 +373,6 @@ export class FetchPolicyGate {
       ...(ctx.headers === undefined ? {} : { headers: ctx.headers }),
       ...(ctx.maxBytes === undefined ? {} : { maxBytes: ctx.maxBytes }),
     })
-    await recordSpend(this.db, ctx.companyId ?? null, spendOf(ctx), this.opts.now?.() ?? new Date())
 
     await writeAudit(this.db, {
       actorType: 'system',

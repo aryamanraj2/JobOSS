@@ -14,6 +14,8 @@ import { AshbyProvider } from './ashby.js'
 import { GreenhouseProvider } from './greenhouse.js'
 import { LeverProvider } from './lever.js'
 import type { AtsVendor } from './signatures.js'
+import { detectAllAtsInText } from './signatures.js'
+import { canonicalizeDomain } from '../domain/canonicalize.js'
 
 export function atsProviders(fetcher: GatedFetcher): Record<AtsVendor, AtsProvider> {
   return {
@@ -30,6 +32,8 @@ export type PostingIngestResult = {
   updated: number
   unchanged: number
   duplicates: number
+  closed?: number
+  complete?: boolean
   sourceFailure?: { reason: ReasonCodeValue; detail: string } | undefined
 }
 
@@ -66,9 +70,32 @@ export async function ingestPostings(
   const observedAt = now()
   const result: PostingIngestResult = { fetched: 0, created: 0, updated: 0, unchanged: 0, duplicates: 0 }
 
+  const owner = await db.company.findUnique({ where: { id: company.id }, select: {
+    canonicalDomain: true, atsSlug: true, atsBoardToken: true, atsOwnershipEvidenceId: true, atsOwnershipVerifiedAt: true,
+  } })
+  const ownership = owner?.atsOwnershipEvidenceId
+    ? await db.evidence.findUnique({ where: { id: owner.atsOwnershipEvidenceId } }) : null
+  const ownershipDomain = ownership ? canonicalizeDomain(ownership.sourceUrl) : null
+  if (!owner?.atsOwnershipVerifiedAt || !ownership || ownership.companyId !== company.id ||
+      !ownershipDomain?.ok || ownershipDomain.domain !== owner.canonicalDomain ||
+      owner.atsSlug !== provider.slug || owner.atsBoardToken !== company.atsBoardToken ||
+      !detectAllAtsInText(ownership.excerpt).some((hit) => hit.vendor === provider.slug && hit.boardToken === company.atsBoardToken)) {
+    result.sourceFailure = { reason: 'weak_evidence', detail: 'ATS board ownership is not verified by an employer careers link' }
+    await writeAudit(db, { actorType: 'system', actorId: `ats-${provider.slug}`, action: 'ats.ownership_refused',
+      subjectType: 'Company', subjectId: company.id, reasonCode: 'weak_evidence' })
+    return result
+  }
+
   let postings: Posting[]
+  let complete = false
   try {
-    postings = await provider.listPostings(company.atsBoardToken)
+    if (provider.listSnapshot) {
+      const snapshot = await provider.listSnapshot(company.atsBoardToken)
+      postings = snapshot.postings
+      complete = snapshot.complete
+    } else {
+      postings = await provider.listPostings(company.atsBoardToken)
+    }
   } catch (err) {
     if (!isSourceError(err)) throw err
     result.sourceFailure = { reason: err.reasonCode, detail: err.message }
@@ -85,12 +112,14 @@ export async function ingestPostings(
   }
 
   result.fetched = postings.length
+  result.complete = complete
   const seenExternalIds = new Set<string>()
 
+  const persistSnapshot = async (tx: Db): Promise<PostingIngestResult> => {
   for (const posting of postings) {
     if (seenExternalIds.has(posting.externalId)) {
       result.duplicates += 1
-      await writeAudit(db, {
+      await writeAudit(tx, {
         actorType: 'system',
         actorId: `ats-${provider.slug}`,
         action: 'ats.posting_skipped',
@@ -103,12 +132,27 @@ export async function ingestPostings(
     }
     seenExternalIds.add(posting.externalId)
 
-    const outcome = await upsertPosting(db, provider.slug, company.id, posting, observedAt)
+    const outcome = await upsertPosting(tx, provider.slug, company.id, posting, observedAt)
     result[outcome] += 1
   }
 
-  await writeBoardCountSignal(db, provider, company, postings, observedAt)
+  if (complete) {
+    const closure = await tx.opportunity.updateMany({
+      where: { companyId: company.id, kind: 'published_role', status: { in: ['open', 'stale', 'unknown'] },
+        externalId: { not: null, notIn: [...seenExternalIds] } },
+      data: { status: 'closed', closedAt: observedAt },
+    })
+    result.closed = closure.count
+    await writeBoardCountSignal(tx, provider, company, postings.filter((p, i) => postings.findIndex((q) => q.externalId === p.externalId) === i), observedAt)
+  } else {
+    await writeAudit(tx, { actorType: 'system', actorId: `ats-${provider.slug}`, action: 'ats.snapshot_partial',
+      subjectType: 'Company', subjectId: company.id, reasonCode: 'source_unavailable', metadata: { fetched: postings.length } })
+  }
   return result
+  }
+  // Fetch before the transaction. Missing-job closure and the complete observation commit together.
+  if ('$transaction' in db) return db.$transaction((tx) => persistSnapshot(tx), { timeout: 30_000 })
+  return persistSnapshot(db)
 }
 
 /**
@@ -138,20 +182,18 @@ async function upsertPosting(
 
   const existing = await db.opportunity.findUnique({
     where: { companyId_externalId: { companyId, externalId: posting.externalId } },
-    select: { id: true },
+    select: { id: true, title: true, roleUrl: true, location: true, description: true, externalId: true, postedAt: true },
   })
 
   if (existing) {
-    const priorEvidence = await db.evidence.findFirst({
-      where: { companyId, contentHash: hash, sourceType: 'ats' },
-      select: { id: true },
-    })
-    if (priorEvidence) {
+    const currentHash = postingContentHash({ externalId: existing.externalId!, title: existing.title ?? '',
+      url: existing.roleUrl ?? '', location: existing.location, content: existing.description ?? '', postedAt: existing.postedAt })
+    if (currentHash === hash) {
       // Unchanged: touch `lastSeenAt` only. A8's freshness question is "was this
       // still listed", and that is exactly what lastSeenAt answers.
       await db.opportunity.update({
         where: { id: existing.id },
-        data: { lastSeenAt: observedAt, closedAt: null },
+        data: { lastSeenAt: observedAt, status: 'open', closedAt: null },
       })
       await writeAudit(db, {
         actorType: 'system',

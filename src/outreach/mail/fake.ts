@@ -1,6 +1,8 @@
-import type { InboundMessage, MailProvider, OutboundMessage, ProviderMessageRef } from '../../core/interfaces/providers.js'
+import type { InboundMessage, MailProvider, OutboundMessage } from '../../core/interfaces/providers.js'
 import { buildRawMessage } from './mime.js'
 import { deriveMessageId, deriveOutreachRef, outreachRefOf, syntheticProviderId } from './message-id.js'
+import type { DeliveryMessageRef, InboxPage } from '../inbox/contracts.js'
+import type { GmailMessage } from './gmail.js'
 import { AmbiguousSendError } from './gmail.js'
 
 /**
@@ -13,7 +15,7 @@ import { AmbiguousSendError } from './gmail.js'
  * *"a crash mid-send issues no second send"* and a fake that quietly behaves better
  * than Gmail proves nothing. Two rules follow, and both are the point of this file:
  *
-_PLACEHOLDER_
+ * 1. The fake rewrites Message-ID by default, as the production provider does.
  * 2. **It can fail ambiguously on demand.** `failNextSendAmbiguously()` delivers the
  *    message and then throws, which is the exact shape of a lost response — the state
  *    that A9 exists for and the one a naive fake never produces.
@@ -56,6 +58,9 @@ export class FakeMailProvider implements MailProvider {
   /** Every send CALL, including ones that threw. `sent` holds only what landed. */
   sendCalls = 0
 
+  readonly inbox: GmailMessage[] = []
+  inboxFailure: Error | null = null
+
   private ambiguousNext = false
   private refuseNext: Error | null = null
   private readonly inbound: InboundMessage[] = []
@@ -86,7 +91,7 @@ export class FakeMailProvider implements MailProvider {
     this.refuseNext = err
   }
 
-  async send(m: OutboundMessage, idempotencyKey: string): Promise<ProviderMessageRef> {
+  async send(m: OutboundMessage, idempotencyKey: string): Promise<DeliveryMessageRef> {
     this.sendCalls += 1
 
     if (this.refuseNext) {
@@ -127,22 +132,35 @@ export class FakeMailProvider implements MailProvider {
       this.ambiguousNext = false
       throw new AmbiguousSendError('fake: response lost after the message was delivered')
     }
-    return { providerMessageId: record.providerMessageId, threadId: record.threadId }
+    return { providerMessageId: record.providerMessageId, threadId: record.threadId, rfc822MessageId: record.storedMessageId }
   }
 
-  async findByMessageId(messageId: string): Promise<ProviderMessageRef | null> {
+  async findByMessageId(messageId: string): Promise<DeliveryMessageRef | null> {
     // Matches on the HEADER the provider kept, which is what the Gmail implementation
     // does and for the same measured reason. With `preservesOutreachRef: false` this
     // returns null for a message that really was sent — the residual failure mode, and
     // the assertion is that even then no second send is issued.
     const ref = outreachRefOf(messageId)
     const hit = this.sent.find((s) => s.storedOutreachRef !== null && s.storedOutreachRef === ref)
-    return hit ? { providerMessageId: hit.providerMessageId, threadId: hit.threadId } : null
+    return hit ? { providerMessageId: hit.providerMessageId, threadId: hit.threadId, rfc822MessageId: hit.storedMessageId } : null
   }
 
   async listReplies(threadIds: string[]): Promise<InboundMessage[]> {
     const wanted = new Set(threadIds)
     return this.inbound.filter((m) => wanted.has(m.threadId))
+  }
+
+  async listInboxPage(_query: string, pageToken?: string, maxResults = 50): Promise<InboxPage> {
+    if (this.inboxFailure) throw this.inboxFailure
+    const offset = Number(pageToken ?? 0)
+    return { messages: this.inbox.slice(offset, offset + maxResults).map(({ id, threadId }) => ({ id, threadId })),
+      nextPageToken: offset + maxResults < this.inbox.length ? String(offset + maxResults) : null }
+  }
+
+  async getMessage(id: string): Promise<GmailMessage> {
+    const message = this.inbox.find((m) => m.id === id)
+    if (!message) throw new Error('fake: message not found')
+    return message
   }
 
   /** Test seam: put a reply, bounce or opt-out into the mailbox. */

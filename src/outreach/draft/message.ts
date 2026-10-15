@@ -79,11 +79,12 @@ export const SENTENCE_ROLES = [
   'tie',
   // `outreach_draft@3`: "writing after <via>", a trigger read off the company's evidence.
   'via',
+  'person',
 ] as const
 export type SentenceRole = (typeof SENTENCE_ROLES)[number]
 
 /** Roles whose text is a claim about the employer, and therefore needs `Evidence`. */
-export const COMPANY_CITED_ROLES = new Set<SentenceRole>(['company', 'tie', 'via'])
+export const COMPANY_CITED_ROLES = new Set<SentenceRole>(['company', 'tie', 'via', 'person'])
 
 /** Roles whose sentence may be about either party, so it must cite at least one of either. */
 export const EITHER_CITED_ROLES = new Set<SentenceRole>(['opener'])
@@ -119,7 +120,9 @@ export const DraftComposition = z.object({
    * session's own paragraphs. Absent on every composition stored before them, which keep
    * rendering as they did.
    */
-  layout: z.enum(['v3', 'v4']).optional(),
+  layout: z.enum(['v3', 'v4', 'v5']).optional(),
+  /** Review limitations travel with the new revision, never hidden in the email. */
+  limitations: z.array(z.string()).optional(),
 })
 export type DraftComposition = z.infer<typeof DraftComposition>
 
@@ -320,7 +323,7 @@ export async function validateComposition(
 export function renderBody(composition: DraftComposition): string {
   const take = (role: SentenceRole) => composition.sentences.filter((s) => s.role === role).map((s) => s.text)
 
-  if (composition.layout === 'v4') {
+  if (composition.layout === 'v4' || composition.layout === 'v5') {
     // The operator's Temple email: TLDR, greeting, intro + hook + bridge, the story a
     // paragraph at a time, the scene, then the window, resume and ask.
     const via = take('via')[0]
@@ -329,6 +332,7 @@ export function renderBody(composition: DraftComposition): string {
       ...take('opener').map((t) => `TLDR: ${t}`),
       ...take('greeting'),
       [...intro, ...take('company'), ...take('bridge')].join(' '),
+      ...take('person'),
       ...take('candidate'),
       take('tie').join(' '),
       [...take('availability'), ...take('resume_link'), ...take('ask')].join(' '),
