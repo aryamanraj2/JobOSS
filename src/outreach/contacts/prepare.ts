@@ -8,7 +8,7 @@ import { ensureCompanyResearchBudget } from '../../ingest/budget/company-budget.
 import { fetchPage } from '../../ingest/fetch-page.js'
 import { curateCompanyContacts } from './curate.js'
 import { readImportedRow } from './verify-backfill.js'
-import { observePersonPage } from './person-research.js'
+import { observePersonPage, identityCaptureHash } from './person-research.js'
 import { recipientSuitability } from './suitability.js'
 import { isCompanyDomain } from './classify.js'
 import { recipientState, validPersonFacts, evidenceSnapshot, type PersonFact } from './verification.js'
@@ -100,10 +100,13 @@ export async function prepareRecipients(db: Db, gate: GatedFetcher, companyIds: 
         for (const url of urls) {
           const page = await read(url)
           if (!page.ok) { limitations.push(`${page.reason}: ${page.detail}`); continue }
-          const observation = observePersonPage({ html: page.body, url: page.url, companyDomain: company.canonicalDomain, fullName: candidateName, publicTitle: contact.publicTitle })
-          if (!observation.identityVerified || !observation.excerpt || (observation.publishedAt && observation.publishedAt > now)) continue
+          const observation = observePersonPage({ html: page.body, url: page.url, companyDomain: company.canonicalDomain, companyName: company.displayName, fullName: candidateName, publicTitle: contact.publicTitle })
+          if (!observation.identityVerified || !observation.excerpt || (observation.publishedAt && observation.publishedAt > now)) {
+            if (observation.limitation) limitations.push(observation.limitation)
+            continue
+          }
           identityUrl = page.url; observation.links.forEach((u) => links.add(u))
-          const e = await personEvidence(db, company, contact.id, page.url, observation.excerpt, now, observation.publishedAt ?? null)
+          const e = await personEvidence(db, company, contact.id, page.url, observation.excerpt, now, observation.publishedAt ?? null, observation.identityRecord?.html)
           facts.push({ ...fact(e, 'identity', false), ...(observation.identityRecord ? { identityRecord: observation.identityRecord } : {}) })
           if (observation.authorshipVerified && observation.workExcerpt) {
             const work = await personEvidence(db, company, contact.id, page.url, observation.workExcerpt, now, observation.publishedAt ?? null)
@@ -114,7 +117,7 @@ export async function prepareRecipients(db: Db, gate: GatedFetcher, companyIds: 
         for (const url of [...links].slice(0, 2)) {
           const page = await read(url)
           if (!page.ok) { limitations.push(`${page.reason}: ${page.detail}`); continue }
-          const observation = observePersonPage({ html: page.body, url: page.url, companyDomain: company.canonicalDomain, fullName: candidateName, publicTitle: contact.publicTitle, employerLinked: !!identityUrl })
+          const observation = observePersonPage({ html: page.body, url: page.url, companyDomain: company.canonicalDomain, companyName: company.displayName, fullName: candidateName, publicTitle: contact.publicTitle, employerLinked: !!identityUrl })
           if (!observation.authorshipVerified || !observation.workExcerpt || (observation.publishedAt && observation.publishedAt > now)) continue
           hooks.push(fact(await personEvidence(db, company, contact.id, page.url, observation.workExcerpt, now, observation.publishedAt ?? null), 'authorship', true))
         }
@@ -130,7 +133,7 @@ export async function prepareRecipients(db: Db, gate: GatedFetcher, companyIds: 
       limitations.forEach((detail) => out.limitations.push({ companyId, contactId: contact.id, detail }))
       const research = await db.contactResearch.findUniqueOrThrow({ where: { contactId: contact.id } })
       const evidence = await db.evidence.findMany({ where: { companyId } })
-      const verified = validPersonFacts(research, updated, evidence, now, company.canonicalDomain)
+      const verified = validPersonFacts(research, updated, evidence, now, company.canonicalDomain, company.displayName)
       const researchHash = contentHashOf({ contact: updated, facts: research.facts, hooks: research.hooks, citedEvidenceIds: research.citedEvidenceIds })
       const task = await recipientTask(db, { kind: 'contact_research', promptVersion: 'contact_research@1', subjectType: 'ContactResearch', subjectId: `${contact.id}:${researchHash}`,
         allowedEvidenceIds: citedEvidenceIds, allowedApprovedClaimIds: [], input: {
@@ -158,8 +161,8 @@ export async function prepareRecipients(db: Db, gate: GatedFetcher, companyIds: 
 function fact(e: Evidence, observation: 'identity' | 'authorship', authorshipVerified: boolean): PersonFact {
   return { text: e.excerpt, evidenceIds: [e.id], authorshipVerified, observation, snapshots: [{ id: e.id, hash: evidenceSnapshot(e) }] }
 }
-async function personEvidence(db: Db, company: { id: string; canonicalDomain: string }, contactId: string, url: string, excerpt: string, now: Date, publishedAt: Date | null) {
-  const text = excerpt.slice(0, 500), contentHash = contentHashOf({ url, excerpt: text, contactId })
+async function personEvidence(db: Db, company: { id: string; canonicalDomain: string }, contactId: string, url: string, excerpt: string, now: Date, publishedAt: Date | null, identityHtml?: string) {
+  const text = excerpt.slice(0, 500), contentHash = identityHtml === undefined ? contentHashOf({ url, excerpt: text, contactId }) : identityCaptureHash(url, text, contactId, identityHtml)
   // Same immutable capture may be reused only at its real observation time; never refresh cache timestamps.
   const prior = await db.evidence.findFirst({ where: { companyId: company.id, contactId, sourceUrl: url, contentHash, observedAt: now } })
   if (prior) return prior

@@ -1,5 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import { writeFileSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { testDb, truncateAll, closeTestDb } from '../helpers/db.js'
 import { StubFetcher } from '../helpers/fixtures.js'
 import { proveBoard, boardSnapshot, syntheticJob } from '../fixtures/discovery-support.js'
@@ -14,6 +16,9 @@ import { rankOutreachCompanies } from '../../src/intel/outreach/assess.js'
 import { ensureScoreVersion, scoreCompanyAndPersist } from '../../src/intel/scoring/run.js'
 import { SCORE_VERSION_V3, ACTIVE_SCORE_VERSION } from '../../src/intel/scoring/score-version.js'
 const NOW = new Date('2026-10-15T00:00:00Z')
+// Retain this run's snapshots for inspection; each invocation owns fresh paths.
+const evidenceDir = mkdtempSync(join(tmpdir(), 'joboss-c-evidence-'))
+const correctionEvidenceDir = mkdtempSync(join(tmpdir(), 'joboss-c-c01-evidence-'))
 const db = testDb()
 beforeEach(async () => { vi.restoreAllMocks(); await truncateAll() })
 afterAll(closeTestDb)
@@ -54,7 +59,7 @@ describe('C discovery persistence and source funnel (synthetic)', () => {
     expect(result.sources.map((s) => s.discovered)).toEqual([1, 1, 1]); expect(await db.contact.count()).toBe(0)
     const resumeGate = new StubFetcher({}), resumed = await prepareDiscovery(db, resumeGate, { limit: 20, now: NOW, delayMs: 0, resume: true, runId: result.batchId })
     expect(resumed.discovered).toBe(1); expect(resumeGate.requested).toHaveLength(0)
-    writeFileSync('/tmp/joboss-c-evidence/synthetic-funnel.json', JSON.stringify(result, null, 2))
+    writeFileSync(join(evidenceDir, 'synthetic-funnel.json'), JSON.stringify(result, null, 2))
   })
   it('rejects unknown run scopes before creating source work', async () => {
     await expect(prepareDiscovery(db, discoveryGate(), { limit: 2, resume: true, runId: 'unrelated' })).rejects.toThrow('Unknown')
@@ -207,8 +212,8 @@ describe('C explainable research ranking (synthetic)', () => {
     await rankOutreachCompanies(db, { limit: 20, now: NOW })
     expect(await db.outreachAssessment.findUniqueOrThrow({ where: { companyId: tiny.id } })).toMatchObject({ status: 'drafted', selectedContactId: 'D-owned-selection', blockers: ['D-owned-blocker'] })
     expect(await db.draft.count()).toBe(0); expect(await db.sendAttempt.count()).toBe(0)
-    writeFileSync('/tmp/joboss-c-evidence/synthetic-ranking.json', JSON.stringify(ranked, null, 2))
-    writeFileSync('/tmp/joboss-c-evidence/synthetic-funding.json', JSON.stringify(await db.fundingRecord.findMany(), null, 2))
+    writeFileSync(join(evidenceDir, 'synthetic-ranking.json'), JSON.stringify(ranked, null, 2))
+    writeFileSync(join(evidenceDir, 'synthetic-funding.json'), JSON.stringify(await db.fundingRecord.findMany(), null, 2))
   })
 })
 
@@ -314,7 +319,7 @@ describe('RC-1 funding persistence and stored-evidence revalidation', () => {
     outputs.push({ text, companyId: c.id, recordId: record.id, freshVerification: record.verificationStatus,
       oldEvidenceId: legacy.id, oldEarlyStageVerified: ranked.fit.earlyStageVerified, oldTrigger: ranked.trigger,
       oldBadEvidenceCited: ranked.citedEvidenceIds.includes(legacy.id), validControl: 'primary_verified', changedControl: 'indexed' })
-    writeFileSync('/tmp/joboss-c-c01-evidence/rc1.json', JSON.stringify(outputs, null, 2))
+    writeFileSync(join(correctionEvidenceDir, 'rc1.json'), JSON.stringify(outputs, null, 2))
   })
 })
 
@@ -349,7 +354,7 @@ describe('RC-2 exact URL binding through production consumers', () => {
     expect(ranked.fit.supported).toBe(false)
     outputs.push({ url, companyId: c.id, snapshot, legacyPostingEligible: input.opportunityTracks.length,
       boardTokenUsable: input.input.applicationRoute.hasBoardToken, supportedFit: ranked.fit.supported, citedEvidenceIds: ranked.citedEvidenceIds })
-    writeFileSync('/tmp/joboss-c-c01-evidence/rc2.json', JSON.stringify(outputs, null, 2))
+    writeFileSync(join(correctionEvidenceDir, 'rc2.json'), JSON.stringify(outputs, null, 2))
   })
   it('rejects fetched nested-only markup and refuses saving old forged detection evidence', async () => {
     const c = await company(), url = 'https://jobs.lever.co/?next=https://job-boards.greenhouse.io/acme', careers = 'https://acme.example/careers'
@@ -404,7 +409,7 @@ describe('RC-3 actual preparation storage interruption and legacy repair', () =>
     const seed = toSeed(record, 'https://yc-oss.github.io/api/companies/all.json', NOW)
     const result = await runSeedIngest(db, { async *listCompanies() { yield seed } }, { now: () => NOW })
     expect(result.unchanged).toBe(1); expect(await assertProvenance(c.id)).toEqual(complete)
-    writeFileSync(`/tmp/joboss-c-c01-evidence/rc3-${where}.json`, JSON.stringify({ synthetic: true, batchId: first.batchId, runIds: first.runIds, firstStatus: first.sources[0]?.status, errors: first.sources[0]?.errors, before, resumedStatus: resumed.sources[0]?.status, complete, replayUnchanged: result.unchanged, companyId: c.id }, null, 2))
+    writeFileSync(join(correctionEvidenceDir, `rc3-${where}.json`), JSON.stringify({ synthetic: true, batchId: first.batchId, runIds: first.runIds, firstStatus: first.sources[0]?.status, errors: first.sources[0]?.errors, before, resumedStatus: resumed.sources[0]?.status, complete, replayUnchanged: result.unchanged, companyId: c.id }, null, 2))
   })
   it('repairs an already-partial record hash without changing operator fields or source bindings', async () => {
     const c = await company('acme.example', { status: 'excluded', ycStatus: 'Acquired', website: 'https://reviewed.acme.example', tags: ['operator'] })

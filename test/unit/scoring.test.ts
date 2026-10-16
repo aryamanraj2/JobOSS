@@ -9,6 +9,8 @@ import {
 import { reconstructTotal, scoreCompany, type ScoreInput } from '../../src/intel/scoring/score.js'
 import { matchTracks } from '../../src/intel/taxonomy/matcher.js'
 import { resolveCountries } from '../../src/intel/country/normalize.js'
+import { storedOpenPostingsAllStale } from '../../src/intel/scoring/collect.js'
+import { describeScoreRefusals } from '../../src/intel/scoring/run.js'
 
 const NOW = new Date('2026-09-09T00:00:00Z')
 
@@ -237,5 +239,27 @@ describe('component behaviour worth pinning', () => {
 
   it('a strong India lead with a live board reaches the queue band', () => {
     expect(scoreCompany(strongInput()).band).toBe('queue')
+  })
+})
+
+describe('S: the stored stale-posting risk (R3) and refusal reporting', () => {
+  const DAY = 86_400_000
+  const ago = (ms: number) => new Date(NOW.getTime() - ms)
+  it('uses whole elapsed days strictly beyond the unchanged 90-day constant', () => {
+    expect(storedOpenPostingsAllStale([ago(90 * DAY)], NOW)).toBe(false)
+    expect(storedOpenPostingsAllStale([ago(90 * DAY + 1)], NOW)).toBe(false)
+    expect(storedOpenPostingsAllStale([ago(91 * DAY - 1)], NOW)).toBe(false)
+    expect(storedOpenPostingsAllStale([ago(91 * DAY)], NOW)).toBe(true)
+  })
+  it('needs every open row old; no rows, a current row, or a future/invalid time is never all-stale', () => {
+    expect(storedOpenPostingsAllStale([], NOW)).toBe(false)
+    expect(storedOpenPostingsAllStale([ago(200 * DAY), ago(300 * DAY)], NOW)).toBe(true)
+    expect(storedOpenPostingsAllStale([ago(200 * DAY), ago(DAY)], NOW)).toBe(false)
+    expect(storedOpenPostingsAllStale([ago(200 * DAY), ago(-DAY)], NOW)).toBe(false)
+    expect(storedOpenPostingsAllStale([ago(200 * DAY), new Date(Number.NaN)], NOW)).toBe(false)
+  })
+  it('names each refusal for what it is, never blanket insufficient_evidence', () => {
+    expect(describeScoreRefusals({ insufficient_evidence: 2, history_protected: 1 })).toBe(
+      '2 refused as insufficient_evidence, 1 refused to protect existing lead history, 0 skipped on a concurrent change (retry)')
   })
 })

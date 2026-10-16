@@ -4,6 +4,12 @@ import { HostRateLimiter } from '../../src/core/policy/rate-limit.js'
 import { seedHostPolicies } from '../../src/core/policy/host-policy.js'
 import { closeTestDb, testDb, truncateAll } from '../helpers/db.js'
 import { mockAgent } from '../setup.js'
+import { currentPeriodMonth } from '../../src/core/policy/budget.js'
+
+// Finite synthetic headroom for the few requests in each case.
+const openGlobal = (when = new Date()) => testDb().researchBudget.create({
+  data: { companyId: null, periodMonth: currentPeriodMonth(when), creditsCap: 20, billedUsdCap: 0 },
+})
 
 const USER_AGENT = 'outreach-intelligence-research/0.1 (+https://example.invalid/about)'
 
@@ -72,6 +78,7 @@ describe('FetchPolicyGate — D4 preflight', () => {
 
   it('allows an employer host once it has a derived_company allow entry', async () => {
     const db = testDb()
+    await openGlobal()
     await db.hostPolicy.create({
       data: {
         host: 'startup.example',
@@ -173,6 +180,7 @@ describe('FetchPolicyGate — D4 preflight', () => {
       data: { host: 'slow.example', mode: 'allow', origin: 'derived_company' },
     })
     const g = gate(() => new Date(now), limiter)
+    await openGlobal(new Date(now))
 
     const first = await g.fetchText('https://slow.example/page1')
     expect(first.ok).toBe(true)
@@ -192,6 +200,7 @@ describe('FetchPolicyGate — D4 preflight', () => {
 
   it('stops when the research budget is exhausted', async () => {
     const db = testDb()
+    await openGlobal(new Date('2026-01-15T00:00:00Z'))
     mockAgent
       .get('https://budget.example')
       .intercept({ path: '/robots.txt', method: 'GET' })
@@ -210,6 +219,8 @@ describe('FetchPolicyGate — D4 preflight', () => {
     const g = gate(() => new Date('2026-01-15T00:00:00Z'))
     const result = await g.check('https://budget.example/careers', { companyId: company.id })
     expect(result).toEqual({ allowed: false, reason: 'budget_exhausted' })
+    expect(await db.auditLog.findFirstOrThrow({ where: { action: 'fetch.refused', reasonCode: 'budget_exhausted' } })).toMatchObject({ metadata: { scope: 'company' } })
+    expect(await db.researchBudget.findFirstOrThrow({ where: { companyId: null } })).toMatchObject({ creditsSpent: 0 })
   })
 
   it('stops when the global monthly cap is exhausted, even for an unbudgeted company', async () => {
@@ -231,6 +242,18 @@ describe('FetchPolicyGate — D4 preflight', () => {
       allowed: false,
       reason: 'budget_exhausted',
     })
+  })
+
+
+  it.each(['global', 'company', 'positive_credits'] as const)('fails closed for missing %s prerequisites', async (missing) => {
+    const db = testDb(), company = await db.company.create({ data: { canonicalDomain: 'prerequisites.example', displayName: 'Prerequisites' } })
+    await db.hostPolicy.create({ data: { host: 'prerequisites.example', mode: 'allow', origin: 'derived_company' } })
+    mockAgent.get('https://prerequisites.example').intercept({ path: '/robots.txt', method: 'GET' }).reply(200, 'User-agent: *\nAllow: /\n')
+    if (missing !== 'global') await openGlobal()
+    if (missing !== 'company') await db.researchBudget.create({ data: { companyId: company.id, periodMonth: currentPeriodMonth(new Date()), creditsCap: 5, billedUsdCap: 0 } })
+    expect(await gate().check('https://prerequisites.example/careers', { companyId: company.id, cost: missing === 'positive_credits' ? 0 : 1 })).toEqual({ allowed: false, reason: 'budget_exhausted' })
+    const refusal = await db.auditLog.findFirstOrThrow({ where: { action: 'fetch.refused', reasonCode: 'budget_exhausted' } })
+    expect(refusal.metadata).toMatchObject(missing === 'positive_credits' ? { detail: 'positive_research_credits_required' } : { scope: missing })
   })
 
   it('records every refusal with its reason code, so a vanished source is visible', async () => {

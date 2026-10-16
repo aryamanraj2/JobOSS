@@ -7,6 +7,7 @@ import { detectAtsForCompany } from '../../src/ingest/ats/detect.js'
 import { StubFetcher } from '../helpers/fixtures.js'
 import { closeTestDb, testDb, truncateAll } from '../helpers/db.js'
 import { mockAgent } from '../setup.js'
+import { currentPeriodMonth } from '../../src/core/policy/budget.js'
 
 const USER_AGENT = 'outreach-intelligence-research/0.1 (+https://example.invalid/about)'
 
@@ -110,8 +111,10 @@ describe('a redirect cannot escape the host policy', () => {
       new HostRateLimiter(0),
     )
 
+    await testDb().researchBudget.create({ data: { companyId: null, periodMonth: currentPeriodMonth(new Date()), creditsCap: 5, billedUsdCap: 0 } })
     const page = await fetchPage(gate, 'https://redirector.example/careers')
     expect(page).toMatchObject({ ok: false, reason: 'host_denied' })
+    expect(page.fetches).toBe(2)
 
     const refusals = await testDb().auditLog.findMany({
       where: { reasonCode: 'host_denied' },
@@ -138,7 +141,7 @@ describe('detection follows redirects', () => {
       'https://redirected.example/home': { body: '<p>Marketing copy</p>' },
       'https://redirected.example/careers': redirect('https://redirected.example/jobs-page'),
       'https://redirected.example/jobs-page': {
-        body: '<iframe src="https://job-boards.greenhouse.io/redirectedco"></iframe>',
+        body: '<iframe src="https://job-boards.greenhouse.io/embed/job_board?for=redirectedco"></iframe>',
       },
     })
 

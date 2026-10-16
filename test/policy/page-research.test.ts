@@ -11,6 +11,9 @@ import { mockAgent } from '../setup.js'
 
 const USER_AGENT = 'outreach-intelligence-research/0.1 (+https://example.invalid/about)'
 const NOW = new Date('2026-09-09T12:00:00Z')
+const openGlobal = () => testDb().researchBudget.create({
+  data: { companyId: null, periodMonth: currentPeriodMonth(NOW), creditsCap: 20, billedUsdCap: 0 },
+})
 
 beforeEach(async () => {
   await truncateAll()
@@ -61,6 +64,7 @@ const LONG_PARAGRAPH =
 describe('static fetch + Readability through the preflight (D4 tier 2)', () => {
   it('stores extracted text as Evidence citing the URL that answered', async () => {
     const company = await makeCompany('acme.example')
+    await openGlobal()
     serveRobots('https://acme.example')
     mockAgent
       .get('https://acme.example')
@@ -90,6 +94,7 @@ describe('static fetch + Readability through the preflight (D4 tier 2)', () => {
    */
   it('stores one Evidence row per matched track, each quoting where that track appears', async () => {
     const company = await makeCompany('deep.example')
+    await openGlobal()
     serveRobots('https://deep.example')
     const filler = '<p>' + 'We believe in building the future of commerce for everyone, everywhere. '.repeat(12) + '</p>'
     mockAgent
@@ -134,6 +139,7 @@ describe('static fetch + Readability through the preflight (D4 tier 2)', () => {
 
   it('follows a redirect through the gate and cites the final URL (F1 §4.8)', async () => {
     const company = await makeCompany('redir.example')
+    await openGlobal()
     serveRobots('https://redir.example')
     mockAgent
       .get('https://redir.example')
@@ -162,6 +168,7 @@ describe('static fetch + Readability through the preflight (D4 tier 2)', () => {
 
   it('reports a page with no readable content as unusable — the escalation trigger', async () => {
     const company = await makeCompany('spa.example')
+    await openGlobal()
     serveRobots('https://spa.example')
     mockAgent
       .get('https://spa.example')
@@ -176,6 +183,7 @@ describe('static fetch + Readability through the preflight (D4 tier 2)', () => {
 
   it('treats a matching contentHash as authority to skip work (F1 §4.10)', async () => {
     const company = await makeCompany('same.example')
+    await openGlobal()
     serveRobots('https://same.example')
     mockAgent
       .get('https://same.example')
@@ -200,6 +208,7 @@ describe('static fetch + Readability through the preflight (D4 tier 2)', () => {
       .reply(200, careersHtml(LONG_PARAGRAPH))
 
     expect(await testDb().researchBudget.count()).toBe(0)
+    await openGlobal()
     await researchCompanyPage(testDb(), gate(), company, 'https://budgeted.example/careers', { now: NOW })
 
     const budget = await testDb().researchBudget.findFirstOrThrow({ where: { companyId: company.id } })
@@ -207,24 +216,34 @@ describe('static fetch + Readability through the preflight (D4 tier 2)', () => {
     // H5: an India company gets the larger envelope, and the fetch is charged to it.
     expect(budget.creditsCap).toBe(45)
     expect(budget.creditsSpent).toBe(1)
+    expect(budget.billedUsdSpent.toNumber()).toBe(0)
+    expect(await testDb().researchBudget.findFirstOrThrow({ where: { companyId: null } })).toMatchObject({ creditsSpent: 1 })
   })
 
   it('no-ops with budget_exhausted when the cap is zero (Part G)', async () => {
     const company = await makeCompany('capped.example')
+    await openGlobal()
     serveRobots('https://capped.example')
     await testDb().researchBudget.create({
       data: { companyId: company.id, periodMonth: currentPeriodMonth(NOW), creditsCap: 0, billedUsdCap: 0 },
     })
 
+    let pageFetched = false
+    mockAgent.get('https://capped.example').intercept({ path: '/careers', method: 'GET' }).reply(() => { pageFetched = true; return { statusCode: 200, data: careersHtml(LONG_PARAGRAPH) } })
+
     const outcome = await researchCompanyPage(testDb(), gate(), company, 'https://capped.example/careers', { now: NOW })
     expect(outcome).toMatchObject({ kind: 'refused', reason: 'budget_exhausted' })
     expect(await testDb().evidence.count()).toBe(0)
+    expect(pageFetched).toBe(false)
+    expect(await testDb().auditLog.findFirstOrThrow({ where: { action: 'fetch.refused', reasonCode: 'budget_exhausted' } })).toMatchObject({ metadata: { scope: 'company' } })
+    expect(await testDb().researchBudget.findFirstOrThrow({ where: { companyId: null } })).toMatchObject({ creditsSpent: 0 })
   })
 })
 
 describe('prompt injection: page text is data, never instruction (Part G)', () => {
   it('blocks a page telling the agent to ignore instructions and export contacts, with zero writes', async () => {
     const company = await makeCompany('hostile.example')
+    await openGlobal()
     serveRobots('https://hostile.example')
     mockAgent
       .get('https://hostile.example')

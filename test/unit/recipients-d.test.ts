@@ -69,3 +69,63 @@ describe('RD-1 one person per identity record', () => {
     expect(observation(meta).identityVerified).toBe(true)
   })
 })
+
+describe('RD-1a/RD-1b structured identity residuals', () => {
+  const person = (worksFor: unknown) => `<script type="application/ld+json">${JSON.stringify({ '@type': 'Person', name: 'Jamie Rao', jobTitle: 'CTO', worksFor })}</script>`
+  it('RD-1a refuses an explicitly named different employer with no URL', () => {
+    expect(observation(person({ name: 'Otherco' })).identityVerified).toBe(false)
+  })
+  it('RD-1b refuses matching structured identity inside a blockquote', () => {
+    expect(observation(`<blockquote>${person({ url: 'https://acme.example' })}</blockquote>`).identityVerified).toBe(false)
+  })
+})
+
+describe('RD-1a supported employer representations', () => {
+  it.each([
+    ['canonical URL object', { url: 'https://acme.example' }, true],
+    ['subdomain URL object', { url: 'https://careers.acme.example' }, true],
+    ['URL string', 'https://acme.example', true],
+    ['named URL Organization', { '@type': 'Organization', name: 'Acme', url: 'https://acme.example' }, true],
+    ['different name', { name: 'Otherco' }, false], ['matching name only', { name: 'Acme' }, false],
+    ['name string', 'Otherco', false], ['matching name string', 'Acme', false],
+    ['conflicting named URL', { name: 'Otherco', url: 'https://acme.example' }, false],
+    ['wrong employer URL', { url: 'https://otherco.example' }, false],
+    ['foreign suffix', { url: 'https://acme.example.otherco.example' }, false],
+    ['reference only', { '@id': 'https://acme.example' }, false],
+    ['array', ['https://acme.example'], false], ['empty', {}, false], ['null', null, false], ['boolean', false, false],
+    ['malformed URL', { url: 'acme.example' }, false], ['numeric URL', { url: 42 }, false],
+    ['nested URL', { url: { url: 'https://acme.example' } }, false], ['unsupported type', { '@type': 'Thing', url: 'https://acme.example' }, false],
+    ['non-web URL', { url: 'file://acme.example/team' }, false],
+  ])('%s has an honest attribution result', (_name, worksFor, expected) => {
+    const html = `<html><body><script type="application/ld+json">${JSON.stringify({ '@type': 'Person', name: 'Jamie Rao', jobTitle: 'CTO', worksFor })}</script></body></html>`
+    expect(observePersonPage({ html, url: 'https://acme.example/team', companyDomain: 'acme.example', companyName: 'Acme', fullName: 'Jamie Rao', publicTitle: 'CTO' }).identityVerified).toBe(expected)
+  })
+})
+
+describe('RD-1b source context, not script placement alone', () => {
+  const meta = `<script type="application/ld+json">${JSON.stringify({ '@type': 'Person', name: 'Jamie Rao', jobTitle: 'CTO', worksFor: { url: 'https://acme.example' } })}</script>`
+  it.each(['q', 'pre', 'code', 'samp', 'template', 'div data-example', 'div data-quoted', 'div role="doc-example"', 'div class="example"'])('excludes a nested %s boundary', (tag) => {
+    const closing = tag.split(' ')[0]
+    expect(observation(`<${tag}><div><section>${meta}</section></div></${closing}>`).identityVerified).toBe(false)
+    expect(observation(`<${tag}><div><section><h2>Jamie Rao</h2><p>CTO</p></section></div></${closing}>`).identityVerified).toBe(false)
+  })
+  it('ignores quoted conflicts while preserving a real isolated graph record and its whole source', () => {
+    const graph = `<script type="application/ld+json">${JSON.stringify({ '@graph': [{ '@type': 'Person', name: 'Jamie Rao', jobTitle: 'CTO', worksFor: 'https://acme.example' }] })}</script>`
+    const html = `<html><head>${graph}</head><body><blockquote>${meta.replaceAll('CTO', 'Marketing analyst')}</blockquote></body></html>`
+    const seen = observePersonPage({ html, url: 'https://acme.example/team', companyDomain: 'acme.example', fullName: 'Jamie Rao', publicTitle: 'CTO' })
+    expect(seen.identityVerified).toBe(true); expect(seen.identityRecord).toEqual({ version: 3, html })
+  })
+  it('excludes semantic quotation/example JSON containers', () => {
+    for (const type of ['Quotation', 'SoftwareSourceCode', 'ExampleObject']) {
+      const script = `<script type="application/ld+json">${JSON.stringify({ '@type': type, '@graph': [{ '@type': 'Person', name: 'Jamie Rao', jobTitle: 'CTO', worksFor: { url: 'https://acme.example' } }] })}</script>`
+      expect(observation(script).identityVerified).toBe(false)
+    }
+  })
+  it('retains contradictory supported records instead of serializing away a conflicting sibling', () => {
+    expect(observation(meta + meta.replace('https://acme.example', 'https://otherco.example')).identityVerified).toBe(false)
+  })
+  it('refuses the full oversized source without truncating away context', () => {
+    const seen = observation(meta + ' '.repeat(32_001) + `<blockquote>${meta}</blockquote>`)
+    expect(seen.identityVerified).toBe(false); expect(seen.identityRecord).toBeUndefined(); expect(seen.limitation).toContain('32,000')
+  })
+})

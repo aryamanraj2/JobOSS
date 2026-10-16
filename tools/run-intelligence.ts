@@ -22,7 +22,7 @@ import { prisma, disconnectPrisma } from '../src/core/db/client.js'
 import { env } from '../src/core/config/config.js'
 import { FetchPolicyGate } from '../src/core/policy/fetch-policy-gate.js'
 import { COMPANY_SCORING_SELECT } from '../src/intel/scoring/collect.js'
-import { ensureScoreVersion, scoreCompanyAndPersist } from '../src/intel/scoring/run.js'
+import { describeScoreRefusals, scoreCompanyAndPersist, ScoreRefusedError, type ScoreRefusalReason } from '../src/intel/scoring/run.js'
 import { computeJobCountDelta } from '../src/intel/signals/job-count-delta.js'
 import { seedRoleTracks } from '../src/intel/taxonomy/seed-tracks.js'
 import { SignalGraphService } from '../src/intel/signal-graph.js'
@@ -30,7 +30,7 @@ import { researchCompanyPage } from '../src/intel/research/page-research.js'
 import { FirecrawlResearchProvider } from '../src/intel/research/firecrawl.js'
 import { queueResearchBrief } from '../src/intel/brief/queue-brief.js'
 import { rankOutreachCompanies } from '../src/intel/outreach/assess.js'
-import { ACTIVE_SCORE_VERSION } from '../src/intel/scoring/score-version.js'
+import { ACTIVE_SCORE_VERSION, assertSumsTo100 } from '../src/intel/scoring/score-version.js'
 
 function flag(name: string): string | undefined {
   const index = process.argv.indexOf(`--${name}`)
@@ -76,8 +76,10 @@ const config = env()
 
 const tracks = await seedRoleTracks(db)
 console.log(`Role tracks: ${tracks.created} created, ${tracks.updated} updated.`)
-await ensureScoreVersion(db)
-console.log(`Score version: ${ACTIVE_SCORE_VERSION.label} (weights sum to 100, thresholds ${JSON.stringify(ACTIVE_SCORE_VERSION.thresholds)}).`)
+// Observational: the version row is created and activated only inside a successful
+// guarded score, so a run where every company is refused leaves versions unchanged.
+assertSumsTo100(ACTIVE_SCORE_VERSION)
+console.log(`Requested score version: ${ACTIVE_SCORE_VERSION.label} (weights sum to 100, thresholds ${JSON.stringify(ACTIVE_SCORE_VERSION.thresholds)}); stored only by a successful score.`)
 
 // --- B2: job-count deltas from signals F1 already stored, no refetch ---------
 {
@@ -154,13 +156,16 @@ if (researchLimit > 0) {
 {
   const companies = await db.company.findMany({ select: COMPANY_SCORING_SELECT, orderBy: { createdAt: 'asc' } })
   const bands = { queue: 0, research: 0, reject: 0 }
-  let refused = 0
+  const refused: Partial<Record<ScoreRefusalReason, number>> = {}
   const scores: number[] = []
 
   for (const company of companies) {
-    const outcome = await scoreCompanyAndPersist(db, company)
+    const outcome = await scoreCompanyAndPersist(db, company).catch((error: unknown) => {
+      if (error instanceof ScoreRefusedError) return { scored: false as const, reason: error.outcome.reason }
+      throw error
+    })
     if (!outcome.scored) {
-      refused += 1
+      refused[outcome.reason] = (refused[outcome.reason] ?? 0) + 1
       continue
     }
     bands[outcome.breakdown.band] += 1
@@ -171,7 +176,7 @@ if (researchLimit > 0) {
   const median = scores.length === 0 ? 0 : scores[Math.floor(scores.length / 2)]!
   console.log(
     `\nScored ${scores.length} of ${companies.length} companies ` +
-      `(${refused} refused as insufficient_evidence).\n` +
+      `(${describeScoreRefusals(refused)}).\n` +
       `  queue (>=${ACTIVE_SCORE_VERSION.thresholds.queue}): ${bands.queue}\n` +
       `  research (${ACTIVE_SCORE_VERSION.thresholds.research}-${ACTIVE_SCORE_VERSION.thresholds.queue - 1}): ${bands.research}\n` +
       `  reject (<${ACTIVE_SCORE_VERSION.thresholds.research}): ${bands.reject}\n` +

@@ -20,7 +20,7 @@ jobs:
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: outreach_test
+          POSTGRES_DB: outreach_test_joboss_b
         ports: ['5432:5432']
         options: >-
           --health-cmd pg_isready
@@ -29,11 +29,13 @@ jobs:
           --health-retries 5
 
     env:
-      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/outreach_test
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/outreach_test_joboss_b
       # prisma.config.ts resolves `env('DATABASE_URL')` at config load, so every
-      # prisma invocation needs it present even though the test suite only reads
-      # TEST_DATABASE_URL. Locally it comes from .env, which CI does not have.
-      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/outreach_test
+      # prisma invocation needs it present. This distinct, config-only identity
+      # has no database service. Global setup captures it, verifies TEST_DATABASE_URL,
+      # and passes that validated B URL to migrate deploy; per-file setup uses B
+      # for runtime clients too. Generate only loads config and never connects.
+      DATABASE_URL: postgresql://config_only:config_only@127.0.0.1:65432/outreach_ci_config_only
 
     steps:
       - uses: actions/checkout@v4

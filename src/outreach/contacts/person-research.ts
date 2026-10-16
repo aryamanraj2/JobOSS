@@ -1,10 +1,11 @@
 import { parseHTML } from 'linkedom'
 import { extractReadable, textWithElementBoundaries } from '../../intel/research/readability.js'
 import { scanForInjection } from '../../intel/research/injection.js'
+import { contentHashOf } from '../../core/evidence/content-hash.js'
 import { isCompanyDomain } from './classify.js'
 
 export type PersonObservation = {
-  identityRecord?: { version: 2; html: string }
+  identityRecord?: { version: 3; html: string }
   identityVerified: boolean
   authorshipVerified: boolean
   excerpt: string | null
@@ -15,6 +16,37 @@ export type PersonObservation = {
 }
 
 const normalized = (value: string) => value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
+/** Full actual source, not a reconstructed safe wrapper or isolated script/card.
+ * Refuse an oversized identity capture rather than dropping ancestor/conflict context. */
+export const MAX_IDENTITY_SOURCE_CHARS = 32_000
+export const identityCaptureHash = (url: string, excerpt: string, contactId: string, html: string) =>
+  contentHashOf({ url, excerpt, contactId, identitySourceHash: contentHashOf(html) })
+const EXCLUDED_CONTEXT = 'blockquote,q,pre,code,samp,kbd,template,[data-example],[data-quoted],[role="doc-example"],[role="blockquote"],[class~="example"],[class~="code-example"],[itemtype$="/Quotation"]'
+function excludeExamples(document: ReturnType<typeof parseHTML>['document']) {
+  for (const element of document.querySelectorAll(EXCLUDED_CONTEXT)) element.remove()
+}
+function exampleData(row: Record<string, unknown>): boolean {
+  const types = Array.isArray(row['@type']) ? row['@type'] : [row['@type']]
+  return types.some((type) => ['Quotation', 'Quote', 'SoftwareSourceCode', 'Code', 'Example', 'ExampleObject'].includes(String(type)))
+}
+/** Supported worksFor: explicit HTTP(S) URL string, or Organization/url object.
+ * Names alone, references, arrays and unknown shapes require corroboration. A
+ * supplied name must also equal the current company name, never a guessed alias. */
+function employerMatches(value: unknown, domain: string, companyName?: string): boolean {
+  let address: unknown = value
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const row = value as Record<string, unknown>
+    if (Object.keys(row).some((key) => !['@type', 'name', 'url'].includes(key)) ||
+      (row['@type'] !== undefined && row['@type'] !== 'Organization') ||
+      (row['name'] !== undefined && (typeof row['name'] !== 'string' || !companyName || normalized(row['name']) !== normalized(companyName)))) return false
+    address = row['url']
+  }
+  if (typeof address !== 'string' || !address.trim()) return false
+  try {
+    const url = new URL(address)
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && isCompanyDomain(`source@${url.hostname}`, domain)
+  } catch { return false }
+}
 const windowAround = (text: string, name: string, radius: number) => {
   const at = text.toLowerCase().indexOf(name.toLowerCase())
   return text.slice(Math.max(0, at - radius), Math.min(text.length, at + name.length + radius)).trim()
@@ -23,11 +55,13 @@ const windowAround = (text: string, name: string, radius: number) => {
 /** Only explicit Person metadata tied to the exact published address supplies a name. */
 export function publishedIdentity(html: string, email: string): { fullName: string; title: string } | null {
   const { document } = parseHTML(html)
+  excludeExamples(document)
   let result: { fullName: string; title: string } | null = null
   const visit = (value: unknown): void => {
     if (Array.isArray(value)) { value.forEach(visit); return }
     if (!value || typeof value !== 'object') return
     const row = value as Record<string, unknown>
+    if (exampleData(row)) return
     if (row['@type'] === 'Person' && String(row['email'] ?? '').replace(/^mailto:/i, '').toLowerCase() === email.toLowerCase() && typeof row['name'] === 'string' && typeof row['jobTitle'] === 'string') {
       result = { fullName: row['name'], title: row['jobTitle'] }
     }
@@ -41,7 +75,7 @@ export function publishedIdentity(html: string, email: string): { fullName: stri
 
 /** A name alone is not identity: require an employer source plus its responsibility. */
 export function observePersonPage(input: {
-  html: string; url: string; companyDomain: string; fullName: string; publicTitle: string | null;
+  html: string; url: string; companyDomain: string; companyName?: string; fullName: string; publicTitle: string | null;
   /** External sources must have been linked by an already verified employer identity page. */
   employerLinked?: boolean
 }): PersonObservation {
@@ -56,21 +90,20 @@ export function observePersonPage(input: {
   const context = windowAround(text, input.fullName, 230)
   const title = input.publicTitle?.trim()
   const { document } = parseHTML(input.html)
+  excludeExamples(document)
   const structured: { record: Record<string, unknown>; title: string; sameEmployer: boolean }[] = []
   let publishedAt: Date | null = null
   const inspect = (value: unknown): void => {
     if (Array.isArray(value)) { value.forEach(inspect); return }
     if (!value || typeof value !== 'object') return
     const row = value as Record<string, unknown>
+    if (exampleData(row)) return
     if (typeof row['datePublished'] === 'string') {
       const date = new Date(row['datePublished'])
       if (Number.isFinite(date.getTime())) publishedAt = date
     }
     if (row['@type'] === 'Person' && normalized(String(row['name'] ?? '')) === name) {
-      const organization = row['worksFor'] as Record<string, unknown> | undefined
-      let sameEmployer = !organization?.['url']
-      try { if (organization?.['url']) sameEmployer = isCompanyDomain(`source@${new URL(String(organization['url'])).hostname}`, input.companyDomain) } catch { sameEmployer = false }
-      structured.push({ record: row, title: normalized(String(row['jobTitle'] ?? '')), sameEmployer })
+      structured.push({ record: row, title: normalized(String(row['jobTitle'] ?? '')), sameEmployer: employerMatches(row['worksFor'], input.companyDomain, input.companyName) })
     }
     for (const key of ['@graph', 'employee', 'founder', 'member']) if (row[key]) inspect(row[key])
   }
@@ -103,8 +136,8 @@ export function observePersonPage(input: {
       return words.startsWith(prefix) && /^(?:builds?|develops?|implements?|maintains?)\b/.test(words.slice(prefix.length))
     })].join(' ').trim() : null
   const metadata = structured.find((r) => r.sameEmployer && r.title === expectedTitle)
-  const recordHtml = metadata ? `<script type="application/ld+json">${JSON.stringify(metadata.record)}</script>` : card?.toString()
-  const identityVerified = Boolean(employer && expectedTitle && !conflict && recordHtml && recordHtml.length <= 4000 &&
+  const oversized = input.html.length > MAX_IDENTITY_SOURCE_CHARS
+  const identityVerified = Boolean(employer && expectedTitle && !conflict && (metadata || card) && !oversized &&
     !/\b(former|previously|ex-employee|guest|quoted|according to)\b/i.test(metadata ? JSON.stringify(metadata.record) : card?.textContent ?? ''))
   const links: string[] = []
   for (const link of document.querySelectorAll('a[href]')) {
@@ -123,6 +156,7 @@ export function observePersonPage(input: {
         if (Array.isArray(value)) { value.forEach(visit); return }
         if (!value || typeof value !== 'object') return
         const row = value as Record<string, unknown>
+        if (exampleData(row)) return
         if (row['author'] && ['Article', 'BlogPosting', 'TechArticle', 'ScholarlyArticle'].includes(String(row['@type']))) {
           const authors = Array.isArray(row['author']) ? row['author'] : [row['author']]
           author ||= authors.some((a) => {
@@ -130,13 +164,7 @@ export function observePersonPage(input: {
             if (!a || typeof a !== 'object') return false
             const person = a as Record<string, unknown>
             if (normalized(String(person['name'] ?? '')) !== name) return false
-            const organization = person['worksFor'] as Record<string, unknown> | string | undefined
-            if (organization) {
-              try {
-                const employerUrl = typeof organization === 'object' ? organization['url'] : organization
-                if (!employerUrl || !isCompanyDomain(`source@${new URL(String(employerUrl)).hostname}`, input.companyDomain)) { conflictingEmployer = true; return false }
-              } catch { conflictingEmployer = true; return false }
-            }
+            if (person['worksFor'] !== undefined && !employerMatches(person['worksFor'], input.companyDomain, input.companyName)) { conflictingEmployer = true; return false }
             return true
           })
         }
@@ -156,11 +184,11 @@ export function observePersonPage(input: {
   return {
     identityVerified,
     authorshipVerified,
-    ...(identityVerified ? { identityRecord: { version: 2 as const, html: recordHtml! } } : {}),
+    ...(identityVerified ? { identityRecord: { version: 3 as const, html: input.html } } : {}),
     excerpt: identityVerified ? (metadata ? `${String(metadata.record['name'])} — ${String(metadata.record['jobTitle'])}.` : cardText!).slice(0, 500) : authoredExcerpt ?? context.slice(0, 500),
     workExcerpt: authoredExcerpt,
     links: [...new Set(links)],
     publishedAt,
-    limitation: identityVerified || authorshipVerified ? null : 'Name appeared, but employer responsibility and authorship were not corroborated.',
+    limitation: oversized ? 'Identity source exceeds the 32,000-character proof bound; deliberate bounded recapture is required, with no source truncation.' : identityVerified || authorshipVerified ? null : 'Name appeared, but unquoted current employer responsibility and authorship were not corroborated.',
   }
 }

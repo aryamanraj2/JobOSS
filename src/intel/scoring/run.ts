@@ -2,7 +2,9 @@ import type { Prisma } from '../../../generated/prisma/client.js'
 import type { Db } from '../../core/audit/audit-log.js'
 import { writeAudit } from '../../core/audit/audit-log.js'
 import type { ReasonCodeValue } from '../../core/reason-codes/registry.js'
-import { collectScoreInput, type CompanyForScoring } from './collect.js'
+import { isStandaloneDatabaseClient } from '../../core/joboss/database-scope.js'
+import { lockDMutation } from '../../outreach/review/locks.js'
+import { COMPANY_SCORING_SELECT, collectScoreInput, type CompanyForScoring } from './collect.js'
 import { scoreCompany, type ScoreBreakdown } from './score.js'
 import { ACTIVE_SCORE_VERSION, assertSumsTo100, type ScoreVersionSpec } from './score-version.js'
 import { roleTrackIdsByKey } from '../taxonomy/seed-tracks.js'
@@ -70,10 +72,58 @@ export type ScoreCompanyOutcome =
   | { scored: true; leadId: string; breakdown: ScoreBreakdown }
   | { scored: false; reason: Extract<ReasonCodeValue, 'insufficient_evidence'>; detail: string }
 
+export type HistoryBlocker = { leadId: string | null; blocker: string }
+
+/**
+ * Refusals that are neither a score nor missing evidence. Neither is a ReasonCode,
+ * so they are not folded into `ScoreCompanyOutcome.reason` (whose callers read it as
+ * one); `scoreCompanyAndPersist` throws them as `ScoreRefusedError` instead.
+ *
+ *   - `history_protected`: current-cycle history (another or no score version, an
+ *     attached draft or packet, a bound contact, operator status/history) or a
+ *     company operator stop this call must not rewrite. Nothing score-owned was
+ *     written; one append-only `score.history_protected` audit row records the blockers.
+ *   - `concurrent_change`: a competing writer held a row this score needs, or an
+ *     eligible posting changed mid-score. Nothing was written; retry later.
+ */
+export type ScoreBlockedOutcome =
+  | { reason: 'history_protected'; detail: string; leadIds: string[]; blockers: HistoryBlocker[] }
+  | { reason: 'concurrent_change'; detail: string }
+
+export class ScoreRefusedError extends Error {
+  constructor(readonly outcome: ScoreBlockedOutcome) {
+    super(`score refused (${outcome.reason}): ${outcome.detail}`)
+    this.name = 'ScoreRefusedError'
+  }
+}
+
+export type ScoreRefusalReason = Extract<ScoreCompanyOutcome, { scored: false }>['reason'] | ScoreBlockedOutcome['reason']
+
+/** One line for CLI reporting; each refusal is named for what it is. */
+export function describeScoreRefusals(counts: Partial<Record<ScoreRefusalReason, number>>): string {
+  return `${counts.insufficient_evidence ?? 0} refused as insufficient_evidence, ` +
+    `${counts.history_protected ?? 0} refused to protect existing lead history, ` +
+    `${counts.concurrent_change ?? 0} skipped on a concurrent change (retry)`
+}
+
 export type ScoreCompanyOptions = {
   now?: Date
   spec?: ScoreVersionSpec
   campaignCycle?: string
+}
+
+/** The status the scorer itself writes for a stored band; anything else is not ours to overwrite. */
+const SCORER_STATUS: Record<string, readonly [string, string | null]> = {
+  queue: ['qualified', null],
+  research: ['qualifying', null],
+  reject: ['rejected', 'low_relevance'],
+}
+
+function lockUnavailable(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const row = error as Record<string, unknown>
+  return row['code'] === '55P03' || row['sqlState'] === '55P03' ||
+    ['meta', 'cause', 'driverAdapterError', 'originalError'].some((key) => lockUnavailable(row[key]))
 }
 
 /**
@@ -84,6 +134,31 @@ export type ScoreCompanyOptions = {
  * what this company builds, and `handover.md` §5.3 forbids applying a label anyway.
  * That is `insufficient_evidence` — D1 makes it re-entrant, a budget decision
  * rather than a verdict, so the company stays eligible for more research.
+ *
+ * ## Transaction boundary
+ *
+ * Guard checks, collection and every write happen in one READ COMMITTED
+ * transaction: the client's own, or a savepoint inside a caller's transaction, which
+ * is rolled back on any error so a caller that catches and commits keeps no partial
+ * S mutation. A caller transaction at another isolation level is refused with an
+ * error, because its snapshot cannot be refreshed by the locks below.
+ *
+ * Lock order matches D: the D mutation advisory lock first (the only wait, taken
+ * while holding nothing else when this call owns the transaction; a caller must
+ * enter it before its own conflicting locks), then company → current-cycle drafts →
+ * current-cycle leads → open opportunities → SHARE on opportunity, evidence,
+ * company_signal and audit_log, all NOWAIT. A busy row, or any uncommitted write to
+ * those tables, returns `concurrent_change` rather than waiting on a partial lock
+ * set, so no deadlock with B review/reservation, D preparation or ingestion. A writer
+ * that arrives after these locks waits for this commit and then sees the new state.
+ *
+ * Availability: while a score transaction is open, every writer of those four
+ * tables waits, for any company (they are table locks). An autovacuum or analyze
+ * of one of them also makes this call refuse busy; retry.
+ *
+ * Protected history and concurrent change throw `ScoreRefusedError` after this
+ * call's own transaction commits its refusal audit (inside a caller's transaction,
+ * after the savepoint is released; the caller decides whether that audit commits).
  */
 export async function scoreCompanyAndPersist(
   db: Db,
@@ -94,6 +169,101 @@ export async function scoreCompanyAndPersist(
   const spec = opts.spec ?? ACTIVE_SCORE_VERSION
   const campaignCycle = opts.campaignCycle ?? currentCampaignCycle(now)
 
+  const work = async (tx: Db): Promise<ScoreCompanyOutcome | ScoreRefusedError> => {
+    const [level] = await tx.$queryRaw<{ transaction_isolation: string }[]>`SHOW transaction_isolation`
+    if (level?.transaction_isolation !== 'read committed') {
+      throw new Error(`scoreCompanyAndPersist requires READ COMMITTED; the caller's transaction is ${level?.transaction_isolation ?? 'unknown'}`)
+    }
+    await lockDMutation(tx)
+    await tx.$executeRaw`SAVEPOINT joboss_s_score`
+    try {
+      const outcome = await scoreLocked(tx, company.id, spec, campaignCycle, now)
+      await tx.$executeRaw`RELEASE SAVEPOINT joboss_s_score`
+      return outcome
+    } catch (error) {
+      await tx.$executeRaw`ROLLBACK TO SAVEPOINT joboss_s_score`
+      await tx.$executeRaw`RELEASE SAVEPOINT joboss_s_score`
+      if (lockUnavailable(error)) {
+        return new ScoreRefusedError({ reason: 'concurrent_change', detail: 'a competing writer holds a company, lead, draft or posting row, or has uncommitted posting, evidence, signal or audit writes; nothing was written' })
+      }
+      throw error
+    }
+  }
+  const result = isStandaloneDatabaseClient(db)
+    ? await db.$transaction(work, { isolationLevel: 'ReadCommitted', timeout: 30_000 })
+    : await work(db)
+  if (result instanceof ScoreRefusedError) throw result
+  return result
+}
+
+async function scoreLocked(
+  db: Db,
+  companyId: string,
+  spec: ScoreVersionSpec,
+  campaignCycle: string,
+  now: Date,
+): Promise<ScoreCompanyOutcome | ScoreRefusedError> {
+  const locked = await db.$queryRaw<{ id: string }[]>`SELECT id FROM company WHERE id = ${companyId} FOR NO KEY UPDATE NOWAIT`
+  if (!locked.length) throw new Error(`Unknown company ${companyId}`)
+  await db.$queryRaw`SELECT d.id FROM draft d JOIN lead l ON l.id = d.lead_id
+    WHERE l.company_id = ${companyId} AND l.campaign_cycle = ${campaignCycle} ORDER BY d.id FOR UPDATE OF d NOWAIT`
+  // FOR UPDATE (not NO KEY): also conflicts with an in-flight draft/packet insert under the lead.
+  await db.$queryRaw`SELECT id FROM lead WHERE company_id = ${companyId} AND campaign_cycle = ${campaignCycle} ORDER BY id FOR UPDATE NOWAIT`
+  const lockedOpen = new Set((await db.$queryRaw<{ id: string }[]>`SELECT id FROM opportunity
+    WHERE company_id = ${companyId} AND status = 'open' ORDER BY id FOR UPDATE NOWAIT`).map((r) => r.id))
+  // Support boundary (RS-01). Row locks cannot see a row that does not exist yet, and
+  // a newer page observation is an INSERT that supersedes Evidence this call reads.
+  // SHARE conflicts with every insert/update/delete on the tables the collector and
+  // the history guard read, until this transaction (or the caller's) ends.
+  await db.$executeRaw`LOCK TABLE opportunity, evidence, company_signal, audit_log IN SHARE MODE NOWAIT`
+
+  // Fresh reads after the locks: the caller's company object is not trusted as current.
+  const company = await db.company.findUniqueOrThrow({ where: { id: companyId }, select: { ...COMPANY_SCORING_SELECT, status: true } })
+  const leads = await db.lead.findMany({
+    where: { companyId, campaignCycle },
+    orderBy: { id: 'asc' },
+    select: { id: true, status: true, statusReason: true, scoreVersionId: true, scoreComponents: true, contactId: true,
+      _count: { select: { drafts: true, applicationPackets: true } } },
+  })
+  // Read-only: creating or activating the version is itself a score-owned mutation.
+  const version = await db.scoreVersion.findUnique({ where: { label: spec.label }, select: { id: true } })
+
+  const blockers: HistoryBlocker[] = []
+  if (company.status === 'excluded') blockers.push({ leadId: null, blocker: 'company_excluded' })
+  if (leads.length > 1) blockers.push({ leadId: null, blocker: 'multiple_current_leads' })
+  for (const lead of leads) {
+    const block = (blocker: string) => blockers.push({ leadId: lead.id, blocker })
+    if (lead.scoreVersionId === null) block('unscored_association')
+    else if (lead.scoreVersionId !== version?.id) block('different_score_version')
+    if (lead._count.drafts > 0) block('draft_attached')
+    if (lead._count.applicationPackets > 0) block('application_packet_attached')
+    if (lead.contactId !== null) block('contact_bound')
+    const band = (lead.scoreComponents as { band?: unknown } | null)?.band
+    const expected = typeof band === 'string' ? SCORER_STATUS[band] : undefined
+    if (!expected || lead.status !== expected[0] || lead.statusReason !== expected[1]) block('operator_status')
+  }
+  // Anything but the scorer writing about the lead is history we cannot classify as automatic.
+  const touched = leads.length === 0 ? [] : await db.auditLog.findMany({
+    where: { subjectType: 'Lead', subjectId: { in: leads.map((l) => l.id) }, NOT: { actorId: 'scorer' } },
+    distinct: ['subjectId'],
+    select: { subjectId: true },
+  })
+  for (const row of touched) blockers.push({ leadId: row.subjectId, blocker: 'non_scorer_history' })
+
+  if (blockers.length > 0) {
+    const leadIds = leads.map((l) => l.id)
+    const detail = `existing ${campaignCycle} history is preserved: ${blockers.map((b) => b.blocker).join(', ')}`
+    await writeAudit(db, {
+      actorType: 'system',
+      actorId: 'scorer',
+      action: 'score.history_protected',
+      subjectType: 'Company',
+      subjectId: companyId,
+      metadata: { campaignCycle, requestedScoreVersion: spec.label, leadIds, blockers, scoreOwnedMutations: 0 },
+    })
+    return new ScoreRefusedError({ reason: 'history_protected', detail, leadIds, blockers })
+  }
+
   const collected = await collectScoreInput(db, company, now)
 
   if (collected.input.match.matches.length === 0) {
@@ -102,7 +272,7 @@ export async function scoreCompanyAndPersist(
         ? 'no source text held for this company'
         : `no track cleared the confidence floor across ${collected.fields.length} source field(s)`
     await db.company.update({
-      where: { id: company.id },
+      where: { id: companyId },
       data: { status: 'insufficient_evidence', statusReason: 'insufficient_evidence', lastRefreshedAt: now },
     })
     await writeAudit(db, {
@@ -110,19 +280,26 @@ export async function scoreCompanyAndPersist(
       actorId: 'scorer',
       action: 'score.refused',
       subjectType: 'Company',
-      subjectId: company.id,
+      subjectId: companyId,
       reasonCode: 'insufficient_evidence',
       metadata: { detail, fields: collected.fields.length },
     })
     return { scored: false, reason: 'insufficient_evidence', detail }
   }
 
+  // Every eligible posting was open when locked above, unless it reopened since: a
+  // row this call does not hold could change before commit, so start again instead.
+  // Nothing has been written yet on this path.
+  if (collected.eligibleOpportunityIds.some((id) => !lockedOpen.has(id))) {
+    return new ScoreRefusedError({ reason: 'concurrent_change', detail: 'an eligible posting changed during scoring; nothing was written, retry' })
+  }
+
   const breakdown = scoreCompany(collected.input, spec)
   const scoreVersionId = await ensureScoreVersion(db, spec)
 
   // F3 selects a track-tailored resume per posting, so the track belongs on the
-  // Opportunity rather than being re-derived from the company later. Only rows
-  // whose own title supports a track are labelled: a posting inherits nothing.
+  // Opportunity rather than being re-derived from the company later. Only eligible
+  // rows whose own text supports a track are labelled: a posting inherits nothing.
   const trackIds = await roleTrackIdsByKey(db)
   for (const assignment of collected.opportunityTracks) {
     const roleTrackId = assignment.track === null ? null : (trackIds.get(assignment.track) ?? null)
@@ -132,15 +309,12 @@ export async function scoreCompanyAndPersist(
     })
   }
 
-  // A3: a lead with no Opportunity is speculative by definition, and the old state
-  // machine could not represent it. Posted-role wins whenever an open posting
-  // exists — Part C routes the two kinds to different terminal actions.
-  const openOpportunity = await db.opportunity.findFirst({
-    where: { companyId: company.id, status: 'open' },
-    orderBy: { lastSeenAt: 'desc' },
-    select: { id: true },
-  })
-  const leadKind = openOpportunity ? ('posted_role' as const) : ('speculative' as const)
+  // A3: a lead with no Opportunity is speculative by definition. Posted-role only for
+  // a posting the collector admitted (RC-4): its first eligible ID, newest lastSeenAt
+  // then smaller ID. A rejected open row never attaches, and zero eligible rows is
+  // speculative even when rejected open rows remain.
+  const opportunityId = collected.eligibleOpportunityIds[0] ?? null
+  const leadKind = opportunityId ? ('posted_role' as const) : ('speculative' as const)
 
   const status =
     breakdown.band === 'queue' ? ('qualified' as const)
@@ -162,7 +336,7 @@ export async function scoreCompanyAndPersist(
   } as unknown as Prisma.InputJsonValue
 
   const data = {
-    opportunityId: openOpportunity?.id ?? null,
+    opportunityId,
     leadKind,
     status,
     statusReason: breakdown.band === 'reject' ? ('low_relevance' as const) : null,
@@ -176,18 +350,16 @@ export async function scoreCompanyAndPersist(
   }
 
   // One lead per company per cycle. There is no unique index for this (D3's
-  // indexes are on send_attempt, where the invariant actually matters), so the
-  // rescore path looks first rather than creating a second row each run.
-  const existing = await db.lead.findFirst({
-    where: { companyId: company.id, campaignCycle },
-    select: { id: true },
-  })
+  // indexes are on send_attempt, where the invariant actually matters); the D lock
+  // above serializes the look-then-write, and the guard has already refused any
+  // current lead this call may not rewrite.
+  const existing = leads[0]
   const lead = existing
     ? await db.lead.update({ where: { id: existing.id }, data, select: { id: true } })
-    : await db.lead.create({ data: { companyId: company.id, campaignCycle, ...data }, select: { id: true } })
+    : await db.lead.create({ data: { companyId, campaignCycle, ...data }, select: { id: true } })
 
   await db.company.update({
-    where: { id: company.id },
+    where: { id: companyId },
     data: { status: 'researched', statusReason: null, lastRefreshedAt: now },
   })
 
@@ -200,7 +372,7 @@ export async function scoreCompanyAndPersist(
     // The band's own code, so the refusal counters read the way Part G intends.
     reasonCode: breakdown.band === 'reject' ? 'low_relevance' : undefined,
     metadata: {
-      companyId: company.id,
+      companyId,
       scoreVersion: breakdown.scoreVersion,
       total: breakdown.total,
       subtotal: breakdown.subtotal,
@@ -209,6 +381,10 @@ export async function scoreCompanyAndPersist(
       primaryTrack: breakdown.primaryTrack,
       reasonCodes: breakdown.reasonCodes,
       countryMapVersion: breakdown.countryMapVersion,
+      opportunityId,
+      eligibleOpportunityIds: collected.eligibleOpportunityIds,
+      // A negative observation about stored rows, not hiring support or an attachment.
+      storedPostingRisk: collected.storedPostingRisk,
     },
   })
 
@@ -223,7 +399,7 @@ export async function scoreCompanyAndPersist(
       subjectType: 'Lead',
       subjectId: lead.id,
       reasonCode: code,
-      metadata: { companyId: company.id, scoreVersion: breakdown.scoreVersion },
+      metadata: { companyId, scoreVersion: breakdown.scoreVersion },
     })
   }
 

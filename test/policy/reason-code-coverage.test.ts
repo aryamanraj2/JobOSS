@@ -14,7 +14,6 @@ import { scoreCompanyAndPersist } from '../../src/intel/scoring/run.js'
 import { COMPANY_SCORING_SELECT } from '../../src/intel/scoring/collect.js'
 import { RESEARCH_ACTIONS } from '../../src/intel/research/actions.js'
 import { seedApprovedClaims } from '../../src/apply/claims/seed-claims.js'
-import { curateCompanyContacts } from '../../src/outreach/contacts/curate.js'
 import { composeDrafts } from '../../src/outreach/draft/compose.js'
 import { generateApplicationPackets } from '../../src/apply/packet/generate.js'
 import { acceptPacket, markPacketSubmitted } from '../../src/apply/packet/lifecycle.js'
@@ -24,6 +23,14 @@ import { makeSendWorld, sendGateOptions, OWNED_INBOX, SEND_TEST_SALT } from '../
 import { evaluateSendGate } from '../../src/outreach/send/gate.js'
 import { ingestInboundMessage, pauseLead, type InboundForIngest } from '../../src/outreach/send/ingest-outcomes.js'
 import { emailHmac } from '../../src/core/crypto/secret-store.js'
+import { currentPeriodMonth } from '../../src/core/policy/budget.js'
+import { proveBoard } from '../fixtures/discovery-support.js'
+import { describeReasonCode } from '../../src/core/reason-codes/registry.js'
+import { writeAudit } from '../../src/core/audit/audit-log.js'
+
+const openGlobal = (when = new Date()) => testDb().researchBudget.create({
+  data: { companyId: null, periodMonth: currentPeriodMonth(when), creditsCap: 20, billedUsdCap: 0 },
+})
 
 const USER_AGENT = 'outreach-intelligence-research/0.1 (+https://example.invalid/about)'
 
@@ -85,6 +92,7 @@ const scenarios: Record<string, () => Promise<ReasonCodeValue>> = {
     await allowHost('rated.example')
     serveRobots('https://rated.example', 'User-agent: *\nAllow: /\n')
     mockAgent.get('https://rated.example').intercept({ path: /^\/p/, method: 'GET' }).reply(200, 'x').persist()
+    await openGlobal(new Date(now))
     const g = gate(() => new Date(now), limiter)
     await g.fetchText('https://rated.example/p1')
     now += 100
@@ -168,6 +176,7 @@ const scenarios: Record<string, () => Promise<ReasonCodeValue>> = {
         tags: [],
       },
     })
+    await proveBoard(company.id, new Date(), 'gone')
     const url = 'https://boards-api.greenhouse.io/v1/boards/gone/jobs?content=true'
     const fetcher = new StubFetcher({ [url]: { statusCode: 503, body: 'upstream error' } })
     const result = await ingestPostings(testDb(), new GreenhouseProvider(fetcher), {
@@ -196,6 +205,7 @@ const scenarios: Record<string, () => Promise<ReasonCodeValue>> = {
     const body = readFixture('greenhouse-jobs')
     const board = { id: company.id, atsBoardToken: token }
 
+    await proveBoard(company.id, new Date(), token)
     await ingestPostings(testDb(), new GreenhouseProvider(new StubFetcher({ [url]: { body } })), board)
     await ingestPostings(testDb(), new GreenhouseProvider(new StubFetcher({ [url]: { body } })), board)
 
@@ -332,6 +342,7 @@ const scenarios: Record<string, () => Promise<ReasonCodeValue>> = {
       },
       select: { id: true, canonicalDomain: true, countries: true },
     })
+    await openGlobal()
     await allowHost('hostile.example')
     serveRobots('https://hostile.example', 'User-agent: *\nAllow: /\n')
     mockAgent
@@ -465,56 +476,6 @@ const scenarios: Record<string, () => Promise<ReasonCodeValue>> = {
   },
 
   // --- F4 contacts and the drafting sandbox -------------------------------
-
-  /**
-   * A careers page that publishes only executives, read by the REAL curator through
-   * the REAL gate.
-   *
-   * `handover.md` §1.1 is the first non-negotiable in the document and the boundary
-   * of the operator's whole F4 broadening: named employees at any level became
-   * permissible, founders and C-suite explicitly did not. This is the scenario that
-   * proves the filter runs on a live path rather than only in unit tests.
-   *
-   * Note what the assertion also checks: the audit row does NOT contain the address.
-   * §1.1 says never target them, and keeping the address where a later query could
-   * recover it would be keeping exactly what the rule says not to keep.
-   */
-  executive_only_contact: async () => {
-    const db = testDb()
-    const company = await db.company.create({
-      data: {
-        canonicalDomain: 'execonly.example',
-        displayName: 'Exec Only',
-        countries: ['India'],
-        locations: [],
-        tags: [],
-      },
-      select: { id: true, canonicalDomain: true, displayName: true, countries: true },
-    })
-    await allowHost('execonly.example')
-    serveRobots('https://execonly.example', 'User-agent: *\nAllow: /\n')
-    const pool = mockAgent.get('https://execonly.example')
-    const html =
-      '<!doctype html><html><head><title>Contact</title></head><body><article>' +
-      '<p>Our leadership team is happy to hear from people. Chief Technology Officer — ' +
-      'cto@execonly.example. Founder — founders@execonly.example.</p></article></body></html>'
-    for (const p of ['/careers', '/contact', '/jobs', '/about', '/']) {
-      pool.intercept({ path: p, method: 'GET' }).reply(200, html).persist()
-    }
-
-    const outcome = await curateCompanyContacts(db, gate(), company)
-    if (outcome.contacts.length !== 0) return 'sending_disabled' as ReasonCodeValue
-    if ((await db.contact.count()) !== 0) return 'sending_disabled' as ReasonCodeValue
-
-    const audit = await db.auditLog.findFirst({
-      where: { action: 'contact.refused', reasonCode: 'executive_only_contact' },
-      select: { reasonCode: true, metadata: true },
-    })
-    if (JSON.stringify(audit?.metadata).includes('cto@execonly.example')) {
-      return 'sending_disabled' as ReasonCodeValue
-    }
-    return (audit?.reasonCode as ReasonCodeValue | undefined) ?? ('sending_disabled' as ReasonCodeValue)
-  },
 
   /**
    * A qualified lead with no verified contact, driven through the REAL composer.
@@ -809,7 +770,7 @@ async function ingestOutcome(
   const message: InboundForIngest = {
     providerMessageId: 'inbound-1',
     threadId: 'thread-outcome',
-    from: over.from ?? 'someone@acme.example',
+    from: over.from ?? OWNED_INBOX,
     subject,
     bodyText,
     inReplyTo: messageId,
@@ -935,6 +896,17 @@ describe('every F5-owned reason code is reachable through its real code path', (
 
   it('covers exactly the codes this build stage claims to raise', () => {
     expect(Object.keys(scenarios).sort()).toEqual([...reachableReasonCodes('F5')].sort())
+  })
+})
+
+describe('historical retired reason compatibility', () => {
+  it('reads a historical executive-only audit without claiming a current emitter', async () => {
+    // Synthetic history fixture, deliberately outside active reachability scenarios.
+    await writeAudit(testDb(), { actorType: 'system', actorId: 'historical-compatibility-fixture', action: 'fixture.historical_reason', subjectType: 'Company', reasonCode: 'executive_only_contact', metadata: { historical: true } })
+    const historical = await testDb().auditLog.findFirstOrThrow({ where: { action: 'fixture.historical_reason' } })
+    expect(historical.reasonCode).toBe('executive_only_contact')
+    expect(describeReasonCode(historical.reasonCode!)).toMatch(/Historical-only/)
+    expect(reachableReasonCodes('F5')).not.toContain(historical.reasonCode)
   })
 })
 

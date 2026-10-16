@@ -135,25 +135,8 @@ desktop.ini
 
 # ---------------------------------------------------------------------------
 # Markdown files
-#
-# The blanket `*.md` rule is here to keep assistant scratch notes out of the repo.
-# As written through F0-F2 it also excluded `docs/` — which is every document this
-# project depends on to be reconstructible:
-#
-#   docs/architecture-plan.md    the implementation contract, kept VERBATIM so it
-#                                stays auditable. Every milestone is told never to
-#                                edit it; none of them could have committed it.
-#   docs/F*-HANDOVER.md          the whole deviation chain, 39 recorded decisions
-#                                with their reasoning.
-#   docs/handoff-llm-gateway.md  the LLM design spec.
-#
-# `handover.md` survived only because it was tracked before the rule existed. The
-# rest were one `rm -rf` from being unrecoverable. Found in F3.
 # ---------------------------------------------------------------------------
-*.md
-!README.md
-!handover.md
-!docs/**/*.md
+*.[mM][dD]
 
 # ---------------------------------------------------------------------------
 # Provider enrichment scratch (F5c §5 step 3a)

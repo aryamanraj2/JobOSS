@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { closeTestDb, testDb, truncateAll } from '../helpers/db.js'
 import { seedHostPolicies } from '../../src/core/policy/host-policy.js'
 import { FetchPolicyGate } from '../../src/core/policy/fetch-policy-gate.js'
@@ -14,9 +14,16 @@ import { SEED_ALLOW_HOSTS } from '../../src/core/policy/host-lists.js'
 import { mockAgent } from '../setup.js'
 
 const NOW = new Date('2026-09-09T12:00:00Z')
+const openGlobal = (vendorCreditsCap = 4) => testDb().researchBudget.create({
+  data: { companyId: null, periodMonth: currentPeriodMonth(NOW), creditsCap: 20, vendorCreditsCap, billedUsdCap: 0 },
+})
+const openCompany = (companyId: string) => testDb().researchBudget.create({
+  data: { companyId, periodMonth: currentPeriodMonth(NOW), creditsCap: 20, billedUsdCap: 0 },
+})
 const USER_AGENT = 'outreach-intelligence-research/0.1 (+https://example.invalid/about)'
 
 beforeEach(async () => {
+  vi.restoreAllMocks()
   await truncateAll()
   await seedHostPolicies(testDb())
 })
@@ -82,6 +89,7 @@ describe('Firecrawl escalation is disabled without a key (H9)', () => {
 describe('Firecrawl escalation with a key (fixture transport)', () => {
   it('stores extracted markdown as Evidence tagged firecrawl', async () => {
     const company = await makeCompany()
+    await openGlobal(); await openCompany(company.id)
     serveFirecrawlRobots()
     replyScrape(200, {
       success: true,
@@ -104,6 +112,7 @@ describe('Firecrawl escalation with a key (fixture transport)', () => {
 
   it('charges the research budget in the same unit as a static fetch', async () => {
     const company = await makeCompany()
+    await openGlobal()
     serveFirecrawlRobots()
     replyScrape(200, { success: true, data: { markdown: MARKDOWN, metadata: {} } })
     await testDb().researchBudget.create({
@@ -115,20 +124,27 @@ describe('Firecrawl escalation with a key (fixture transport)', () => {
     )
     const budget = await testDb().researchBudget.findFirstOrThrow({ where: { companyId: company.id } })
     expect(budget.creditsSpent).toBe(FIRECRAWL_PLAIN_SCRAPE_CREDITS)
+    expect(budget.vendorCreditsSpent).toBe(FIRECRAWL_PLAIN_SCRAPE_CREDITS)
+    expect(budget.billedUsdSpent.toNumber()).toBe(0)
+    expect(await testDb().researchBudget.findFirstOrThrow({ where: { companyId: null } })).toMatchObject({ creditsSpent: FIRECRAWL_PLAIN_SCRAPE_CREDITS, vendorCreditsSpent: FIRECRAWL_PLAIN_SCRAPE_CREDITS })
   })
 
   it('refuses with budget_exhausted at a zero cap, before the vendor is called (Part G)', async () => {
     const company = await makeCompany()
+    await openGlobal()
     serveFirecrawlRobots()
     await testDb().researchBudget.create({
       data: { companyId: company.id, periodMonth: currentPeriodMonth(NOW), creditsCap: 0, billedUsdCap: 0 },
     })
-    // No scrape interceptor is registered: if a request were issued, the mock agent
-    // would throw rather than let it reach the network.
+    const dispatch = vi.spyOn(mockAgent, 'dispatch')
+    // A positive global envelope leaves the zero company cap as the first refusal.
     const outcome = await new FirecrawlResearchProvider(gate(), { apiKey: 'k', now: () => NOW }).escalate(
       testDb(), company, 'https://acme.example/careers',
     )
     expect(outcome).toMatchObject({ kind: 'refused', reason: 'budget_exhausted' })
+    expect(dispatch.mock.calls.some(([request]) => request.method === 'POST' && request.path === '/v2/scrape')).toBe(false)
+    expect(await testDb().auditLog.findFirstOrThrow({ where: { action: 'fetch.refused', reasonCode: 'budget_exhausted' } })).toMatchObject({ metadata: { scope: 'company' } })
+    expect(await testDb().researchBudget.findFirstOrThrow({ where: { companyId: null } })).toMatchObject({ creditsSpent: 0, vendorCreditsSpent: 0 })
   })
 
   it('treats an out-of-credits or rate-limited response as unusable, not as data', async () => {
@@ -136,6 +152,7 @@ describe('Firecrawl escalation with a key (fixture transport)', () => {
       await truncateAll()
       await seedHostPolicies(testDb())
       const company = await makeCompany()
+      await openGlobal(); await openCompany(company.id)
       serveFirecrawlRobots()
       replyScrape(status, { success: false, error: 'nope' })
 
@@ -149,6 +166,7 @@ describe('Firecrawl escalation with a key (fixture transport)', () => {
 
   it('blocks an injected page from the escalation path too, with zero writes', async () => {
     const company = await makeCompany()
+    await openGlobal(); await openCompany(company.id)
     serveFirecrawlRobots()
     replyScrape(200, {
       success: true,
@@ -168,6 +186,7 @@ describe('Firecrawl escalation with a key (fixture transport)', () => {
 
   it('skips a rewrite when the content hash matches (F1 §4.10)', async () => {
     const company = await makeCompany()
+    await openGlobal(); await openCompany(company.id)
     serveFirecrawlRobots()
     for (let i = 0; i < 2; i += 1) {
       replyScrape(200, {
@@ -181,13 +200,33 @@ describe('Firecrawl escalation with a key (fixture transport)', () => {
     expect(await testDb().evidence.count({ where: { companyId: company.id } })).toBe(1)
   })
 
+  it.each(['global', 'company', 'global_vendor'] as const)('refuses at missing or zero %s headroom before contacting the vendor', async (scope) => {
+    const company = await makeCompany()
+    if (scope !== 'global') await openGlobal(scope === 'global_vendor' ? 0 : 4)
+    if (scope !== 'company') await openCompany(company.id)
+    serveFirecrawlRobots()
+    const dispatch = vi.spyOn(mockAgent, 'dispatch')
+    const outcome = await new FirecrawlResearchProvider(gate(), { apiKey: 'synthetic-key', now: () => NOW }).escalate(testDb(), company, 'https://acme.example/careers')
+    expect(outcome).toMatchObject({ kind: 'refused', reason: 'budget_exhausted' })
+    expect(dispatch.mock.calls.some(([request]) => request.method === 'POST' && request.path === '/v2/scrape')).toBe(false)
+    expect(await testDb().auditLog.findFirstOrThrow({ where: { action: 'fetch.refused', reasonCode: 'budget_exhausted' } })).toMatchObject({ metadata: { scope } })
+    expect(await testDb().evidence.count()).toBe(0)
+  })
+
   it('keeps the API key out of the audit trail', async () => {
     const company = await makeCompany()
+    await openGlobal(); await openCompany(company.id)
     serveFirecrawlRobots()
-    replyScrape(200, { success: true, data: { markdown: MARKDOWN, metadata: {} } })
-    await new FirecrawlResearchProvider(gate(), { apiKey: 'fc-secret-value', now: () => NOW }).escalate(
+    let vendorCalled = false
+    mockAgent.get('https://api.firecrawl.dev').intercept({ path: '/v2/scrape', method: 'POST' }).reply(() => { vendorCalled = true; return { statusCode: 200, data: { success: true, data: { markdown: MARKDOWN, metadata: {} } } } })
+    const outcome = await new FirecrawlResearchProvider(gate(), { apiKey: 'fc-secret-value', now: () => NOW }).escalate(
       testDb(), company, 'https://acme.example/careers',
     )
+    expect(outcome.kind).toBe('stored')
+    expect(vendorCalled).toBe(true)
+    expect(await testDb().auditLog.count({ where: { action: 'fetch.performed' } })).toBe(1)
+    expect(await testDb().researchBudget.findFirstOrThrow({ where: { companyId: null } })).toMatchObject({ vendorCreditsSpent: FIRECRAWL_PLAIN_SCRAPE_CREDITS })
+    expect((await testDb().researchBudget.findFirstOrThrow({ where: { companyId: null } })).billedUsdSpent.toNumber()).toBe(0)
     const rows = await testDb().auditLog.findMany({ select: { metadata: true } })
     expect(JSON.stringify(rows)).not.toContain('fc-secret-value')
   })

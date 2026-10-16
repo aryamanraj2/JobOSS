@@ -50,6 +50,16 @@ async function addBoardRead(companyId: string, observedAt: Date): Promise<void> 
   })
 }
 
+const openGlobal = (when = NOW) => testDb().researchBudget.create({
+  data: { companyId: null, periodMonth: currentPeriodMonth(when), creditsCap: 20, billedUsdCap: 0 },
+})
+const openCompany = (companyId: string, when = NOW) => testDb().researchBudget.create({
+  data: { companyId, periodMonth: currentPeriodMonth(when), creditsCap: 20, billedUsdCap: 0 },
+})
+async function openEnvelopes(companyId: string, when = NOW) {
+  await openGlobal(when); await openCompany(companyId, when)
+}
+
 const graph = (opts = {}) => new SignalGraphService(testDb(), { now: NOW, ...opts })
 
 /**
@@ -67,18 +77,21 @@ describe('source precedence is a hard floor (D4)', () => {
       atsBoardToken: 'acme',
       careersUrl: 'https://acme.example/careers',
     })
+    await openEnvelopes(company.id)
     const action = await graph().nextAction(company)
     expect(action).toMatchObject({ kind: 'read_ats_board', tier: 1, boardToken: 'acme' })
   })
 
   it('chooses ATS detection over page research when no board token exists', async () => {
     const company = await makeCompany({ careersUrl: 'https://acme.example/careers' })
+    await openEnvelopes(company.id)
     const action = await graph().nextAction(company)
     expect(action).toMatchObject({ kind: 'detect_ats', tier: 1 })
   })
 
   it('keeps returning detection while no board token exists and none has been tried', async () => {
     const company = await makeCompany()
+    await openEnvelopes(company.id)
     expect(await graph().nextAction(company)).toMatchObject({ kind: 'detect_ats', tier: 1 })
   })
 
@@ -90,6 +103,7 @@ describe('source precedence is a hard floor (D4)', () => {
    */
   it('falls through to tier 2 once detection has been attempted and failed', async () => {
     const company = await makeCompany({ careersUrl: 'https://acme.example/careers' })
+    await openEnvelopes(company.id)
     await writeAudit(testDb(), {
       actorType: 'system', actorId: 'ats-detect', action: 'ats.detection_failed',
       subjectType: 'Company', subjectId: company.id, reasonCode: 'source_unavailable',
@@ -97,19 +111,28 @@ describe('source precedence is a hard floor (D4)', () => {
     expect(await graph().nextAction(company)).toMatchObject({ kind: 'static_fetch', tier: 2 })
   })
 
-  it('re-attempts detection once the failure is old enough to be worth retrying', async () => {
-    const company = await makeCompany()
-    await writeAudit(testDb(), {
+  it.each(['2026-10-16T00:00:00Z', '2026-12-31T23:59:59Z'])('re-attempts detection only after its retry window: %s', async (timestamp) => {
+    const company = await makeCompany(), failedAt = new Date(timestamp)
+    // Explicit synthetic audit time; independent of the database/server clock.
+    const failure = await testDb().auditLog.create({ data: {
       actorType: 'system', actorId: 'ats-detect', action: 'ats.detection_failed',
-      subjectType: 'Company', subjectId: company.id, reasonCode: 'source_unavailable',
-    })
-    // The failure above is "now"; a graph whose clock is 60 days later sees it as stale.
-    const later = new SignalGraphService(testDb(), { now: new Date('2026-11-15T00:00:00Z') })
-    expect(await later.nextAction(company)).toMatchObject({ kind: 'detect_ats', tier: 1 })
+      subjectType: 'Company', subjectId: company.id, reasonCode: 'source_unavailable', createdAt: failedAt,
+    } })
+    expect(failure.createdAt).toEqual(failedAt)
+    const threshold = failedAt.getTime() + 30 * 86_400_000
+    const clocks = [failedAt, new Date(threshold - 1), new Date(threshold), new Date(threshold + 1), new Date(failedAt.getTime() + 60 * 86_400_000)]
+    // Open each evaluated month exactly once, including year/month transitions.
+    const months = new Set<string>()
+    for (const now of clocks) {
+      if (!months.has(currentPeriodMonth(now))) { await openEnvelopes(company.id, now); months.add(currentPeriodMonth(now)) }
+      const action = await new SignalGraphService(testDb(), { now }).nextAction(company)
+      expect(action).toMatchObject(now.getTime() <= threshold ? { kind: 'static_fetch', tier: 2 } : { kind: 'detect_ats', tier: 1 })
+    }
   })
 
   it('only reaches tier 2 once the tier-1 feed is current', async () => {
     const company = await makeCompany({ atsSlug: 'greenhouse', atsBoardToken: 'acme' })
+    await openEnvelopes(company.id)
     await addBoardRead(company.id, new Date('2026-09-08T00:00:00Z'))
     const action = await graph().nextAction(company)
     expect(action).toMatchObject({ kind: 'static_fetch', tier: 2 })
@@ -117,12 +140,14 @@ describe('source precedence is a hard floor (D4)', () => {
 
   it('treats a board read older than the refresh window as unread again', async () => {
     const company = await makeCompany({ atsSlug: 'ashby', atsBoardToken: 'acme' })
+    await openEnvelopes(company.id)
     await addBoardRead(company.id, new Date('2026-08-01T00:00:00Z'))
     expect(await graph().nextAction(company)).toMatchObject({ kind: 'read_ats_board', tier: 1 })
   })
 
   it('only reaches tier 3 for a page tier 2 could not read, and never otherwise', async () => {
     const company = await makeCompany({ atsSlug: 'lever', atsBoardToken: 'acme' })
+    await openEnvelopes(company.id)
     await addBoardRead(company.id, NOW)
 
     await writeAudit(testDb(), {
@@ -144,11 +169,13 @@ describe('source precedence is a hard floor (D4)', () => {
 
   it('never returns a browser task: D4 defers that layer to F7', async () => {
     const company = await makeCompany({ atsSlug: 'lever', atsBoardToken: 'acme' })
+    await openEnvelopes(company.id)
     await addBoardRead(company.id, NOW)
     await writeAudit(testDb(), {
       actorType: 'system', actorId: 'researcher', action: RESEARCH_ACTIONS.pageUnusable,
       subjectType: 'Company', subjectId: company.id,
     })
+    expect(await graph({ firecrawlEnabled: true }).nextAction(company)).toMatchObject({ kind: 'firecrawl_escalate', tier: 3 })
     await writeAudit(testDb(), {
       actorType: 'system', actorId: 'researcher', action: RESEARCH_ACTIONS.escalated,
       subjectType: 'Company', subjectId: company.id,
@@ -156,22 +183,27 @@ describe('source precedence is a hard floor (D4)', () => {
     const action = await graph({ firecrawlEnabled: true }).nextAction(company)
     expect(action.kind).not.toBe('browser_task')
     expect(action).toMatchObject({ kind: 'none' })
+    expect(action.reason).toBe('every permitted source is current')
   })
 
   it('leaves Firecrawl unreachable while the flag is off, even for an unusable page', async () => {
     const company = await makeCompany({ atsSlug: 'lever', atsBoardToken: 'acme' })
+    await openEnvelopes(company.id)
     await addBoardRead(company.id, NOW)
     await writeAudit(testDb(), {
       actorType: 'system', actorId: 'researcher', action: RESEARCH_ACTIONS.pageUnusable,
       subjectType: 'Company', subjectId: company.id,
     })
     expect(await graph().nextAction(company)).toMatchObject({ kind: 'none' })
+    expect(await graph().nextAction(company)).toMatchObject({ reason: 'static fetch produced no usable text and Firecrawl escalation is disabled' })
+    expect(await graph({ firecrawlEnabled: true }).nextAction(company)).toMatchObject({ kind: 'firecrawl_escalate', tier: 3 })
   })
 })
 
 describe('refusals are recorded, not retried around (D4, F2 exit criterion)', () => {
   it('does not re-issue a fetch against a host that refused inside the window', async () => {
     const company = await makeCompany({ atsSlug: 'greenhouse', atsBoardToken: 'acme' })
+    await openEnvelopes(company.id)
     await addBoardRead(company.id, NOW)
     await writeAudit(testDb(), {
       actorType: 'system', actorId: 'researcher', action: RESEARCH_ACTIONS.pageRefused,
@@ -186,6 +218,7 @@ describe('refusals are recorded, not retried around (D4, F2 exit criterion)', ()
 describe('budget is a precondition, not a tier (Part G)', () => {
   it('no-ops with budget_exhausted when the company envelope is spent', async () => {
     const company = await makeCompany({ atsSlug: 'greenhouse', atsBoardToken: 'acme' })
+    await openGlobal()
     await testDb().researchBudget.create({
       data: {
         companyId: company.id,
@@ -197,11 +230,13 @@ describe('budget is a precondition, not a tier (Part G)', () => {
     expect(await graph().nextAction(company)).toMatchObject({
       kind: 'none',
       reasonCode: 'budget_exhausted',
+      reason: 'research budget exhausted at company scope',
     })
   })
 
   it('no-ops with budget_exhausted when the global envelope is spent', async () => {
     const company = await makeCompany({ atsSlug: 'greenhouse', atsBoardToken: 'acme' })
+    await openCompany(company.id)
     await testDb().researchBudget.create({
       data: { companyId: null, periodMonth: currentPeriodMonth(NOW), creditsCap: 0, billedUsdCap: 0 },
     })

@@ -7,7 +7,9 @@ export type ReasonCodeValue = (typeof ReasonCode)[keyof typeof ReasonCode]
 export type ReasonCodeEntry = {
   /** The milestone that makes this code reachable in running code. */
   milestone: Milestone
-  /** Where the code is raised, in one line. */
+  /** Historical-only codes keep their enum and milestone, but have no current emitter. */
+  retired?: true
+  /** Where the code is raised, or its historical meaning, in one line. */
   description: string
 }
 
@@ -22,9 +24,9 @@ export type ReasonCodeEntry = {
  *     are in exact bijection, in both directions. Adding a code to the schema
  *     without registering it fails the suite, and vice versa.
  *   - Each entry names the milestone that owns it. Codes owned by a shipped
- *     milestone must have a recorded test hit; codes owned by a future milestone
- *     are legitimately unreachable now and are recorded as such rather than
- *     silently exempted.
+ *     milestone must have a recorded test hit unless explicitly retired. Future
+ *     and retired codes remain registered and tested for deferred/history
+ *     compatibility rather than silently exempted.
  *
  * Nothing here is free text: a reason recorded anywhere in the system is one of
  * these values.
@@ -112,7 +114,8 @@ export const REASON_CODE_REGISTRY: Record<ReasonCodeValue, ReasonCodeEntry> = {
   },
   executive_only_contact: {
     milestone: 'F4',
-    description: 'Only founder/CEO/executive contacts were found; these are never targeted.',
+    retired: true,
+    description: 'Historical-only executive-contact refusal. Supported founders and executives may now qualify; no blanket executive ban applies.',
   },
   outdated_role: {
     milestone: 'F2',
@@ -180,7 +183,7 @@ export const ALL_REASON_CODES = Object.values(ReasonCode) as ReasonCodeValue[]
 /** Codes that running code at the current build stage is expected to be able to raise. */
 export function reachableReasonCodes(stage: Milestone = MILESTONE_STAGE): ReasonCodeValue[] {
   return ALL_REASON_CODES.filter((code) =>
-    isAtOrAfter(stage, REASON_CODE_REGISTRY[code].milestone),
+    !REASON_CODE_REGISTRY[code].retired && isAtOrAfter(stage, REASON_CODE_REGISTRY[code].milestone),
   )
 }
 

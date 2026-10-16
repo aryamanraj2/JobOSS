@@ -4,6 +4,7 @@ import {
   REASON_CODE_REGISTRY,
   ReasonCode,
   reachableReasonCodes,
+  describeReasonCode,
 } from '../../src/core/reason-codes/registry.js'
 import { MILESTONE_ORDER } from '../../src/core/config/stage.js'
 
@@ -41,9 +42,25 @@ describe('reason-code registry', () => {
     expect(Object.keys(ReasonCode).sort()).toEqual([...ALL_REASON_CODES].sort())
   })
 
+  it('retains the retired executive reason for historical decoding at its original milestone', () => {
+    expect(ReasonCode.executive_only_contact).toBe('executive_only_contact')
+    expect(ALL_REASON_CODES).toContain('executive_only_contact')
+    expect(REASON_CODE_REGISTRY.executive_only_contact).toMatchObject({ milestone: 'F4', retired: true })
+    expect(describeReasonCode(ReasonCode.executive_only_contact)).toMatch(/Historical-only/)
+    expect(Object.entries(REASON_CODE_REGISTRY).filter(([, entry]) => entry.retired).map(([code]) => code)).toEqual(['executive_only_contact'])
+    for (const stage of MILESTONE_ORDER) {
+      expect(reachableReasonCodes(stage)).not.toContain('executive_only_contact')
+      const expectedActive = ALL_REASON_CODES.filter(code => code !== 'executive_only_contact' && MILESTONE_ORDER.indexOf(stage) >= MILESTONE_ORDER.indexOf(REASON_CODE_REGISTRY[code].milestone))
+      expect(reachableReasonCodes(stage).sort()).toEqual(expectedActive.sort())
+    }
+    expect(reachableReasonCodes('F5')).toContain('outdated_role')
+    expect(reachableReasonCodes('F5')).not.toContain('browser_blocked')
+    expect(reachableReasonCodes('F7')).toContain('browser_blocked')
+  })
+
   it('marks the F5-owned codes as reachable and defers the rest', () => {
     const reachable = reachableReasonCodes('F5')
-    // Everything F0-F4 could raise, plus F5's fifteen — the fourteen the F4 handover
+    // All still-active F0-F4 reasons, plus F5's fifteen — the fourteen the F4 handover
     // named, and `recipient_not_owned`, added in F5 as the 40th code.
     //
     // The enum is closed and a new value costs a migration and an owner, so F4 §4.11
@@ -63,7 +80,6 @@ describe('reason-code registry', () => {
         'duplicate',
         'duplicate_company',
         'duplicate_contact',
-        'executive_only_contact',
         'hard_bounce',
         'host_denied',
         'injection_detected',
@@ -93,15 +109,14 @@ describe('reason-code registry', () => {
         'wrong_contact',
       ].sort(),
     )
-    // F4's own set stays exactly what it was: bumping the stage adds codes, it never
-    // reclassifies one that already shipped.
+    // F4's active set excludes the explicitly retired executive refusal.
+    // Its historical enum value and milestone remain intact.
     expect(reachableReasonCodes('F4').sort()).toEqual(
       [
         'application_submitted',
         'budget_exhausted',
         'content_unchanged',
         'duplicate',
-        'executive_only_contact',
         'host_denied',
         'injection_detected',
         'insufficient_evidence',

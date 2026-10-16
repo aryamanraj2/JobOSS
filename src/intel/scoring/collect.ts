@@ -126,6 +126,23 @@ function ageInDays(from: Date, now: Date): number {
   return Math.max(0, Math.floor((now.getTime() - from.getTime()) / 86_400_000))
 }
 
+/**
+ * The stored-staleness risk: every company-scoped `open` Opportunity row was last
+ * seen more than `POSTING_STALE_DAYS` whole days ago (floor of elapsed days, strictly
+ * greater). It is a NEGATIVE observation about the rows we hold, not evidence that
+ * the employer is hiring, so it is computed from all open rows independently of the
+ * eligible/support set and never feeds support, citations, tracks or attachment.
+ *
+ * No rows is false. One current row is false. A future or invalid timestamp is an
+ * unknown age, never proof of staleness, so it also makes the answer false.
+ */
+export function storedOpenPostingsAllStale(lastSeen: readonly Date[], now: Date): boolean {
+  return lastSeen.length > 0 && lastSeen.every((date) => {
+    const age = now.getTime() - date.getTime()
+    return Number.isFinite(age) && age >= 0 && Math.floor(age / 86_400_000) > POSTING_STALE_DAYS
+  })
+}
+
 function countTerms(text: string, terms: readonly string[]): number {
   const lower = text.toLowerCase()
   return terms.reduce((n, term) => (lower.includes(term) ? n + 1 : n), 0)
@@ -184,6 +201,17 @@ export type CollectedScoreInput = {
    * posting whose track is only implied by its company would get the wrong one.
    */
   opportunityTracks: Omit<PostingTrackMatch, 'tracks'>[]
+  /**
+   * The authoritative eligible postings: exactly the rows whose text was admitted
+   * as support above, in selection order (newest `lastSeenAt`, then smaller ID).
+   * Persistence attaches a Lead only to one of these; empty means speculative.
+   */
+  eligibleOpportunityIds: string[]
+  /**
+   * Explanation of the stored-data risk behind `input.risks.allPostingsStale`.
+   * Counts every open row the company holds, eligible or not; it is never support.
+   */
+  storedPostingRisk: { openRows: number; allStale: boolean }
 }
 
 export type PostingTrackMatch = {
@@ -245,7 +273,7 @@ export async function collectScoreInput(
   company: CompanyForScoring,
   now = new Date(),
 ): Promise<CollectedScoreInput> {
-  const [opportunities, evidence, boardFailure] = await Promise.all([
+  const [opportunities, evidence, boardFailure, storedOpenRows] = await Promise.all([
     db.opportunity.findMany({
       where: { companyId: company.id, status: 'open',
         lastSeenAt: { gte: new Date(now.getTime() - POSTING_STALE_DAYS * 86_400_000) } },
@@ -271,6 +299,8 @@ export async function collectScoreInput(
       orderBy: { createdAt: 'desc' },
       select: { createdAt: true },
     }),
+    // Risk-only read: deliberately unfiltered by ownership, source, hash or age.
+    db.opportunity.findMany({ where: { companyId: company.id, status: 'open' }, select: { lastSeenAt: true } }),
   ])
 
   // --- the text the matcher is allowed to see ------------------------------
@@ -372,6 +402,8 @@ export async function collectScoreInput(
     .sort((a, b) => b.getTime() - a.getTime())[0]
 
   const allText = fields.map((f) => f.text).join('\n')
+  const storedPostingRisk = { openRows: storedOpenRows.length,
+    allStale: storedOpenPostingsAllStale(storedOpenRows.map((o) => o.lastSeenAt), now) }
 
   const input: ScoreInput = {
     now,
@@ -414,9 +446,9 @@ export async function collectScoreInput(
       newestPostingAgeDays: newestPosting ? ageInDays(newestPosting, now) : null,
     },
     risks: {
-      allPostingsStale:
-        openOpportunities.length > 0 &&
-        openOpportunities.every((o) => ageInDays(o.lastSeenAt, now) > POSTING_STALE_DAYS),
+      // Stored-data risk only; see `storedOpenPostingsAllStale`. The eligible rows
+      // above are current by construction, so deriving this from them could never fire.
+      allPostingsStale: storedPostingRisk.allStale,
       lifecycleStatus: company.ycStatus,
     },
   }
@@ -431,5 +463,9 @@ export async function collectScoreInput(
       track,
       confidence,
     })),
+    eligibleOpportunityIds: [...openOpportunities]
+      .sort((a, b) => b.lastSeenAt.getTime() - a.lastSeenAt.getTime() || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .map((o) => o.id),
+    storedPostingRisk,
   }
 }

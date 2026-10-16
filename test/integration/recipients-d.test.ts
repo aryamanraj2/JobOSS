@@ -113,18 +113,28 @@ describe('D draft revisions, exact support and readiness', () => {
     expect(await db.auditLog.count({ where: { action: 'lead.speculative_association_created' } })).toBe(1)
   })
   it.each(['excerpt', 'hash', 'claim', 'resume', 'recipient', 'identity', 'stale', 'future', 'superseded', 'fit', 'suppressed'])('unchanged text loses readiness after current support changes: %s', async (mutation) => {
-    const w = await dWorld({ named: true }), { draftId } = await prepareWritten(w, true); await fulfillSupport(w, draftId)
-    expect((await evaluateOutreachReadiness(db, draftId, NOW)).ready).toBe(true)
-    if (mutation === 'excerpt') await db.evidence.update({ where: { id: w.product.id }, data: { excerpt: `${w.product.excerpt} Changed claim.` } })
-    if (mutation === 'hash') await db.evidence.update({ where: { id: w.product.id }, data: { contentHash: 'changed' } })
-    if (mutation === 'claim') await db.approvedClaim.update({ where: { key: 'project.saldo.ios' }, data: { text: 'Changed approved candidate fact' } })
-    if (mutation === 'resume') await db.resumeVersion.update({ where: { id: w.resume.id }, data: { fileSha256: 'b'.repeat(64) } })
-    if (mutation === 'recipient') await db.contact.update({ where: { id: w.contact.id }, data: { emailNormalized: 'other@acme.example' } })
-    if (mutation === 'identity') await db.evidence.updateMany({ where: { contactId: w.contact.id }, data: { excerpt: 'Same-name person at Otherco' } })
-    if (mutation === 'stale' || mutation === 'future') await db.evidence.update({ where: { id: w.product.id }, data: { observedAt: new Date(NOW.getTime() + (mutation === 'future' ? 1 : -61 * 86400000)) } })
-    if (mutation === 'superseded') await db.evidence.create({ data: { ...w.product, id: randomUUID(), observedAt: new Date(NOW.getTime() + 1), excerpt: 'Newer changed capture' } }); else if (mutation === 'fit') await db.evidence.updateMany({ where: { companyId: w.company.id, contactId: null }, data: { excerpt: 'Unrelated generic company' } })
-    if (mutation === 'suppressed') await db.suppression.create({ data: { emailHmac: emailHmac(w.contact.emailNormalized, process.env.SUPPRESSION_HMAC_SALT!), scope: 'contact', reasonCode: 'opt_out' } })
-    expect((await evaluateOutreachReadiness(db, draftId, NOW)).ready).toBe(false)
+    const previousSalt = process.env.SUPPRESSION_HMAC_SALT
+    if (mutation === 'suppressed') process.env.SUPPRESSION_HMAC_SALT = 'joboss-d-synthetic-suppression-salt'
+    try {
+      const w = await dWorld({ named: true }), { draftId } = await prepareWritten(w, true); await fulfillSupport(w, draftId)
+      expect((await evaluateOutreachReadiness(db, draftId, NOW)).ready).toBe(true)
+      if (mutation === 'excerpt') await db.evidence.update({ where: { id: w.product.id }, data: { excerpt: `${w.product.excerpt} Changed claim.` } })
+      if (mutation === 'hash') await db.evidence.update({ where: { id: w.product.id }, data: { contentHash: 'changed' } })
+      if (mutation === 'claim') await db.approvedClaim.update({ where: { key: 'project.saldo.ios' }, data: { text: 'Changed approved candidate fact' } })
+      if (mutation === 'resume') await db.resumeVersion.update({ where: { id: w.resume.id }, data: { fileSha256: 'b'.repeat(64) } })
+      if (mutation === 'recipient') await db.contact.update({ where: { id: w.contact.id }, data: { emailNormalized: 'other@acme.example' } })
+      if (mutation === 'identity') await db.evidence.updateMany({ where: { contactId: w.contact.id }, data: { excerpt: 'Same-name person at Otherco' } })
+      if (mutation === 'stale' || mutation === 'future') await db.evidence.update({ where: { id: w.product.id }, data: { observedAt: new Date(NOW.getTime() + (mutation === 'future' ? 1 : -61 * 86400000)) } })
+      if (mutation === 'superseded') await db.evidence.create({ data: { ...w.product, id: randomUUID(), observedAt: new Date(NOW.getTime() + 1), excerpt: 'Newer changed capture' } }); else if (mutation === 'fit') await db.evidence.updateMany({ where: { companyId: w.company.id, contactId: null }, data: { excerpt: 'Unrelated generic company' } })
+      if (mutation === 'suppressed') await db.suppression.create({ data: { emailHmac: emailHmac(w.contact.emailNormalized, process.env.SUPPRESSION_HMAC_SALT!), scope: 'contact', reasonCode: 'opt_out' } })
+      expect((await evaluateOutreachReadiness(db, draftId, NOW)).ready).toBe(false)
+    } finally {
+      if (mutation === 'suppressed') {
+        if (previousSalt === undefined) delete process.env.SUPPRESSION_HMAC_SALT
+        else process.env.SUPPRESSION_HMAC_SALT = previousSalt
+      }
+    }
+    if (mutation === 'suppressed') expect(process.env.SUPPRESSION_HMAC_SALT === previousSalt).toBe(true)
   })
   it('rejects partial coverage, changed citations, uncertain semantics and omitted subject through production fulfilment', async () => {
     const w = await dWorld(), { draftId } = await prepareWritten(w), support = await queueDraftSupport(db, draftId)
@@ -624,4 +634,284 @@ it('RD-1 preserves root employer identity for a published contact on an employer
   await db.evidence.update({ where: { id: w.route.id }, data: { excerpt: 'Engineering inquiries: jamie@careers.acme.example.' } })
   const { recipientState } = await import('../../src/outreach/contacts/verification.js')
   expect((await recipientState(db, contact, 'acme.example', NOW)).ready).toBe(true)
+})
+
+const identityMetadata02 = (worksFor: unknown = { url: 'https://acme.example' }) => `<script type="application/ld+json">${JSON.stringify({ '@type': 'Person', name: 'Jamie Rao', jobTitle: 'Co-Founder & CEO', worksFor })}</script>`
+async function cleanIdentityWorld02() {
+  const w = await dWorld({ named: true, personWork: false })
+  await db.contactResearch.deleteMany(); await db.evidence.deleteMany({ where: { contactId: w.contact.id } })
+  await db.contact.update({ where: { id: w.contact.id }, data: { identityVerifiedAt: null } })
+  await db.evidence.update({ where: { id: w.route.id }, data: { excerpt: 'Engineering inquiries: jamie@acme.example.' } })
+  return w
+}
+describe('RD-1a/RD-1b corrections 02 production capture', () => {
+  it.each(['wrong-employer', 'quoted-structured'])('refuses the exact residual on a clean neutral route: %s', async (mode) => {
+    const w = await cleanIdentityWorld02()
+    const markup = mode === 'wrong-employer' ? identityMetadata02({ name: 'Otherco' }) : `<blockquote>${identityMetadata02()}</blockquote>`
+    const out = await prepareRecipients(db, new StubFetcher({ 'https://acme.example/team': { body: `<html><body>${markup}</body></html>` } }), [w.company.id], { now: NOW, interPageDelayMs: 0 })
+    const { recipientState } = await import('../../src/outreach/contacts/verification.js')
+    const state = await recipientState(db, await db.contact.findUniqueOrThrow({ where: { id: w.contact.id } }), 'acme.example', NOW)
+    const tasks = await db.llmTask.findMany({ orderBy: { id: 'asc' } })
+    const prepared = await prepareOutreachDrafts(db, { companyIds: [w.company.id], limit: 1, now: NOW })
+    mkdirSync('scratch/joboss-d-corrections-02', { recursive: true })
+    writeFileSync(`scratch/joboss-d-corrections-02/capture-${mode}.json`, JSON.stringify({ markup, out, state, prepared, drafts: await db.draft.findMany() }, null, 2))
+    expect(out.selected).toHaveLength(0); expect(state.ready).toBe(false)
+    expect(state.research?.identityStatus).toBe('unverified'); expect(prepared.draftIds).toEqual([]); expect(prepared.taskIds).toEqual([])
+    expect(await db.draft.count()).toBe(0); expect(await db.llmTask.findMany({ orderBy: { id: 'asc' } })).toEqual(tasks)
+    expect(await db.llmTask.count({ where: { kind: { in: ['outreach_draft', 'draft_support'] } } })).toBe(0)
+  })
+})
+
+describe('RD-1a/RD-1b employer/context capture boundaries', () => {
+  it.each([
+    ['employer-name-string', identityMetadata02('Otherco')],
+    ['matching-name-only', identityMetadata02({ name: 'Acme' })],
+    ['conflicting-name-and-url', identityMetadata02({ name: 'Otherco', url: 'https://acme.example' })],
+    ['unsupported-employer-array', identityMetadata02(['https://acme.example'])],
+    ['missing-employer', '<script type="application/ld+json">{"@type":"Person","name":"Jamie Rao","jobTitle":"Co-Founder & CEO"}</script>'],
+    ['nested-quotation', `<blockquote><div><section>${identityMetadata02()}</section></div></blockquote>`],
+    ['embedded-code-example', `<pre><code>${identityMetadata02()}</code></pre>`],
+    ['explicit-example-context', `<div data-example><section>${identityMetadata02()}</section></div>`],
+    ['contradictory-structured-records', identityMetadata02() + identityMetadata02('https://otherco.example')],
+    ['card-cannot-override-conflicting-metadata', '<section><h2>Jamie Rao</h2><p>Co-Founder &amp; CEO</p></section>' + identityMetadata02({ name: 'Otherco' })],
+    ['oversize-full-source', identityMetadata02() + ' '.repeat(32_001) + `<blockquote>${identityMetadata02()}</blockquote>`],
+  ])('does not select or draft from %s', async (mode, markup) => {
+    const w = await cleanIdentityWorld02()
+    const out = await prepareRecipients(db, new StubFetcher({ 'https://acme.example/team': { body: `<html><body>${markup}</body></html>` } }), [w.company.id], { now: NOW, interPageDelayMs: 0 })
+    const tasks = await db.llmTask.findMany({ orderBy: { id: 'asc' } })
+    const { recipientState } = await import('../../src/outreach/contacts/verification.js')
+    expect(out.selected).toEqual([])
+    expect((await recipientState(db, await db.contact.findUniqueOrThrow({ where: { id: w.contact.id } }), 'acme.example', NOW)).ready).toBe(false)
+    const draft = await prepareOutreachDrafts(db, { companyIds: [w.company.id], limit: 1, now: NOW })
+    expect(draft.draftIds).toEqual([]); expect(draft.taskIds).toEqual([]); expect(await db.draft.count()).toBe(0)
+    expect(await db.llmTask.findMany({ orderBy: { id: 'asc' } })).toEqual(tasks)
+    if (mode === 'oversize-full-source') expect(out.limitations.some((l) => l.detail.includes('32,000'))).toBe(true)
+  })
+  it.each([
+    ['canonical-employer', identityMetadata02()],
+    ['employer-subdomain', identityMetadata02({ url: 'https://careers.acme.example' })],
+    ['URL-string', identityMetadata02('https://acme.example')],
+    ['named-Organization', identityMetadata02({ '@type': 'Organization', name: 'Acme', url: 'https://acme.example' })],
+    ['legitimate-and-quoted', identityMetadata02() + `<blockquote>${identityMetadata02({ name: 'Otherco' })}</blockquote>`],
+    ['card-and-quoted', '<section><h2>Jamie Rao</h2><p>Co-Founder &amp; CEO</p></section>' + `<blockquote>${identityMetadata02({ name: 'Otherco' })}</blockquote>`],
+    ['graph-container', `<script type="application/ld+json">${JSON.stringify({ '@graph': [{ '@type': 'Organization', employee: { '@type': 'Person', name: 'Jamie Rao', jobTitle: 'Co-Founder & CEO', worksFor: { url: 'https://acme.example' } } }] })}</script>`],
+  ])('retains %s through real writer/support/gate/final readiness', async (mode, markup) => {
+    const w = await cleanIdentityWorld02(), html = `<html><body>${markup}</body></html>`
+    const out = await prepareRecipients(db, new StubFetcher({ 'https://acme.example/team': { body: html } }), [w.company.id], { now: NOW, interPageDelayMs: 0 })
+    expect(out.selected).toEqual([{ companyId: w.company.id, contactId: w.contact.id }])
+    const research = await db.contactResearch.findUniqueOrThrow({ where: { contactId: w.contact.id } })
+    const facts = research.facts as { identityRecord: { version: number; html: string }; evidenceIds: string[]; text: string }[]
+    expect(facts[0]?.identityRecord).toEqual({ version: 3, html })
+    const { identityCaptureHash } = await import('../../src/outreach/contacts/person-research.js')
+    const evidence = await db.evidence.findUniqueOrThrow({ where: { id: facts[0]!.evidenceIds[0]! } })
+    expect(evidence.contentHash).toBe(identityCaptureHash(evidence.sourceUrl, evidence.excerpt, w.contact.id, html))
+    const { draftId } = await prepareWritten(w); await fulfillSupport(w, draftId)
+    expect((await gateDraft(db, draftId, NOW)).ok).toBe(true)
+    const before = await identityRows02()
+    await db.$transaction(async (tx) => { await tx.$executeRaw`SET TRANSACTION READ ONLY`; expect((await evaluateOutreachReadiness(tx, draftId, NOW)).ready).toBe(true) })
+    expect(await identityRows02()).toEqual(before)
+    const view = await outreachReview(db, draftId, NOW)
+    expect(view?.readiness.ready).toBe(true); expect(view?.recipientVerification.ready).toBe(true)
+    mkdirSync('scratch/joboss-d-corrections-02', { recursive: true })
+    writeFileSync(`scratch/joboss-d-corrections-02/positive-${mode}.json`, JSON.stringify({ html, research, evidence, view }, null, 2))
+  })
+})
+
+async function identityRows02() {
+  return { drafts: await db.draft.findMany({ orderBy: { id: 'asc' } }), tasks: await db.llmTask.findMany({ orderBy: { id: 'asc' } }),
+    audit: await db.auditLog.findMany({ orderBy: { id: 'asc' } }), research: await db.contactResearch.findMany({ orderBy: { id: 'asc' } }),
+    contact: await db.contact.findMany({ orderBy: { id: 'asc' } }), evidence: await db.evidence.findMany({ orderBy: { id: 'asc' } }) }
+}
+
+describe('RD-1a/RD-1b stored proof, compatibility and final readiness', () => {
+  it.each(['current-wrong-employer-name', 'current-wrong-employer-string', 'current-conflicting-name-url', 'current-quoted', 'current-nested-example', 'current-conflicting-records',
+    'old-wrong-employer', 'old-context-lost-script', 'old-context-lost-card', 'version-only-upgrade', 'missing', 'malformed-json', 'malformed-shape', 'unsupported-version', 'empty', 'oversize'])('refuses %s after fresh matching evidence/support, without validation writes', async (mode) => {
+    const w = await dWorld({ named: true, personWork: false }), { draftId } = await prepareWritten(w)
+    await fulfillSupport(w, draftId); await gateDraft(db, draftId, NOW)
+    expect((await evaluateOutreachReadiness(db, draftId, NOW)).ready).toBe(true)
+    const originalDraft = await db.draft.findUniqueOrThrow({ where: { id: draftId } })
+    await db.evidence.update({ where: { id: w.route.id }, data: { excerpt: 'Engineering inquiries: jamie@acme.example.' } })
+    const research = await db.contactResearch.findUniqueOrThrow({ where: { contactId: w.contact.id } })
+    const first = (research.facts as { evidenceIds: string[] }[])[0]!, id = first.evidenceIds[0]!
+    const card = '<section><h2>Jamie Rao</h2><p>Co-Founder &amp; CEO</p></section>'
+    const markup = mode.includes('wrong-employer-name') || mode === 'old-wrong-employer' ? identityMetadata02({ name: 'Otherco' }) :
+      mode === 'current-wrong-employer-string' ? identityMetadata02('Otherco') : mode === 'current-conflicting-name-url' ? identityMetadata02({ name: 'Otherco', url: 'https://acme.example' }) :
+      mode === 'current-quoted' ? `<blockquote>${identityMetadata02()}</blockquote>` : mode === 'current-nested-example' ? `<pre><div>${identityMetadata02()}</div></pre>` :
+      mode === 'current-conflicting-records' ? identityMetadata02() + identityMetadata02('https://otherco.example') : mode === 'old-context-lost-card' ? card : mode === 'malformed-json' ? '<script type="application/ld+json">not JSON</script>' : identityMetadata02()
+    // Old v2 really discarded parents. These bare scripts/cards intentionally carry
+    // no recovered quotation context. No safe wrapper is invented for them.
+    const html = mode.startsWith('old-') || mode === 'version-only-upgrade' ? markup : mode === 'empty' ? '' : mode === 'oversize' ? `<html><body>${markup}${' '.repeat(32_001)}</body></html>` : `<html><body>${markup}</body></html>`
+    const proof = mode === 'missing' ? undefined : mode === 'malformed-shape' ? { version: 3, html: 42 } : { version: mode.startsWith('old-') ? 2 : mode === 'unsupported-version' ? 99 : 3, html }
+    const text = mode === 'old-context-lost-card' ? 'Jamie Rao Co-Founder & CEO' : 'Jamie Rao — Co-Founder & CEO.'
+    const { identityCaptureHash } = await import('../../src/outreach/contacts/person-research.js')
+    const { contentHashOf } = await import('../../src/core/evidence/content-hash.js')
+    const { evidenceSnapshot, recipientState } = await import('../../src/outreach/contacts/verification.js')
+    const url = 'https://acme.example/team'
+    const e = await db.evidence.update({ where: { id }, data: { excerpt: text, observedAt: NOW,
+      contentHash: mode.startsWith('old-') || mode === 'version-only-upgrade' ? contentHashOf({ url, excerpt: text, contactId: w.contact.id }) : identityCaptureHash(url, text, w.contact.id, html) } })
+    const fact = { text, evidenceIds: [id], observation: 'identity', authorshipVerified: false, snapshots: [{ id, hash: evidenceSnapshot(e) }], ...(proof ? { identityRecord: proof } : {}) }
+    await db.contactResearch.update({ where: { contactId: w.contact.id }, data: { identityStatus: 'verified', verifiedAt: NOW, researchedAt: NOW, facts: [fact], hooks: [], citedEvidenceIds: [id] } })
+    await fulfillSupport(w, draftId)
+    const before = await identityRows02()
+    const result = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SET TRANSACTION READ ONLY`
+      return { state: await recipientState(tx, await tx.contact.findUniqueOrThrow({ where: { id: w.contact.id } }), 'acme.example', NOW), readiness: await evaluateOutreachReadiness(tx, draftId, NOW) }
+    })
+    expect(result.state.ready).toBe(false); expect(result.readiness.ready).toBe(false)
+    expect(await identityRows02()).toEqual(before)
+    const view = await outreachReview(db, draftId, NOW)
+    expect(view?.recipientVerification.ready).toBe(false); expect(view?.readiness.ready).toBe(false)
+    expect(await identityRows02()).toEqual(before)
+    const prepared = await prepareOutreachDrafts(db, { companyIds: [w.company.id], limit: 1, now: NOW, upgradeExisting: true })
+    expect(prepared.draftIds).toEqual([]); expect(prepared.taskIds).toEqual([])
+    expect(await identityRows02()).toEqual(before); expect(await db.draft.findUnique({ where: { id: draftId } })).toEqual(originalDraft)
+    mkdirSync('scratch/joboss-d-corrections-02', { recursive: true })
+    writeFileSync(`scratch/joboss-d-corrections-02/stored-${mode}.json`, JSON.stringify({ fact, evidence: e, result, prepared, preservedDraft: originalDraft, validationUnchanged: true }, null, 2))
+  })
+  it('requires deliberate recapture of an old proof, preserving the written draft throughout', async () => {
+    const w = await dWorld({ named: true, personWork: false }), { draftId } = await prepareWritten(w)
+    const original = await db.draft.findUniqueOrThrow({ where: { id: draftId } }), research = await db.contactResearch.findUniqueOrThrow({ where: { contactId: w.contact.id } })
+    const facts = research.facts as { text: string; evidenceIds: string[]; snapshots: { id: string; hash: string }[]; observation: string; authorshipVerified: boolean; identityRecord: { version: number; html: string } }[]
+    facts[0]!.identityRecord = { version: 2, html: '<section><h2>Jamie Rao</h2><p>Co-Founder &amp; CEO</p></section>' }
+    await db.contactResearch.update({ where: { contactId: w.contact.id }, data: { facts } })
+    await fulfillSupport(w, draftId)
+    expect((await evaluateOutreachReadiness(db, draftId, NOW)).ready).toBe(false)
+    const html = `<html><body>${identityMetadata02()}</body></html>`
+    const captured = await prepareRecipients(db, new StubFetcher({ 'https://acme.example/team': { body: html } }), [w.company.id], { now: NOW, interPageDelayMs: 0 })
+    expect(captured.selected).toEqual([{ companyId: w.company.id, contactId: w.contact.id }])
+    await fulfillSupport(w, draftId)
+    expect((await evaluateOutreachReadiness(db, draftId, NOW)).ready).toBe(true)
+    expect(await db.draft.findUnique({ where: { id: draftId } })).toEqual(original)
+  })
+})
+// RD-1b corrections03: a valid base identity must not certify secondary work.
+import { personFacts, evidenceSnapshot, recipientState, validPersonFacts, type PersonFact } from '../../src/outreach/contacts/verification.js'
+import { observePersonPage, identityCaptureHash } from '../../src/outreach/contacts/person-research.js'
+import { contentHashOf } from '../../src/core/evidence/content-hash.js'
+
+const fieldCard03 = (work: string = '') => `<html><body><section><h2>Jamie Rao</h2><p>Field Engineer</p>${work ? `<p>Jamie Rao ${work}</p>` : ''}</section></body></html>`
+const productWork03 = 'builds the iOS mobile SDK product.'
+type MixedMode03 = 'old-context-lost' | 'quoted-current' | 'substituted-current'
+type World03 = Awaited<ReturnType<typeof dWorld>>
+function record03(name: string, result: unknown) {
+  const dir = `scratch/joboss-d-corrections-03/${process.env.JOBOSS_D_CORRECTION03_PHASE ?? 'final'}`
+  mkdirSync(dir, { recursive: true }); writeFileSync(`${dir}/${name}.json`, JSON.stringify(result, null, 2))
+}
+async function fieldWorld03() {
+  const w = await dWorld({ named: true })
+  const authored = personFacts((await db.contactResearch.findUniqueOrThrow({ where: { contactId: w.contact.id } })).hooks)
+  await db.contactResearch.deleteMany()
+  await db.evidence.deleteMany({ where: { contactId: w.contact.id, sourceType: 'company_page' } })
+  await db.contact.update({ where: { id: w.contact.id }, data: { publicTitle: 'Field Engineer', identityVerifiedAt: null } })
+  await db.evidence.update({ where: { id: w.route.id }, data: { excerpt: 'Engineering inquiries: jamie@acme.example.' } })
+  const captured = await prepareRecipients(db, new StubFetcher({ 'https://acme.example/team': { body: fieldCard03(productWork03) } }), [w.company.id], { now: NOW, interPageDelayMs: 0 })
+  expect(captured.selected).toEqual([{ companyId: w.company.id, contactId: w.contact.id }])
+  const p = await prepareWritten(w)
+  await fulfillSupport(w, p.draftId); expect((await gateDraft(db, p.draftId, NOW)).ok).toBe(true)
+  return { w, draftId: p.draftId, original: await db.draft.findUniqueOrThrow({ where: { id: p.draftId } }), authored }
+}
+async function fact03(w: World03, path: string, work = '', mode?: MixedMode03): Promise<PersonFact> {
+  const url = `https://acme.example/${path}`, source = fieldCard03(work)
+  const html = mode === 'quoted-current' ? `<html><body><blockquote>${source}</blockquote></body></html>` : mode === 'substituted-current' ? fieldCard03() : source
+  const observed = observePersonPage({ html: source, url, companyDomain: 'acme.example', companyName: 'Acme', fullName: 'Jamie Rao', publicTitle: 'Field Engineer' })
+  expect(observed.identityVerified).toBe(true)
+  const text = observed.excerpt!
+  const e = await db.evidence.create({ data: { companyId: w.company.id, contactId: w.contact.id, sourceUrl: url, sourceType: 'company_page', excerpt: text,
+    contentHash: mode === 'old-context-lost' ? contentHashOf({ url, excerpt: text, contactId: w.contact.id }) : identityCaptureHash(url, text, w.contact.id, mode === 'substituted-current' ? source : html),
+    observedAt: NOW, confidence: 0.9, fetchedVia: 'static_fetch' } })
+  return { text, evidenceIds: [e.id], observation: 'identity', authorshipVerified: false, identityRecord: { version: mode === 'old-context-lost' ? 2 : 3, html }, snapshots: [{ id: e.id, hash: evidenceSnapshot(e) }] }
+}
+async function storeFacts03(w: World03, facts: PersonFact[], hooks: PersonFact[] = []) {
+  await db.contactResearch.update({ where: { contactId: w.contact.id }, data: { facts, hooks, citedEvidenceIds: [...facts, ...hooks].flatMap((f) => f.evidenceIds) } })
+}
+async function rows03() {
+  return { ...await identityRows02(), leads: await db.lead.findMany({ orderBy: { id: 'asc' } }), assessments: await db.outreachAssessment.findMany({ orderBy: { id: 'asc' } }), attempts: await db.sendAttempt.findMany({ orderBy: { id: 'asc' } }) }
+}
+async function read03(w: World03, draftId: string, name: string) {
+  const before = await rows03()
+  const result = await db.$transaction(async (tx) => {
+    await tx.$executeRaw`SET TRANSACTION READ ONLY`
+    const contact = await tx.contact.findUniqueOrThrow({ where: { id: w.contact.id } })
+    const research = await tx.contactResearch.findUniqueOrThrow({ where: { contactId: contact.id } })
+    return { valid: validPersonFacts(research, contact, await tx.evidence.findMany({ where: { companyId: w.company.id } }), NOW, 'acme.example', 'Acme'),
+      recipient: await recipientState(tx, contact, 'acme.example', NOW), readiness: await evaluateOutreachReadiness(tx, draftId, NOW), review: await outreachReview(tx, draftId, NOW) }
+  }, { isolationLevel: 'RepeatableRead' })
+  const after = await rows03()
+  record03(name, { result, before, after, validationUnchanged: contentHashOf(before) === contentHashOf(after) })
+  expect(after).toEqual(before)
+  return result
+}
+describe('RD-1b per-fact responsibility binding', () => {
+  it('keeps a current Field Engineer identity without product work unsuitable', async () => {
+    const { w, draftId, original } = await fieldWorld03()
+    await storeFacts03(w, [await fact03(w, 'team')]); await fulfillSupport(w, draftId)
+    const out = await read03(w, draftId, 'no-work')
+    expect(out.valid).toBe(true); expect(out.recipient.ready).toBe(false)
+    expect(out.readiness.ready).toBe(false); expect(out.review?.readiness.ready).toBe(false)
+    expect(await db.draft.findUnique({ where: { id: draftId } })).toEqual(original)
+  })
+  describe.each(['old-context-lost', 'quoted-current', 'substituted-current'] as const)('%s secondary proof', (mode) => {
+    it.each(['first', 'middle', 'last'] as const)('refuses mixed facts with the invalid work %s despite fresh support', async (position) => {
+      const { w, draftId, original } = await fieldWorld03()
+      const base = await fact03(w, 'team'), other = await fact03(w, 'people/jamie', 'maintains the documentation.'), bad = await fact03(w, 'engineering/jamie', productWork03, mode)
+      const facts = position === 'first' ? [bad, base, other] : position === 'middle' ? [base, bad, other] : [base, other, bad]
+      await storeFacts03(w, facts); await fulfillSupport(w, draftId)
+      const out = await read03(w, draftId, `${mode}-${position}`)
+      expect(out.valid).toBe(false); expect(out.recipient.ready).toBe(false); expect(out.recipient.suitability.suitable).toBe(false)
+      expect(out.readiness.ready).toBe(false); expect(out.review?.recipientVerification.ready).toBe(false); expect(out.review?.readiness.ready).toBe(false)
+      const before = await rows03()
+      const blocked = await prepareOutreachDrafts(db, { companyIds: [w.company.id], limit: 1, now: NOW, upgradeExisting: true })
+      expect(blocked.draftIds).toEqual([]); expect(blocked.taskIds).toEqual([]); expect(await rows03()).toEqual(before)
+      expect(await db.draft.findUnique({ where: { id: draftId } })).toEqual(original)
+    })
+    it('recaptures instead of selecting an invalid cached mix, then restores readiness without rewriting email', async () => {
+      const { w, draftId, original } = await fieldWorld03()
+      await storeFacts03(w, [await fact03(w, 'team'), await fact03(w, 'second-source', productWork03, mode)])
+      await fulfillSupport(w, draftId)
+      const beforeTasks = await db.llmTask.findMany({ where: { kind: { in: ['outreach_draft', 'draft_support'] } }, orderBy: { id: 'asc' } })
+      const failedSources = new StubFetcher({})
+      const blocked = await prepareRecipients(db, failedSources, [w.company.id], { now: NOW, interPageDelayMs: 0 })
+      record03(`cache-${mode}`, { blocked, requests: failedSources.requested, original })
+      expect(blocked.selected).toEqual([]); expect(blocked.researched).toBe(1); expect(blocked.blockers.length).toBeGreaterThan(0)
+      expect(failedSources.requested.length).toBeGreaterThan(0); expect(failedSources.requested.length).toBeLessThanOrEqual(4)
+      expect(await db.llmTask.findMany({ where: { kind: { in: ['outreach_draft', 'draft_support'] } }, orderBy: { id: 'asc' } })).toEqual(beforeTasks)
+      expect(await db.draft.findUnique({ where: { id: draftId } })).toEqual(original)
+      const sources = new StubFetcher({ 'https://acme.example/team': { body: fieldCard03(productWork03) } })
+      const captured = await prepareRecipients(db, sources, [w.company.id], { now: NOW, interPageDelayMs: 0 })
+      expect(captured.selected).toEqual([{ companyId: w.company.id, contactId: w.contact.id }]); expect(sources.requested).toContain('https://acme.example/team')
+      expect((await evaluateOutreachReadiness(db, draftId, NOW)).ready).toBe(false)
+      await fulfillSupport(w, draftId)
+      const restored = await read03(w, draftId, `recaptured-${mode}`)
+      expect(restored.recipient.ready).toBe(true); expect(restored.readiness.ready).toBe(true); expect(restored.review?.readiness.ready).toBe(true)
+      expect(await db.draft.findUnique({ where: { id: draftId } })).toEqual(original)
+    })
+  })
+  it.each([false, true])('retains individually validated multi-source work and distinct authored hooks, reverse=%s', async (reverse) => {
+    const { w, draftId, original, authored } = await fieldWorld03()
+    const facts = [await fact03(w, 'team'), await fact03(w, 'people/jamie', 'maintains the documentation.'), await fact03(w, 'engineering/jamie', productWork03)]
+    await storeFacts03(w, reverse ? facts.reverse() : facts, authored); await fulfillSupport(w, draftId)
+    expect(authored.length).toBeGreaterThan(0); expect(authored.every((f) => f.observation === 'authorship' && f.authorshipVerified && !f.identityRecord)).toBe(true)
+    const out = await read03(w, draftId, `multi-source-${reverse}`)
+    expect(out.valid).toBe(true); expect(out.recipient.ready).toBe(true); expect(out.readiness.ready).toBe(true); expect(out.review?.readiness.ready).toBe(true)
+    const sources = new StubFetcher({})
+    const reuse = await prepareRecipients(db, sources, [w.company.id], { now: NOW, interPageDelayMs: 0 })
+    expect(reuse.selected).toEqual([{ companyId: w.company.id, contactId: w.contact.id }]); expect(reuse.researched).toBe(0); expect(sources.requested).toEqual([])
+    expect(await db.draft.findUnique({ where: { id: draftId } })).toEqual(original)
+  })
+  it.each(['unlabelled', 'authorship-label', 'extra-unbound-citation', 'irrelevant-invalid'] as const)('cannot trust secondary work through %s', async (mode) => {
+    const { w, draftId } = await fieldWorld03()
+    const base = await fact03(w, 'team'), work = await fact03(w, 'engineering/jamie', productWork03, mode === 'extra-unbound-citation' ? undefined : 'quoted-current')
+    if (mode === 'unlabelled') delete work.observation
+    if (mode === 'authorship-label') { work.observation = 'authorship'; work.authorshipVerified = true }
+    if (mode === 'extra-unbound-citation') {
+      const other = await fact03(w, 'another-source', productWork03, 'quoted-current')
+      work.evidenceIds.push(...other.evidenceIds); work.snapshots!.push(...other.snapshots!)
+    }
+    const validWork = await fact03(w, 'valid-product-source', productWork03)
+    const facts = mode === 'irrelevant-invalid' ? [base, validWork, await fact03(w, 'invalid-documentation', 'maintains the documentation.', 'quoted-current')] : [base, work]
+    await storeFacts03(w, facts); await fulfillSupport(w, draftId)
+    const out = await read03(w, draftId, mode)
+    expect(out.valid).toBe(false); expect(out.recipient.ready).toBe(false); expect(out.recipient.suitability.suitable).toBe(false)
+    expect(out.readiness.ready).toBe(false); expect(out.review?.readiness.ready).toBe(false)
+  })
 })
