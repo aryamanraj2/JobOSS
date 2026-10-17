@@ -13,6 +13,7 @@ import { verifyApprovalHash } from '../draft/approve.js'
 import { reservationSnapshot, lockReservationSnapshot, planMatchesSnapshot } from './reservation.js'
 import { deriveIdempotencyKey } from '../mail/message-id.js'
 import { evaluateSendGate, type SendGateOptions, type SendPlan } from './gate.js'
+import { tryReadinessReservation } from './readiness-boundary.js'
 
 /**
  * A9 — the send, and the only at-most-once job class in the system.
@@ -116,6 +117,18 @@ export async function sendApprovedDraft(
   if (!isInboxProvider(mail)) {
     return { status: 'refused', reason: 'weak_evidence', detail: 'incomplete outcome ingestion: provider cannot read inbox' }
   }
+  const busy = { allowed: false as const, reason: 'weak_evidence' as const,
+    detail: '@5 reservation inputs are busy or changed lock protocol; retry later in a fresh invocation' }
+  const revisionBeforeInbox = await db.draft.findUnique({ where: { id: draftId }, select: { promptVersion: true } })
+  if (revisionBeforeInbox?.promptVersion === 'outreach_draft@5') {
+    // An already-active D/S support decision also SHARE-locks audit_log. Yield
+    // before inbox checkpoint writes could wait behind it. This short availability
+    // probe commits/releases ALL locks before any provider call. It validates no
+    // readiness and cannot authorize a send: reacquire everything after ingestion.
+    const available = await db.$transaction(tx => tryReadinessReservation(tx, draftId),
+      { isolationLevel: 'ReadCommitted', timeout: 30_000 })
+    if (!available) return { status: 'refused', reason: busy.reason, detail: busy.detail }
+  }
   let ingestion = await syncInbox(db, mail, {
     suppressionSalt: opts.suppressionSalt, checkpointKey: `pre-send:${opts.sendingAccount ?? 'default'}`,
   })
@@ -133,11 +146,25 @@ export async function sendApprovedDraft(
   // Serialize gate + reservation so concurrent sends cannot both consume the last
   // cap or the same dedup slot. The provider call remains outside the transaction.
   const reservation = await db.$transaction(async (tx) => {
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended('outreach-send-reservation', 0))::text`
+    // This first read only selects the lock protocol. All authoritative reads are
+    // fresh READ COMMITTED reads AFTER the complete @5 boundary is acquired.
+    const revision = await tx.draft.findUnique({ where: { id: draftId }, select: { promptVersion: true } })
+    const supportLocked = revision?.promptVersion === 'outreach_draft@5'
+    if (supportLocked) {
+      if (!await tryReadinessReservation(tx, draftId)) return busy
+    } else {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended('outreach-send-reservation', 0))::text`
+    }
     const snapshot = await reservationSnapshot(tx, draftId)
-    const decision = await evaluateSendGate(tx, draftId, opts)
+    if (!supportLocked && snapshot.draft?.promptVersion === 'outreach_draft@5') return busy
+    // A legacy revision could become @5 between this snapshot and the gate. Never
+    // invoke its callback without the support boundary. Missing-callback refusal
+    // and B's independent content/plan comparison close that protocol-switch race.
+    const legacyOptions = { ...opts }
+    delete legacyOptions.evaluateOutreachReadiness
+    const decision = await evaluateSendGate(tx, draftId, supportLocked ? opts : legacyOptions)
     if (!decision.allowed) return decision
-    await lockReservationSnapshot(tx, snapshot)
+    await lockReservationSnapshot(tx, snapshot, supportLocked)
     const current = await reservationSnapshot(tx, draftId)
     if (JSON.stringify(snapshot) !== JSON.stringify(current) || current.draft?.status !== 'approved' || !planMatchesSnapshot(decision.plan, current)) {
       const detail = 'validated approval/content/recipient snapshot changed before reservation'
@@ -177,7 +204,7 @@ export async function sendApprovedDraft(
       select: { id: true },
     })
     return { allowed: true as const, attempt: row, plan }
-  }, { timeout: 30_000 })
+  }, { isolationLevel: 'ReadCommitted', timeout: 30_000 })
   if (!reservation.allowed) return { status: 'refused', reason: reservation.reason, detail: reservation.detail }
   const { attempt, plan } = reservation
 

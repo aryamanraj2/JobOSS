@@ -30,6 +30,7 @@ import { evaluateSendGate, type SendGateOptions } from '../src/outreach/send/gat
 import { sendApprovedDraft, reconcileInFlight, type SendOutcome } from '../src/outreach/send/send.js'
 import { deliverabilityCounters } from '../src/outreach/send/counters.js'
 import { capsForStage } from '../src/outreach/send/caps.js'
+import { evaluateOutreachReadiness } from '../src/outreach/review/readiness.js'
 
 function flag(name: string): string | undefined {
   const index = process.argv.indexOf(`--${name}`)
@@ -47,6 +48,7 @@ const gateOptions: SendGateOptions = {
   messageIdDomain: config.MESSAGE_ID_DOMAIN,
   suppressionSalt: config.SUPPRESSION_HMAC_SALT,
   envFlag: config.SENDING_ENABLED,
+  evaluateOutreachReadiness,
 }
 
 function mailProvider(): GmailProvider {

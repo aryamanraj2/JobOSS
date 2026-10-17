@@ -96,9 +96,10 @@ const gate = new FetchPolicyGate(db, {
 })
 
 // Explicit deterministic discovery mode. This CLI is never run by tests or an automatic scheduler.
-if (process.argv.includes('--discovery')) {
+if (process.argv.includes('--discovery') || process.argv.includes('--discovery-expanded')) {
   try {
     const summary = await prepareDiscovery(db, gate, { limit,
+      ...(process.argv.includes('--discovery-expanded') ? { mode: 'expanded-v1' as const } : {}),
       ...(flag('run-id') ? { runId: flag('run-id')! } : {}), resume: process.argv.includes('--resume'),
       delayMs: config.DEFAULT_HOST_RATE_DELAY_MS })
     console.log(JSON.stringify(summary, null, 2))

@@ -11,9 +11,20 @@ export async function reservationSnapshot(db: Db, draftId: string) {
 
 /** Same draft row is locked by revokeApproval. Related mutable hash/route rows stay
  * locked until the approved->sending transition and attempt commit together. */
-export async function lockReservationSnapshot(db: Db, snapshot: Awaited<ReturnType<typeof reservationSnapshot>>): Promise<void> {
+export async function lockReservationSnapshot(db: Db, snapshot: Awaited<ReturnType<typeof reservationSnapshot>>, nowait = false): Promise<void> {
   const draft = snapshot.draft
   if (!draft) return
+  // @5 takes these before validation, within the rollbackable support boundary.
+  // Even a SELECT FOR UPDATE holder (no table writer yet) must yield busy rather
+  // than leave us waiting with D/support locks. Legacy B retains its wait order.
+  if (nowait) {
+    await db.$queryRaw`SELECT id FROM draft WHERE id = ${draft.id} FOR UPDATE NOWAIT`
+    if (draft.contactId) await db.$queryRaw`SELECT id FROM contact WHERE id = ${draft.contactId} FOR UPDATE NOWAIT`
+    if (draft.resumeVersionId) await db.$queryRaw`SELECT id FROM resume_version WHERE id = ${draft.resumeVersionId} FOR UPDATE NOWAIT`
+    await db.$queryRaw`SELECT id FROM lead WHERE id = ${draft.leadId} FOR UPDATE NOWAIT`
+    if (snapshot.profile) await db.$queryRaw`SELECT id FROM candidate_profile WHERE id = ${snapshot.profile.id} FOR UPDATE NOWAIT`
+    return
+  }
   await db.$queryRaw`SELECT id FROM draft WHERE id = ${draft.id} FOR UPDATE`
   if (draft.contactId) await db.$queryRaw`SELECT id FROM contact WHERE id = ${draft.contactId} FOR UPDATE`
   if (draft.resumeVersionId) await db.$queryRaw`SELECT id FROM resume_version WHERE id = ${draft.resumeVersionId} FOR UPDATE`

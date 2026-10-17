@@ -55,6 +55,16 @@ export const SEED_DENY_HOSTS: SeedHostEntry[] = [
  * verified in B6.
  */
 export const SEED_ALLOW_HOSTS: SeedHostEntry[] = [
+  // X public source entries only. Our allowlist is not robots/terms/access clearance; no API exemptions or rate overrides.
+  { host: 'www.ycombinator.com', includeSubdomains: false, note: 'X expanded public source; exact host only, unverified representation/access, all gateway checks still required.' },
+  { host: 'www.southparkcommons.com', includeSubdomains: false, note: 'X expanded public source; exact host only, unverified representation/access, all gateway checks still required.' },
+  { host: 'www.alchemistaccelerator.com', includeSubdomains: false, note: 'X expanded public source; exact host only, unverified representation/access, all gateway checks still required.' },
+  { host: 'www.joinef.com', includeSubdomains: false, note: 'X expanded public source; exact host only, unverified representation/access, all gateway checks still required.' },
+  { host: 'masschallenge.org', includeSubdomains: false, note: 'X expanded public source; exact host only, unverified representation/access, all gateway checks still required.' },
+  { host: 'more.masschallenge.org', includeSubdomains: false, note: 'X expanded public source; exact host only, unverified representation/access, all gateway checks still required.' },
+  { host: 'seedcamp.com', includeSubdomains: false, note: 'X expanded public source; exact host only, unverified representation/access, all gateway checks still required.' },
+  { host: 'talent.seedcamp.com', includeSubdomains: false, note: 'X expanded public source; exact host only, unverified representation/access, all gateway checks still required.' },
+
   { host: 'startupdb.com', includeSubdomains: false, sourceUrl: 'https://startupdb.com/api', note: 'Public documented GET API; CC BY 4.0 attribution and coverage retained. Website paths still require robots.' },
   { host: 'hacker-news.firebaseio.com', includeSubdomains: false, sourceUrl: 'https://github.com/HackerNews/API', note: 'Official HN public item and whoishiring user API; requests remain bounded by local policy.' },
   { host: 'boards-api.greenhouse.io', includeSubdomains: false, note: 'Greenhouse public job board API: GET /v1/boards/{token}/jobs, no auth (B6).' },

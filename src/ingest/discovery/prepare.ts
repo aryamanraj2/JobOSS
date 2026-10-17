@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto'
+import { prepareExpandedDiscovery, type expandedHandoff as prepareExpandedHandoffType } from './expanded/run.js'
+import { employerApplicationCandidate as employerWebsite, employerApplicationUrl } from './expanded/parsers.js'
+import { currentCompanyContext } from '../../outreach/review/context.js'
 import type { Prisma } from '../../../generated/prisma/client.js'
 import type { Db } from '../../core/audit/audit-log.js'
 import type { GatedFetcher } from '../../core/interfaces/providers.js'
@@ -17,13 +20,13 @@ import { detectAtsForCompany, saveDetection } from '../ats/detect.js'
 import { atsProviders, ingestPostings } from '../ats/ingest-postings.js'
 import type { AtsVendor } from '../ats/signatures.js'
 
-export type PrepareDiscoveryOptions = { limit: number; runId?: string; now?: Date; resume?: boolean; delayMs?: number }
+export type PrepareDiscoveryOptions = { mode?: 'legacy3' | 'expanded-v1'; limit: number; runId?: string; now?: Date; resume?: boolean; delayMs?: number }
 export type SourceSummary = { source: string; runId: string; status: string; discovered: number;
   counts: Record<string, unknown>; coverage: Record<string, unknown>; errors: string[] }
-export type DiscoverySummary = { batchId: string; companyIds: string[]; sources: SourceSummary[]; runIds: string[]; discovered: number; complete: boolean }
+export type DiscoverySummary = { mode?: 'expanded-v1'; manifestVersion?: string; manifestHash?: string; handoff?: Awaited<ReturnType<typeof prepareExpandedHandoffType>>; batchId: string; companyIds: string[]; sources: SourceSummary[]; runIds: string[]; discovered: number; complete: boolean }
 
 /** Only the selected cohort is refreshed. Missing ATS never blocks company/person research. */
-export async function refreshDiscoveryBoards(db: Db, gate: GatedFetcher, companyIds: string[], opts: { now?: Date; delayMs?: number; limit?: number } = {}) {
+export async function refreshDiscoveryBoards(db: Db, gate: GatedFetcher, companyIds: string[], opts: { now?: Date; delayMs?: number; limit?: number; candidateCareersUrls?: Record<string, string> } = {}) {
   const now = opts.now ?? new Date()
   const limit = opts.limit ?? 20
   if (!Number.isInteger(limit) || limit < 1 || limit > 200 || new Set(companyIds).size > limit) throw new Error('Selected board scope exceeds limit1-200')
@@ -31,7 +34,11 @@ export async function refreshDiscoveryBoards(db: Db, gate: GatedFetcher, company
   const providers = atsProviders(gate)
   for (const company of await db.company.findMany({ where: { id: { in: companyIds } } })) {
     try {
-      const detected = await detectAtsForCompany(db, gate, company, { maxPages: 3,
+      const hint = opts.candidateCareersUrls?.[company.id]
+      const employerHint = hint && employerWebsite(hint), hintDomain = employerHint ? canonicalizeDomain(employerHint) : null
+      const target = !company.careersUrl && employerHint && hintDomain?.ok && hintDomain.domain === company.canonicalDomain
+        ? { ...company, careersUrl: employerHint } : company
+      const detected = await detectAtsForCompany(db, gate, target, { maxPages: 3,
         interPageDelayMs: opts.delayMs ?? 5_000, now: () => now })
       if (!detected.found) { results.push({ companyId: company.id, status: 'no_verified_board', detail: detected.detail, complete: false }); continue }
       await saveDetection(db, company.id, detected.detection, detected.sourceUrl)
@@ -91,6 +98,8 @@ export type BoardRefreshResult = { companyId: string;
 /** Per-source emitted limit; batchId binds all three source scopes. Resume never falls back to unrelated work. */
 export async function prepareDiscovery(db: Db, gate: GatedFetcher, opts: PrepareDiscoveryOptions): Promise<DiscoverySummary> {
   if (!Number.isInteger(opts.limit) || opts.limit < 1 || opts.limit > 200) throw new Error('discovery limit must be an integer between1 and200')
+  if (opts.mode === 'expanded-v1') return prepareExpandedDiscovery(db, gate, opts, storeCandidate)
+  if (opts.mode !== undefined && opts.mode !== 'legacy3') throw new Error('Unsupported discovery mode')
   const now = opts.now ?? new Date()
   if (!Number.isFinite(now.getTime())) throw new Error('Invalid discovery observation time')
   let batchId = opts.runId
@@ -102,7 +111,7 @@ export async function prepareDiscovery(db: Db, gate: GatedFetcher, opts: Prepare
   batchId ??= randomUUID()
   if (!/^[A-Za-z0-9_-]{1,100}$/.test(batchId)) throw new Error('Invalid discovery batchId')
   const existing = await db.discoveryRun.findMany({ where: { coverage: { path: ['batchId'], equals: batchId } } })
-  if (opts.resume ? existing.length !== 3 || new Set(existing.map((r) => r.source)).size !== 3 : existing.length > 0) {
+  if (opts.resume ? existing.length !== 3 || new Set(existing.map((r) => r.source)).size !== 3 || existing.some((r) => !['yc', 'startupdb', 'hn'].includes(r.source) || object(r.coverage).manifest !== undefined) : existing.length > 0) {
     throw new Error(opts.resume ? 'Unknown/incomplete discovery batchId; no unrelated resume performed' : 'Discovery batchId already exists; use resume')
   }
   const createRuns = (client: Db) => Promise.all(['yc', 'startupdb', 'hn'].map((source) => client.discoveryRun.create({
@@ -194,4 +203,47 @@ export async function prepareDiscovery(db: Db, gate: GatedFetcher, opts: Prepare
   const companyIds = [...new Set(sources.flatMap((s) => s.coverage.companyIds as string[]))]
   return { batchId, companyIds, sources, runIds: sources.map((s) => s.runId), discovered: companyIds.length,
     complete: sources.every((s) => s.status === 'completed') }
+}
+
+/** Explicit downstream step; discovery itself does not schedule employer fetches.
+ * Source application URLs are candidates only. Exact current employer ATS rows still determine listed intent. */
+export async function refreshExpandedListingBoards(db: Db, gate: GatedFetcher, summary: DiscoverySummary,
+  opts: { companyIds: string[]; now?: Date; limit?: number; delayMs?: number }) {
+  if (summary.mode !== 'expanded-v1' || !summary.handoff) throw new Error('Expanded handoff required')
+  const now = opts.now ?? new Date(), ids = [...new Set(opts.companyIds)]
+  if (ids.some((id) => !summary.companyIds.includes(id))) throw new Error('Listing verification IDs must belong to this discovery scope')
+  const current = await db.company.findMany({ where: { id: { in: ids } }, include: { outreachAssessment: true } })
+  const blocked = ids.flatMap((companyId) => {
+    const company = current.find((c) => c.id === companyId)
+    return !company ? [{ companyId, reason: 'missing_company', detail: 'Selected company no longer exists.' }]
+      : company.status === 'excluded' || /^(?:stopped|excluded|rejected|closed|paused)$/.test(company.outreachAssessment?.status ?? '')
+        ? [{ companyId, reason: 'operator_stopped', detail: 'Current stored company/assessment stop blocks X listing refresh selection; no refresh was attempted.' }] : []
+  })
+  const items = summary.handoff.items.filter((i) => ids.includes(i.companyId) && i.listingHints.length && !blocked.some((b) => b.companyId === i.companyId))
+  const candidateCareersUrls: Record<string, string> = {}
+  for (const item of items) {
+    const candidates = item.applicationUrlCandidates.filter((u) => {
+      const domain = canonicalizeDomain(u)
+      return employerApplicationUrl(u, item.domain) && domain.ok && domain.domain === item.domain
+    })
+    if (new Set(candidates).size === 1) candidateCareersUrls[item.companyId] = candidates[0]!
+  }
+  const refreshed = await refreshDiscoveryBoards(db, gate, items.map((i) => i.companyId), { now, limit: opts.limit ?? 20,
+    delayMs: opts.delayMs ?? 5_000, candidateCareersUrls })
+  const listingChecks = []
+  for (const item of items) {
+    const context = await currentCompanyContext(db, item.companyId, now)
+    for (const hint of item.listingHints) {
+      const listing = object(hint)
+      const roles = context?.currentRoles.filter((r) => r.title === listing.title &&
+        (r.roleUrl === listing.applicationUrl || r.roleUrl === listing.url)) ?? []
+      listingChecks.push({ companyId: item.companyId, listingUrl: listing.url,
+        status: roles.length === 1 ? 'current_employer_role_verified' : 'external_listing_not_accepted_ats_support',
+        opportunityId: roles.length === 1 ? roles[0]!.id : null,
+        detail: roles.length === 1 ? 'Exact URL/title bound to current unchanged employer-owned ATS support; D still checks the existing association and all readiness requirements.'
+          : 'No unique exact current employer ATS URL/title binding; do not switch this listed inquiry to speculative.',
+      })
+    }
+  }
+  return { refreshed, listingChecks, blocked, taskIds: [], automaticExecution: 'isolation_blocked' }
 }

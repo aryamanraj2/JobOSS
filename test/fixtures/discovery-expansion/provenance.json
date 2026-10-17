@@ -1,0 +1,18 @@
+{
+  "label": "synthetic \u2014 NOT captured publisher markup or access proof",
+  "createdAt": "2026-10-16",
+  "origin": "Offline fixtures authored for X; source URLs/scopes from docs/JOBOSS-DISCOVERY-SOURCE-EXPANSION.md dated 2026-10-15. YC jobs URL is public entry candidate, unverified here.",
+  "shape": "schema.org ItemList/Organization/JobPosting and semantic article with labelled Website. These standards/semantic shapes are parser contracts, not claims about current sites.",
+  "files": [
+    "yc-jobs.html",
+    "southparkcommons-companies.html",
+    "alchemist-highlights.html",
+    "alchemist-class29.html",
+    "ef-companies.html",
+    "masschallenge-ch-uk-2026.html",
+    "masschallenge-us-2023.html",
+    "seedcamp-companies.html",
+    "seedcamp-talent.html"
+  ],
+  "remaining": "Authorized retained public representations, redirects/pagination, robots/terms and independent review before any live-source correctness/completeness claim."
+}

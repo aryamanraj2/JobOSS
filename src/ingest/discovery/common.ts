@@ -33,7 +33,7 @@ export const waitForSource = (ms: number): Promise<void> => ms > 0
   ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve()
 
 export type DiscoveryCandidate = {
-  source: 'startupdb' | 'hn' | 'yc'
+  source: 'startupdb' | 'hn' | 'yc' | 'southparkcommons' | 'alchemist' | 'ef' | 'masschallenge' | 'seedcamp'
   externalId: string
   companyName: string
   website: string
@@ -41,9 +41,17 @@ export type DiscoveryCandidate = {
   text: string
   publishedAt: Date | null
   raw: Record<string, unknown>
+  provenance?: DiscoveryProvenance
   contactEmails?: string[]
   investor?: { name: string; domain: string }
   funding?: Record<string, unknown>[]
 }
 
 export type CandidateHandler = (candidate: DiscoveryCandidate) => Promise<void | boolean>
+
+/** Index relationships and listing hints never establish ATS ownership or draft support. */
+export type DiscoveryProvenance = {
+  route: string; profileUrl: string | null; relationship: string; mode: 'company_seed' | 'listed_hint'
+  period: string | null; periodPrecision: string
+  listing: { title: string; url: string; applicationUrl: string | null; observedAt: string; publishedAt: string; validThrough?: string | null; currentVerification: string } | null
+}
