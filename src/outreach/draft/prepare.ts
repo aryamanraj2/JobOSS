@@ -1,3 +1,4 @@
+import { beginPreparationSelection, currentSelectionError, preparationTransaction, type PreparationSelection } from '../preparation/selection.js'
 import type { Db } from '../../core/audit/audit-log.js'
 import { isStandaloneDatabaseClient } from '../../core/joboss/database-scope.js'
 import { writeAudit } from '../../core/audit/audit-log.js'
@@ -20,7 +21,7 @@ export { hasConcreteHook } from '../review/context.js'
 export type PrepareDraftsResult = { draftIds: string[]; taskIds: string[]; blockers: { companyId: string; reason: string; detail: string }[] }
 export type PrepareDraftsOptions = { companyIds: string[]; limit: number; now?: Date; upgradeExisting?: boolean;
   /** Explicit operator/integration campaign, required only when no association exists. Never inferred to evade dedup. */
-  campaignCycle?: string; additionalContacts?: number; reviseDraftId?: string }
+  campaignCycle?: string; preparationSelection?: PreparationSelection; additionalContacts?: number; reviseDraftId?: string }
 
 /** Resume only identifiable JOBOSS revisions with the exact current work. Original rows are never updated.
  * Companies 1-100, contacts 1-6 per company (default strongest only); tasks enqueue but never execute. */
@@ -30,6 +31,11 @@ export async function prepareOutreachDrafts(db: Db, opts: PrepareDraftsOptions):
   for (const companyId of [...new Set(opts.companyIds)].slice(0, limit)) {
     const prepare = async (tx: Db) => {
       await lockDMutation(tx)
+      if (opts.preparationSelection) {
+        const problem = await beginPreparationSelection(tx, opts.preparationSelection, opts.companyIds, opts.campaignCycle) ??
+          await currentSelectionError(tx, opts.preparationSelection, now)
+        if (problem) { out.blockers.push({ companyId, reason: problem, detail: 'Exact preparation selection is blocked; existing history is preserved.' }); return }
+      }
       await tx.$queryRaw`SELECT id FROM company WHERE id = ${companyId} FOR UPDATE`
       const context = await currentCompanyContext(tx, companyId, now)
       const block = (reason: string, detail: string) => out.blockers.push({ companyId, reason, detail })
@@ -37,7 +43,7 @@ export async function prepareOutreachDrafts(db: Db, opts: PrepareDraftsOptions):
       const { company, assessment, currentEvidence, currentRoles } = context
       const saved = company.outreachAssessment
       if (saved && /^(?:stopped|excluded|rejected|closed|paused)$/.test(saved.status)) { block('operator_stopped', 'Preparation is stopped by the operator.'); return }
-      const contacts = await tx.contact.findMany({ where: { companyId }, orderBy: { id: 'asc' } })
+      const contacts = await tx.contact.findMany({ where: { companyId, ...(opts.preparationSelection ? { id: opts.preparationSelection.contactId } : {}) }, orderBy: { id: 'asc' } })
       const ordered = contacts.sort((a, b) => (a.id === saved?.selectedContactId ? -1 : b.id === saved?.selectedContactId ? 1 :
         recipientSuitability(a).priority - recipientSuitability(b).priority || a.id.localeCompare(b.id)))
       const reachable = []
@@ -61,10 +67,10 @@ export async function prepareOutreachDrafts(db: Db, opts: PrepareDraftsOptions):
       if (lead?.leadKind === 'posted_role' && !currentRoles.some((r) => r.id === lead!.opportunityId)) { block('listed_role_not_current', 'Existing listed-role association lacks a current owned unchanged posting.'); return }
       if (!lead) {
         if (!opts.campaignCycle?.trim()) { block('campaign_cycle_required', 'Supply the authorized campaignCycle to create a new speculative association.'); return }
-        lead = await tx.lead.create({ data: { companyId, leadKind: 'speculative', status: 'candidate', primaryTrack: assessment.primaryTrack!,
-          primaryTrackReason: 'JOBOSS D speculative association from current primary outreach fit; no application assessment or score was produced.',
+        lead = await tx.lead.create({ data: { companyId, leadKind: opts.preparationSelection?.intent === 'listed' ? 'posted_role' : 'speculative', ...(opts.preparationSelection?.opportunityId ? { opportunityId: opts.preparationSelection.opportunityId } : {}), status: 'candidate', primaryTrack: assessment.primaryTrack!,
+          primaryTrackReason: opts.preparationSelection?.intent === 'listed' ? 'Explicit preparation selection of a current verified role; no application assessment or score was produced.' : 'JOBOSS D speculative association from current primary outreach fit; no application assessment or score was produced.',
           campaignCycle: opts.campaignCycle, citedEvidenceIds: assessment.citedEvidenceIds } })
-        await writeAudit(tx, { actorType: 'system', actorId: 'outreach-preparation', action: 'lead.speculative_association_created', subjectType: 'Lead', subjectId: lead.id,
+        await writeAudit(tx, { actorType: 'system', actorId: 'outreach-preparation', action: opts.preparationSelection?.intent === 'listed' ? 'lead.listed_association_created' : 'lead.speculative_association_created', subjectType: 'Lead', subjectId: lead.id,
           metadata: { companyId, campaignCycle: lead.campaignCycle, fitEvidenceIds: assessment.fit.evidenceIds, scoringPerformed: false } })
       }
       const primaryContactId = saved?.selectedContactId ?? reachable[0]!.contact.id
@@ -129,7 +135,8 @@ export async function prepareOutreachDrafts(db: Db, opts: PrepareDraftsOptions):
         if (!gated.ok) block('readiness_blocked', gated.detail)
       }
     }
-    if (isStandaloneDatabaseClient(db)) await db.$transaction(prepare, { timeout: 30_000 })
+    if (isStandaloneDatabaseClient(db) && opts.preparationSelection) await preparationTransaction(db, prepare, companyId, out)
+    else if (isStandaloneDatabaseClient(db)) await db.$transaction(prepare, { timeout: 30_000 })
     else await prepare(db)
   }
   return out

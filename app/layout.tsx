@@ -21,6 +21,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
               hard-disabled until F5.
             </p>
           </header>
+          <nav><a href="/preparation">Preparation runs</a> · <a href="/outreach">Outreach review</a></nav>
           {children}
         </div>
       </body>

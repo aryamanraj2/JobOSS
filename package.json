@@ -45,6 +45,7 @@
     "gmail:auth": "tsx tools/gmail-auth.ts",
     "send:test": "tsx tools/send-test.ts",
     "send:run": "tsx tools/run-send.ts",
+    "outreach:prepare": "tsx tools/run-outreach-prepare.ts",
     "inbox:sync": "tsx tools/run-inbox.ts",
     "verify:f5": "tsx tools/verify-f5.ts"
   },

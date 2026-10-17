@@ -23,6 +23,9 @@ export async function lockReservationSnapshot(db: Db, snapshot: Awaited<ReturnTy
     if (draft.resumeVersionId) await db.$queryRaw`SELECT id FROM resume_version WHERE id = ${draft.resumeVersionId} FOR UPDATE NOWAIT`
     await db.$queryRaw`SELECT id FROM lead WHERE id = ${draft.leadId} FOR UPDATE NOWAIT`
     if (snapshot.profile) await db.$queryRaw`SELECT id FROM candidate_profile WHERE id = ${snapshot.profile.id} FOR UPDATE NOWAIT`
+    // Pre-acquire SendAttempt's company FK lock: table SHARE alone permits a
+    // plain FOR UPDATE holder that would otherwise block the later FK check.
+    await db.$queryRaw`SELECT id FROM company WHERE id = ${draft.lead.companyId} FOR KEY SHARE NOWAIT`
     return
   }
   await db.$queryRaw`SELECT id FROM draft WHERE id = ${draft.id} FOR UPDATE`
