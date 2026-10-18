@@ -24,8 +24,8 @@ it('expanded production mode refuses a legacy three-source resume', async () => 
 
 import { mkdirSync, writeFileSync, readFileSync } from 'node:fs'
 import { contentHashOf } from '../../src/core/evidence/content-hash.js'
-import { EXPANDED_ROUTES } from '../../src/ingest/discovery/expanded/registry.js'
-import { responses, syntheticGate, html, org } from '../fixtures/discovery-expansion/fixtures.js'
+import { EXPANDED_ROUTES, routeRunnable } from '../../src/ingest/discovery/expanded/registry.js'
+import { spcDetail, responses, syntheticGate, html, org } from '../fixtures/discovery-expansion/fixtures.js'
 import { rankOutreachCompanies } from '../../src/intel/outreach/assess.js'
 import { FetchPolicyGate } from '../../src/core/policy/fetch-policy-gate.js'
 import { seedHostPolicies } from '../../src/core/policy/host-policy.js'
@@ -46,10 +46,15 @@ const record = (name: string, data: unknown) => { mkdirSync(EVIDENCE, { recursiv
 
 it('uses all production adapters, deduplicates direct/indirect portfolios, retains zero-priority IDs and exact provenance', async () => {
   const gate = syntheticGate(), result = await prepareDiscovery(db, gate, options)
-  expect(result.sources).toHaveLength(15); expect(result.discovered).toBe(4); expect(await db.company.count()).toBe(4)
-  for (const r of EXPANDED_ROUTES.filter((r) => r.url && ['directory', 'jobs'].includes(r.kind))) {
+  expect(result.sources).toHaveLength(EXPANDED_ROUTES.length); expect(result.discovered).toBe(4); expect(await db.company.count()).toBe(4)
+  // SX1: only routes whose pre-flight access permits requests run; SPC listing rows never establish identity (Part B 4, 5-7, 10).
+  for (const r of EXPANDED_ROUTES.filter((r) => r.url && ['directory', 'jobs'].includes(r.kind) && routeRunnable(r) && r.id !== 'southparkcommons:companies')) {
     expect(gate.requested).toContain(r.url); expect(source(result, r.id).discovered).toBe(1)
     expect(source(result, r.id).status).toBe('unverified'); expect(source(result, r.id).coverage.scopeComplete).toBe(true)
+  }
+  expect(gate.requested).toContain(route('southparkcommons:companies').url); expect(source(result, 'southparkcommons:companies').discovered).toBe(0)
+  for (const r of EXPANDED_ROUTES.filter((r) => r.url && !routeRunnable(r))) {
+    expect(gate.requested).not.toContain(r.url); expect(source(result, r.id)).toMatchObject({ status: r.access, discovered: 0, coverage: { reason: r.access } })
   }
   expect(source(result, 'yc:companies').discovered).toBe(4)
   expect(source(result, 'startupdb').discovered).toBe(1); expect(source(result, 'hn').discovered).toBe(1)
@@ -57,7 +62,7 @@ it('uses all production adapters, deduplicates direct/indirect portfolios, retai
   const acme = await db.company.findUniqueOrThrow({ where: { canonicalDomain: 'acme.example' } })
   expect(await db.contact.count()).toBe(0); expect(await db.opportunity.count()).toBe(0); expect(await db.fundingRecord.count()).toBe(0)
   const allRecords = result.sources.flatMap((s) => Array.isArray(s.coverage.records) ? s.coverage.records : [])
-  expect(allRecords.filter((r) => (r as { companyId: string }).companyId === acme.id).length).toBeGreaterThanOrEqual(12)
+  expect(allRecords.filter((r) => (r as { companyId: string }).companyId === acme.id).length).toBeGreaterThanOrEqual(6)
   expect(source(result, 'seedcamp:companies').coverage.records).toEqual(expect.arrayContaining([expect.objectContaining({
     publishedAt: null, provenance: expect.objectContaining({ period: '2018', relationship: 'investment_portfolio' }), primaryFitEvidence: false, employerAtsOwnership: false,
   })]))
@@ -110,7 +115,7 @@ it('partial YC resumes by stable IDs/hashes across reorder, exposes pending olde
   expect(source(changed, 'yc:companies').discovered).toBe(2)
 })
 it('a frozen partial public page survives changed live ordering/content without refetch or losing pending entries', async () => {
-  const pages = responses(), r = route('ef:companies')
+  const pages = responses(), r = route('seedcamp:companies') // SX1: EF is unavailable (never requested); Seedcamp carries this coverage
   pages[r.url!] = { body: html([org(), org('Second', 'https://second.example')]) }
   const first = await prepareDiscovery(db, new StubFetcher(pages), { ...options, limit: 1 })
   expect(source(first, r.id).status).toBe('partial')
@@ -120,7 +125,7 @@ it('a frozen partial public page survives changed live ordering/content without 
   expect(next.companyIds).toContain((await db.company.findUniqueOrThrow({ where: { canonicalDomain: 'second.example' } })).id)
 })
 it.each(['beforeEvidence', 'afterEvidence', 'afterProvenance', 'cursor'])('replays/repairs %s crash without losing provenance or advancing cursor early', async (point) => {
-  const r = route('ef:companies'), pages = responses()
+  const r = route('seedcamp:companies'), pages = responses() // SX1: EF is unavailable; Seedcamp carries this coverage
   pages[r.url!] = { body: html([org('Repair', 'https://repair.example')]) }
   const originalUpdate = db.discoveryRun.update.bind(db.discoveryRun)
   let fired = false
@@ -214,17 +219,26 @@ it('all eight added exact hosts reach production adapters through robots and pos
   for (const host of hosts) {
     const r = EXPANDED_ROUTES.find((r) => r.hosts.includes(host) && ['jobs', 'directory'].includes(r.kind))!
     const url = new URL(r.url!)
+    if (!routeRunnable(r)) {
+      const gate = realGate(), audit = await db.auditLog.count()
+      await expect(publicPage(boundedSourceGate(gate, r, 0).gate, r.url!, r)).rejects.toMatchObject({ reason: r.access })
+      expect(await db.auditLog.count()).toBe(audit)
+      expect(await db.hostPolicy.findFirst({ where: { host } })).toMatchObject({ includeSubdomains: false })
+      continue
+    }
     mockAgent.get(url.origin).intercept({ path: '/robots.txt' }).reply(200, 'User-agent: *\nAllow: /\n')
     mockAgent.get(url.origin).intercept({ path: url.pathname + url.search }).reply(200, html([org()]))
-    expect((await publicPage(boundedSourceGate(realGate(), r, 0).gate, r.url!, r)).html).toContain('Acme')
+    let t = NOW.getTime()
+    const gate = realGate(NOW, new HostRateLimiter(5000, () => t), async ms => { t += ms })
+    expect((await publicPage(boundedSourceGate(gate, r, 0).gate, r.url!, r)).html).toContain('Acme')
     expect(await db.hostPolicy.findFirst({ where: { host } })).toMatchObject({ includeSubdomains: false })
   }
   const after = await db.researchBudget.findFirstOrThrow({ where: { companyId: null } })
-  expect(after.creditsSpent - before.creditsSpent).toBe(hosts.length)
+  expect(after.creditsSpent - before.creditsSpent).toBe(hosts.filter(host => EXPANDED_ROUTES.some(r => r.hosts.includes(host) && routeRunnable(r) && ['jobs', 'directory'].includes(r.kind))).length)
 }, 60_000) // Eight fresh robots/content pairs now include the mandatory 5s gaps.
 it.each(['deny', 'robots', 'terms', 'budget', 'rate'])('expanded page real gateway refuses %s before page transport', async (kind) => {
   await policySetup(kind === 'budget' ? 0 : 20)
-  const r = route({ deny: 'southparkcommons:companies', robots: 'ef:companies', terms: 'seedcamp:companies', budget: 'masschallenge:ch-uk-2026', rate: 'masschallenge:us-2023' }[kind]!), url = new URL(r.url!); url.searchParams.set('probe', kind); let pageCalls = 0
+  const r = route({ deny: 'southparkcommons:companies', robots: 'seedcamp:companies', terms: 'seedcamp:companies', budget: 'seedcamp:companies', rate: 'seedcamp:companies' }[kind]!), url = new URL(r.url!); url.searchParams.set('probe', kind); let pageCalls = 0
   mockAgent.get(url.origin).intercept({ path: url.pathname + url.search }).reply(() => { pageCalls++; return { statusCode: 200, data: html([org()]) } }).times(kind === 'rate' ? 2 : 1)
   if (kind === 'deny') await db.hostPolicy.updateMany({ where: { host: url.hostname }, data: { mode: 'deny' } })
   if (kind === 'terms') await db.hostPolicy.updateMany({ where: { host: url.hostname }, data: { termsProhibited: true } })
@@ -243,7 +257,7 @@ it('exact host additions do not trust vault, apex aliases, vendor APIs or arbitr
 })
 it('real source 429 preserves retry-after/cursor and real redirect target denial cannot open a page socket', async () => {
   await policySetup()
-  const r = route('ef:companies'), url = new URL(r.url!)
+  const r = route('seedcamp:companies'), url = new URL(r.url!)
   mockAgent.get(url.origin).intercept({ path: '/robots.txt' }).reply(200, 'User-agent: *\nAllow: /\n')
   mockAgent.get(url.origin).intercept({ path: url.pathname }).reply(429, '', { headers: { 'retry-after': '37' } })
   await expect(publicPage(boundedSourceGate(realGate(), r, 0).gate, r.url!, r)).rejects.toMatchObject({ reason: 'source_rate_limited', retryAfterSeconds: 37 })
@@ -264,6 +278,10 @@ it('CLI maps only the explicit expanded option to the production callable mode',
 it('whole expanded prepare path uses the real policy/transport seam for all supported source adapters', async () => {
   await policySetup(200)
   const pages = responses(), seen: string[] = [], origins = new Set<string>()
+  const spc = route('southparkcommons:companies'), detail = 'https://www.southparkcommons.com/companies/acme'
+  pages[spc.url!] = { body: '<html><body><article><h2><a href="/companies/acme">Acme</a></h2></article></body></html>' }
+  pages[detail] = { body: spcDetail() }
+  pages[route('yc:hiring').url!] = { body: JSON.stringify([{ id: 1, name: 'Acme', website: 'https://acme.example', isHiring: true }]) }
   for (const [href, response] of Object.entries(pages)) {
     const url = new URL(href)
     if (!origins.has(url.origin)) { mockAgent.get(url.origin).intercept({ path: '/robots.txt' }).reply(200, 'User-agent: *\nAllow: /\n'); origins.add(url.origin) }
@@ -273,14 +291,19 @@ it('whole expanded prepare path uses the real policy/transport seam for all supp
   const clock = () => elapsed
   const gate = realGate(NOW, new HostRateLimiter(5000, clock), async (ms) => { elapsed += ms })
   // Advancing a synthetic clock represents waiting; the actual limiter, robots, terms, budget and raw-client all still run.
-  const guarded = { check: gate.check.bind(gate), fetchText: (async (...args: Parameters<typeof gate.fetchText>) => { elapsed += 6000; return gate.fetchText(...args) }) }
+  const guarded = { check: gate.check.bind(gate), fetchSourceText: (async (...args: Parameters<typeof gate.fetchSourceText>) => { elapsed += 6000; return gate.fetchSourceText(...args) }), fetchText: (async (...args: Parameters<typeof gate.fetchText>) => { elapsed += 6000; return gate.fetchText(...args) }) }
   const result = await prepareDiscovery(db, guarded, options)
   record('synthetic-real-gateway-debug', { result, seen })
   expect(result.discovered).toBe(4)
+  // SX1: non-runnable routes are never requested; SPC listing rows need detail pages for identity.
   for (const r of EXPANDED_ROUTES.filter((r) => r.url && r.kind !== 'unavailable')) {
-    expect(source(result, r.id).discovered).toBeGreaterThan(0)
+    if (!routeRunnable(r)) { expect(seen).not.toContain(r.url); expect(source(result, r.id).status).toBe(r.access); continue }
+    expect(source(result, r.id).discovered, r.id).toBeGreaterThan(0)
     if (r.kind === 'directory' || r.kind === 'jobs') expect(seen).toContain(r.url)
   }
+  expect(seen).toContain(detail)
+  expect(source(result, spc.id).coverage.records).toEqual(expect.arrayContaining([expect.objectContaining({ sourceUrl: detail, raw: expect.objectContaining({ detailUrl: detail }), provenance: expect.objectContaining({ route: spc.id }) })]))
+  expect(source(result, 'yc:hiring').coverage.records).toEqual(expect.arrayContaining([expect.objectContaining({ provenance: expect.objectContaining({ mode: 'company_seed', listing: null }), raw: expect.objectContaining({ hiringSignal: 'yc_oss_hiring_feed_listing_signal_not_job_posting' }) })]))
   const budget = await db.researchBudget.findFirstOrThrow({ where: { companyId: null } })
   expect(budget.creditsSpent).toBe(seen.length)
   record('synthetic-real-gateway', { result, seen, creditsSpent: budget.creditsSpent, liveRetrieval: false, network: 'MockAgent.disableNetConnect; synthetic public shapes' })
@@ -288,15 +311,18 @@ it('whole expanded prepare path uses the real policy/transport seam for all supp
 it('dynamic/auth shells, missing domain and failed source routes remain explicit in production summaries', async () => {
   const pages = responses()
   pages[route('alchemist:highlights').url!] = { body: '<html><body>Loading...<button>Load more</button></body></html>' }
-  pages[route('yc:jobs').url!] = { body: '<html><body><input type="password"></body></html>' }
-  pages[route('ef:companies').url!] = { body: html([org('No domain', 'https://www.joinef.com')]) }
+  // SX1: yc:jobs and EF are never requested; the auth shell and missing-domain cases move to SPC and Seedcamp.
+  pages[route('southparkcommons:companies').url!] = { body: '<html><body><input type="password"></body></html>' }
+  pages[route('seedcamp:companies').url!] = { body: html([org('No domain', 'https://seedcamp.com')]) }
   pages[route('seedcamp:talent').url!] = { body: '', statusCode: 429, headers: { 'retry-after': '61' } }
-  const result = await prepareDiscovery(db, new StubFetcher(pages), options)
+  const gate = new StubFetcher(pages), result = await prepareDiscovery(db, gate, options)
   expect(source(result, 'alchemist:highlights').coverage).toMatchObject({ scopeComplete: false, limitations: expect.arrayContaining(['dynamic_empty_or_changed_representation']) })
-  expect(source(result, 'yc:jobs').coverage).toMatchObject({ scopeComplete: false, limitations: ['access_blocked'] })
-  expect(source(result, 'ef:companies').coverage.unresolved).toEqual(expect.arrayContaining([expect.objectContaining({ reason: 'company_website_missing_or_foreign' })]))
+  expect(source(result, 'yc:jobs')).toMatchObject({ status: 'access_blocked', coverage: { scopeComplete: false, reason: 'access_blocked' } })
+  expect(source(result, 'ef:companies')).toMatchObject({ status: 'unavailable', coverage: { scopeComplete: false, reason: 'unavailable' } })
+  expect(gate.requested.filter((u) => u === route('yc:jobs').url || u === route('ef:companies').url)).toEqual([])
+  expect(source(result, 'southparkcommons:companies')).toMatchObject({ status: 'access_blocked', coverage: { scopeComplete: false, limitations: ['access_blocked'] } })
+  expect(source(result, 'seedcamp:companies').coverage.unresolved).toEqual(expect.arrayContaining([expect.objectContaining({ reason: 'company_website_missing_or_foreign' })]))
   expect(source(result, 'seedcamp:talent')).toMatchObject({ status: 'paused', coverage: { retryAfterSeconds: 61, reason: 'source_rate_limited' } })
-  expect(source(result, 'southparkcommons:companies').discovered).toBe(1)
   record('synthetic-source-blockers', result)
 })
 it('same-domain distinct YC record IDs refuse identity merge, and public source duplication does not starve pending employers', async () => {
@@ -317,10 +343,12 @@ import { job } from '../fixtures/discovery-expansion/fixtures.js'
 import { syntheticJob } from '../fixtures/discovery-support.js'
 it('explicit expanded listing handoff passes employer application candidates into unchanged board verification and retains exact-role gaps', async () => {
   const pages = responses(), applicationUrl = 'https://job-boards.greenhouse.io/acme/jobs/mobile-1'
-  pages[route('yc:jobs').url!] = { body: html([job({ applicationUrl, title: 'iOS Engineer Intern' })]) }
+  // SX1: yc:jobs is never requested; the unbound external listing rides on seedcamp:talent beside its bound role.
+  const talent = route('seedcamp:talent')
+  pages[talent.url!] = { body: html([org(), job({ url: 'https://talent.seedcamp.com/jobs/mobile-1' }), job({ identifier: { value: 'intern-1' }, applicationUrl, title: 'iOS Engineer Intern' })]) }
   const result = await prepareDiscovery(db, new StubFetcher(pages), options)
   const acme = await db.company.findUniqueOrThrow({ where: { canonicalDomain: 'acme.example' } })
-  expect(source(result, 'yc:jobs').coverage.unresolved).toEqual(expect.arrayContaining([expect.objectContaining({ reason: 'listing_not_proven_current_or_bound' })]))
+  expect(source(result, 'seedcamp:talent').coverage.unresolved).toEqual(expect.arrayContaining([expect.objectContaining({ reason: 'listing_not_proven_current_or_bound' })]))
   // Independent synthetic mapping input, not parser-promoted ATS ownership or source binding.
   result.handoff!.items.find((i) => i.companyId === acme.id)!.listingHints.push({ title: 'iOS Engineer Intern', url: 'https://www.ycombinator.com/jobs/mobile-1', applicationUrl })
   const gate = new StubFetcher({ 'https://acme.example/careers/mobile': { body: '<a href="https://job-boards.greenhouse.io/acme">Open roles</a>' },

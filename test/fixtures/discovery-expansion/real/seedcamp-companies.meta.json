@@ -1,0 +1,33 @@
+{
+  "label": "real-format trimmed fixture: saved first-party pre-flight bytes; whole records removed only, no markup rewritten",
+  "sourceFile": "scratch/joboss-source-access-preflight-01-20261018-a/raw/https_seedcamp_com_our_companies_",
+  "sourceSha256": "4bef4f5092d6fff120bbffa48f03c237a95a1c275b4f8de7ff34f31ad41302c8",
+  "sourceBytes": 441635,
+  "preflight": "docs/JOBOSS-SOURCE-ACCESS-PREFLIGHT-01.md (18 Oct 2026, root, plain GET, joboss-preflight/1)",
+  "fixtureSha256": "f094c60b1b92bea1cd264f56d11588e7b1ddaba8a896ae20644b57212307c5e1",
+  "fixtureBytes": 65864,
+  "selection": {
+    "records": "company__item cards",
+    "kept": [
+      "Solvera",
+      "Vessla",
+      "Waniwani",
+      "Wexler",
+      "Linkup",
+      "Fiat Republic",
+      "Wise",
+      "Caveman"
+    ],
+    "removed": 310,
+    "sourceCards": 318,
+    "sourceCardsWithWebsiteLink": 316
+  },
+  "expected": {
+    "candidates": 6,
+    "unresolved": [
+      "Solvera",
+      "Caveman"
+    ],
+    "note": "Linkup and Fiat Republic carry the source quirk \"Link to {name} &#039;s website\" (space before the apostrophe)"
+  }
+}

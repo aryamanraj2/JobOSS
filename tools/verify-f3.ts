@@ -13,6 +13,7 @@
  *     because the operator accepting and submitting them is the milestone WORKING.
  */
 import 'dotenv/config'
+import { maskDirectArrayString } from './passive-domain-mask.js'
 import { execFileSync } from 'node:child_process'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
@@ -20,6 +21,12 @@ import { prisma, disconnectPrisma } from '../src/core/db/client.js'
 import { MILESTONE_STAGE, isAtOrAfter } from '../src/core/config/stage.js'
 import { reachableReasonCodes } from '../src/core/reason-codes/registry.js'
 import { PrefilledAnswers } from '../src/apply/packet/answers.js'
+
+/** Same narrow passive-list boundary as the H8 policy checker. */
+function passiveIdentityClassification(file: string, source: string): string {
+  if (file !== 'src/ingest/discovery/hn.ts') return source
+  return maskDirectArrayString(source, 'APPLICATION_DOMAINS', 'applytojob.com')
+}
 
 type Check = { name: string; ok: boolean; detail: string }
 const checks: Check[] = []
@@ -170,7 +177,7 @@ const db = prisma()
     /\b(submitApplication|autoApply|applyToJob|postApplication|sendApplication|submitToAts)\b/i,
   ]
   const hits = files.filter((f) => {
-    const text = readFileSync(f, 'utf8')
+    const text = passiveIdentityClassification(f.slice(process.cwd().length + 1), readFileSync(f, 'utf8'))
     return forbidden.some((p) => p.test(text))
   })
   // A named allowlist rather than a count. F3 wrote `<= 1` because exactly one caller

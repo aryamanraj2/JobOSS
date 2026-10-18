@@ -37,6 +37,60 @@ function pageFinished(response: Record<string, unknown>, length: number, offset:
       (!length && total > offset)) throw new Error('Missing/inconsistent pagination total; coverage undetermined')
   return offset + length >= total
 }
+/** CC BY 4.0 covers StartupDB facts, not descriptions or third-party text: keep only round facts. */
+export function fundingFacts(round: Record<string, unknown>): Record<string, unknown> {
+  const amount = object(round.amount)
+  return Object.fromEntries(Object.entries({ eventId: round.eventId, kind: round.kind, roundLabel: round.roundLabel, eventDate: round.eventDate,
+    dateMeaning: round.dateMeaning, amount: round.amount === undefined ? undefined : { original: amount.original, currency: amount.currency },
+    participants: Array.isArray(round.participants) ? round.participants.map((p) => ({ name: object(p).name, role: object(p).role, slug: object(p).slug })) : undefined,
+    sourceUrls: round.sourceUrls }).filter(([, v]) => v !== undefined).map(([k, v]) => [k, JSON.parse(JSON.stringify(v))]))
+}
+/** StartupDB reusable storage is an allowlist of dataset facts, including resumed state. */
+const pick = (row: Record<string, unknown>, keys: string[]) => Object.fromEntries(keys.filter(k => row[k] !== undefined).map(k => [k, row[k]]))
+const relationshipFacts = (value: unknown) => value == null ? null : pick(object(value), ['type', 'status', 'investmentYear', 'roundLabel', 'eventId'])
+const startupEntryFacts = (value: unknown) => {
+  const row = object(value)
+  return { ...pick(row, ['name', 'slug', 'domain', 'websiteUrl']), ...(row.relationship === undefined ? {} : { relationship: relationshipFacts(row.relationship) }) }
+}
+export function startupDbFacts(value: unknown): Record<string, unknown> {
+  const row = object(value), profile = object(row.profile)
+  return { ...pick(row, ['name', 'slug', 'domain', 'websiteUrl', 'fundingHistoryTotal', 'license', 'licenseScope', 'attribution']),
+    ...(row.profile === undefined ? {} : { profile: Object.fromEntries(['productTechnologyTags', 'sectorTags', 'productsAndServices'].filter(k => profile[k] !== undefined)
+      .map(k => [k, array(profile[k]).map(v => pick(object(v), ['value']))])) }),
+    ...(Array.isArray(row.fundingHistory) ? { fundingHistory: row.fundingHistory.map(object).map(fundingFacts) } : {}) }
+}
+export function startupDbText(raw: Record<string, unknown>): string {
+  const profile = object(raw.profile)
+  return [...array(profile.productTechnologyTags), ...array(profile.sectorTags), ...array(profile.productsAndServices)]
+    .map(v => str(object(v).value)).filter(Boolean).join(', ')
+}
+export function sanitizeStartupDbCursor<T extends Record<string, unknown>>(cursor: T): T {
+  const pending = object(cursor.pending)
+  if (Object.keys(pending).length) {
+    Object.assign(cursor, { pending: { ...pick(pending, ['slug', 'fundingOffset', 'total', 'fundingHashes', 'fundingDone']), detail: startupDbFacts(pending.detail),
+      entry: startupEntryFacts(pending.entry),
+      funding: array(pending.funding).map(object).map(fundingFacts) } })
+  }
+  return cursor
+}
+/** Sanitizes working relationship records too; historical C is never run or rewritten by SX1C. */
+export function sanitizeStartupDbCoverage(coverage: Record<string, unknown>): Record<string, unknown> {
+  const keys = new Map<string, string>()
+  const records = array(coverage.records).map(value => {
+    const record = object(value), raw = object(record.raw)
+    const safe = { ...startupDbFacts(raw), identitySourceFields: pick(object(raw.identitySourceFields), ['name', 'slug', 'websiteUrl', 'domain']),
+      fundingPartial: raw.fundingPartial === true, portfolioRelationship: relationshipFacts(raw.portfolioRelationship),
+      verifiedInvestorIdentity: pick(object(raw.verifiedInvestorIdentity), ['name', 'domain']), relationshipVerification: 'indexed_exact_identities' }
+    const text = startupDbText(safe)
+    const key = contentHashOf(raw) === contentHashOf(safe) ? String(record.key) : contentHashOf({ route: 'startupdb', externalId: record.externalId, raw: safe, provenance: null })
+    keys.set(String(record.key), key)
+    return { ...pick(record, ['companyId', 'externalId', 'companyName', 'website', 'sourceUrl', 'source', 'route', 'observedAt', 'publishedAt', 'primaryFitEvidence', 'employerAtsOwnership']),
+      provenance: { relationship: 'indexed_investor_portfolio', mode: 'company_seed' }, key, raw: safe, text, textHash: contentHashOf(text) }
+  })
+  return { ...coverage, records, ...(Array.isArray(coverage.pendingFollowups) ? { pendingFollowups: coverage.pendingFollowups.map(value => {
+    const row = object(value); return { ...row, key: keys.get(String(row.key)) ?? row.key }
+  }) } : {}) }
+}
 /** A UTF-8 prefix, never more than 4 KiB (including multibyte source text). */
 function rawExcerpt(raw: string): string {
   return new TextDecoder().decode(Buffer.from(raw).subarray(0, 4096), { stream: true })
@@ -48,6 +102,7 @@ export class StartupDbProvider {
     if (cursor.version !== 2 || !Number.isInteger(cursor.investorIndex) || cursor.investorIndex < 0 || cursor.investorIndex > 5 ||
       !Number.isInteger(cursor.offset) || cursor.offset < 0 || !Number.isInteger(cursor.entryIndex) || cursor.entryIndex < 0 ||
       !cursor.pageHashes || !Array.isArray(cursor.omissions) || !Array.isArray(cursor.disclosures)) throw new Error('Invalid StartupDB cursor; start a new source run')
+    sanitizeStartupDbCursor(cursor)
     let count = 0, requests = 0, scans = 0
     const disclosures = cursor.disclosures
     const save = () => checkpoint(structuredClone(cursor))
@@ -108,9 +163,12 @@ export class StartupDbProvider {
         while (cursor.entryIndex < page.length && count < limit && scans < 500) {
           const entry = page[cursor.entryIndex]!
           const website = str(entry.websiteUrl) ?? str(entry.domain), name = str(entry.name), slug = str(entry.slug)
-          if (!website || !name || !slug) {
+          // A present but unusable (uncanonicalizable or denied) website is omitted like a missing one, not a source pause.
+          const usable = website ? canonicalizeDomain(website) : null
+          if (!website || !name || !slug || !usable?.ok) {
             cursor.omissions.push({ pageUrl: url, index: cursor.offset + cursor.entryIndex,
-              reason: 'portfolio identity missing', raw: rawExcerpt(JSON.stringify(entry)), recordHash: contentHashOf(entry) })
+              reason: !website || !name || !slug ? 'portfolio identity missing' : `portfolio website unusable: ${usable && !usable.ok ? usable.reason : 'unknown'}`,
+              storagePurpose: 'bounded_forensic_source_excerpt_not_reusable_facts', raw: rawExcerpt(JSON.stringify(entry)), recordHash: contentHashOf(entry) })
             scans++; cursor.entryIndex++; await save(); continue
           }
           const detailUrl = `${STARTUPDB_BASE}/startups/${encodeURIComponent(slug)}`
@@ -126,10 +184,10 @@ export class StartupDbProvider {
               !Number.isSafeInteger(detail.fundingHistoryTotal) || detail.fundingHistoryTotal < detail.fundingHistory.length) {
               throw SourceError.unusable(detailUrl, 'funding preview/total omitted or malformed')
             }
-            cursor.pending = { slug, detail: { ...detail, license: detailResponse.license ?? response.license ?? null,
+            cursor.pending = { slug, detail: { ...startupDbFacts(detail), license: detailResponse.license ?? response.license ?? null,
               licenseScope: detailResponse.licenseScope ?? response.licenseScope ?? null,
-              attribution: detailResponse.attribution ?? response.attribution ?? null }, entry,
-              funding: detail.fundingHistoryTotal > detail.fundingHistory.length ? [] : detail.fundingHistory.map(object),
+              attribution: detailResponse.attribution ?? response.attribution ?? null }, entry: startupEntryFacts(entry),
+              funding: detail.fundingHistoryTotal > detail.fundingHistory.length ? [] : detail.fundingHistory.map(object).map(fundingFacts),
               fundingOffset: 0, total: detail.fundingHistoryTotal, fundingHashes: {}, fundingDone: detail.fundingHistoryTotal === detail.fundingHistory.length }
             await save()
           }
@@ -147,16 +205,14 @@ export class StartupDbProvider {
             if (rounds.length > 25 || object(activity.pagination).total !== pending.total) throw new Error('Funding page size/total drift')
             const done = pageFinished(activity, rounds.length, pending.fundingOffset)
             bind(pending.fundingHashes, String(pending.fundingOffset), rounds)
-            pending.funding.push(...rounds); pending.fundingOffset += rounds.length; pending.fundingDone = done
+            pending.funding.push(...rounds.map(fundingFacts)); pending.fundingOffset += rounds.length; pending.fundingDone = done
             await save()
           }
           if (!pending.fundingDone) cursor.omissions.push(`${slug}: funding capped at100; total${pending.total}`)
-          const detail = pending.detail, profile = object(detail.profile)
-          const terms = [...array(profile.productTechnologyTags), ...array(profile.sectorTags), ...array(profile.productsAndServices)]
-            .map((v) => str(object(v).value)).filter(Boolean).join(', ')
+          const detail = pending.detail
           const accepted = await handle({ source: 'startupdb', externalId: slug, companyName: name, website,
-            sourceUrl: detailUrl, text: [str(profile.shortDescription), terms].filter(Boolean).join('\n'), publishedAt: null,
-            raw: { ...detail, identitySourceFields: { name: entry.name, slug: entry.slug, websiteUrl: entry.websiteUrl ?? null, domain: entry.domain ?? null }, fundingPartial: !pending.fundingDone, portfolioRelationship: entry.relationship ?? null,
+            sourceUrl: detailUrl, text: startupDbText(detail), publishedAt: null,
+            raw: { ...detail, identitySourceFields: { name: entry.name, slug: entry.slug, websiteUrl: entry.websiteUrl ?? null, domain: entry.domain ?? null }, fundingPartial: !pending.fundingDone, portfolioRelationship: relationshipFacts(entry.relationship),
               verifiedInvestorIdentity: investor, relationshipVerification: 'indexed_exact_identities' },
             investor, funding: [...new Map(pending.funding.map((r) => [str(r.eventId) ?? contentHashOf(r), r])).values()] })
           if (accepted !== false) count++
@@ -171,7 +227,7 @@ export class StartupDbProvider {
     } catch (error) {
       if (!(error instanceof DiscoveryPaused) && lastResponse) {
         cursor.responseFailures ??= []
-        cursor.responseFailures.push({ ...lastResponse, reason: error instanceof Error ? error.message : String(error) })
+        cursor.responseFailures.push({ ...lastResponse, storagePurpose: 'bounded_forensic_source_excerpt_not_reusable_facts', reason: error instanceof Error ? error.message : String(error) })
         await save()
       }
       throw error
@@ -179,6 +235,8 @@ export class StartupDbProvider {
     return { count, complete: cursor.investorIndex === INVESTOR_SEEDS.length && cursor.omissions.length === 0,
       coverage: { investorSeeds: INVESTOR_SEEDS.map((s) => s.name), disclosures, omissions: cursor.omissions, responseFailures: cursor.responseFailures ?? [],
         requests, requestCap: 120, scanned: scans, scanCap: 500, fundingRoundCap: 100,
-        attribution: 'StartupDB (https://startupdb.com)', license: 'CC BY 4.0', exhaustive: false } }
+        attribution: 'StartupDB (https://startupdb.com)', license: 'CC BY 4.0', exhaustive: false,
+        rateLimit: '120/min per IP enforced at the gate (startupdb.* API contract minSpacingMs 500) plus provider delay', fundingStorage: 'round facts only (CC BY 4.0); descriptions/third-party text excluded',
+        robotsConflictDisclosure: 'robots.txt Disallow: /api/v1/ conflicts with the documented keyless API; exact documented endpoints only (existing orchestrator decision)' } }
   }
 }

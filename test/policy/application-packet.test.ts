@@ -1,3 +1,4 @@
+import { maskDirectArrayString } from '../../tools/passive-domain-mask.js'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
@@ -451,6 +452,21 @@ describe('nothing auto-submits (H8, irreversible in Part H)', () => {
    */
   const SCANNER_FILES = new Set([join('tools', 'verify-f3.ts')])
 
+  /** Only the JazzHR string inside HN's named passive domain set is exempt. */
+  function passiveIdentityClassification(file: string, source: string): string {
+    if (file !== 'src/ingest/discovery/hn.ts') return source
+    return maskDirectArrayString(source, 'APPLICATION_DOMAINS', 'applytojob.com')
+  }
+  it('H8 passive identity-classification exemption is limited to the HN domain constant', () => {
+    const classifier = readFileSync('src/ingest/discovery/hn.ts', 'utf8')
+    const forbiddenVerb = /\bapplyToJob\b/i
+    expect(classifier).toContain("'applytojob.com'")
+    expect(forbiddenVerb.test(passiveIdentityClassification('src/ingest/discovery/hn.ts', classifier))).toBe(false)
+    expect(forbiddenVerb.test(passiveIdentityClassification('src/other.ts', classifier))).toBe(true)
+    expect(forbiddenVerb.test(passiveIdentityClassification('src/ingest/discovery/hn.ts', `${classifier}\napplyToJob()`))).toBe(true)
+    expect(forbiddenVerb.test(passiveIdentityClassification('src/ingest/discovery/hn.ts', classifier.replace("'applytojob.com'", "'applytojob.com', applyToJob()")))).toBe(true)
+  })
+
   const sourceFiles = ['src', 'tools']
     .flatMap((d) => walk(join(process.cwd(), d)))
     .filter((f) => !SCANNER_FILES.has(f.slice(process.cwd().length + 1)))
@@ -472,7 +488,7 @@ describe('nothing auto-submits (H8, irreversible in Part H)', () => {
     ]
     const hits: string[] = []
     for (const file of sourceFiles) {
-      const text = readFileSync(file, 'utf8')
+      const text = passiveIdentityClassification(file.slice(process.cwd().length + 1), readFileSync(file, 'utf8'))
       for (const pattern of forbidden) {
         if (pattern.test(text)) hits.push(`${file}: ${pattern}`)
       }

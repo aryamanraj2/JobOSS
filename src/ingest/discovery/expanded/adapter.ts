@@ -1,9 +1,9 @@
 import type { GatedFetcher } from '../../../core/interfaces/providers.js'
 import { contentHashOf } from '../../../core/evidence/content-hash.js'
-import { object, type DiscoveryCandidate } from '../common.js'
+import { object, DiscoveryPaused, type DiscoveryCandidate } from '../common.js'
 import { parseExpandedPage, sourceRelationship, type ParsedPage, type UnresolvedEntry } from './parsers.js'
 import { publicPage } from './page.js'
-import type { ExpandedRoute } from './registry.js'
+import { routeRunnable, type ExpandedRoute } from './registry.js'
 import { decodePageCursor, candidateKey } from './snapshot.js'
 
 export type PageCursor = { version: 1; next: string | null; pages: string[]; pageHashes: Record<string, string>;
@@ -12,8 +12,10 @@ export type PageCursor = { version: 1; next: string | null; pages: string[]; pag
 export const pageCursor = (route: ExpandedRoute): PageCursor => ({ version: 1, next: route.url, pages: [], pageHashes: {}, processed: [], unresolved: [], limitations: [], scopeDone: false })
 
 
+const DETAIL_REASONS = ['company_website_missing_or_foreign', 'identity_requires_same_source_detail_page']
 export async function discoverPublic(gate: GatedFetcher, route: ExpandedRoute, cursor: PageCursor, now: Date,
   handle: (c: DiscoveryCandidate) => Promise<boolean>, save: (cursor: PageCursor) => Promise<void>, limit: number) {
+  if (!routeRunnable(route)) throw new DiscoveryPaused(route.url ?? route.id, route.access)
   Object.assign(cursor, decodePageCursor(cursor, route, now))
   const checkpoint = () => save(structuredClone(cursor))
   let emitted = 0, scans = 0
@@ -29,17 +31,18 @@ export async function discoverPublic(gate: GatedFetcher, route: ExpandedRoute, c
       cursor.pageHashes[cursor.next] = hash
       cursor.pages.push(cursor.next)
       cursor.snapshot = { url: cursor.next, observedAt: now.toISOString(), parsed }
-      cursor.unresolved.push(...parsed.unresolved)
+      cursor.unresolved.push(...parsed.unresolved.filter((u) => !cursor.unresolved.some((v) => v.externalId === u.externalId && v.reason === u.reason)))
       cursor.limitations.push(...parsed.limitations)
       // Persist fetched bytes' parsed scope before storing any company. Partial resumes use frozen records.
       await checkpoint()
     }
     const snapshot = cursor.snapshot
     // Public same-source detail pages only, with exact name match; a vault/foreign URL stays unresolved.
-    for (const entry of snapshot.parsed.unresolved.filter((r) => r.detailUrl && r.reason === 'company_website_missing_or_foreign')) {
-      if (cursor.pages.length >= 6 || scans >= 500) break
+    for (const entry of snapshot.parsed.unresolved.filter((r) => r.detailUrl && DETAIL_REASONS.includes(r.reason))) {
       const key = `detail:${entry.detailUrl}`
       if (cursor.processed.includes(key)) continue
+      // Detail pages count in the same page/request budget as listing pages.
+      if (cursor.pages.length >= 6 || scans >= 500) { cursor.limitations.push('detail_page_or_scan_cap_remaining_entries'); break }
       if (cursor.pages.includes(entry.detailUrl!)) { cursor.limitations.push('detail_cycle'); continue }
       const detail = await publicPage(gate, entry.detailUrl!, route)
       const parsed = parseExpandedPage(detail.html, detail.url, route, now)

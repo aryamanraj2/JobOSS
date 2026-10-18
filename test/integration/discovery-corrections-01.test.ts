@@ -49,6 +49,9 @@ it.each(['https://apply.workable.com/acme', 'https://jobs.lever.co/acme', 'https
   expect(summary.sources.find((s) => s.source === 'hn')?.coverage).toHaveProperty('identityUnresolved.0.reason', 'employer_identity_unresolved')
 })
 it('RR1-04 reproduces HN and StartupDB identity from additive linked JSON evidence and retains old excerpts', async () => {
+  // SX1C: preserve existing historical excerpts, while new StartupDB observations exclude descriptions.
+  const historicalCompany = await db.company.create({ data: { canonicalDomain: 'acme.example', displayName: 'Acme', website: 'https://acme.example/about', countries: [], locations: [], tags: [] } })
+  const historical = await db.evidence.create({ data: { companyId: historicalCompany.id, sourceType: 'external_source', sourceUrl: `${S}/startups/acme`, excerpt: 'Product description historical excerpt, retained without reuse.', contentHash: 'a'.repeat(64), observedAt: new Date('2026-09-01T00:00:00Z'), confidence: 0.65, fetchedVia: 'structured_feed' } })
   const post = `Hnco | Hiring engineers ${'Long product description. '.repeat(35)}<a href="https://hnco.example/jobs">Apply</a>`
   const gate = fixture([post], [{ name: 'Acme', slug: 'acme', websiteUrl: 'https://acme.example/about' }])
   await run(gate)
@@ -65,7 +68,8 @@ it('RR1-04 reproduces HN and StartupDB identity from additive linked JSON eviden
   await run(fixture([post], [{ name: 'Acme', slug: 'acme', websiteUrl: 'https://acme.example/about' }]))
   expect(await db.evidence.findMany({ orderBy: { id: 'asc' } })).toEqual(before)
   expect(before.some((e) => e.excerpt.startsWith('Hnco | Hiring'))).toBe(true)
-  expect(before.some((e) => e.excerpt.startsWith('Product description'))).toBe(true)
+  expect(before.find(e => e.id === historical.id)).toEqual(historical)
+  expect(before.filter(e => e.id !== historical.id).some(e => e.excerpt.includes('Product description'))).toBe(false)
 })
 it('RR1-05 omits a missing website with bounded raw bytes, then continues and retains omission on resume', async () => {
   const gate = fixture([], [{ name: 'Broken', slug: 'broken', rawMarker: '💡'.repeat(3000) }, { name: 'Acme', slug: 'acme', websiteUrl: 'https://acme.example/about' }])

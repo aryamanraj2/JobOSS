@@ -8,11 +8,17 @@ export const NOW = new Date('2026-10-16T00:00:00Z')
 export function fixture(name: string) { return readFileSync(fileURLToPath(new URL(name, import.meta.url)), 'utf8') }
 export const org = (name = 'Acme', website = 'https://acme.example', extra = {}) => ({ '@type': 'Organization', name, url: website, description: `${name} builds iOS apps with Swift and SwiftUI.`, ...extra })
 export const html = (items: unknown[], tail = '') => `<html><body><script type="application/ld+json">${JSON.stringify({ '@type': 'ItemList', itemListElement: items.map((item) => ({ '@type': 'ListItem', item })) })}</script>${tail}</body></html>`
+/** Synthetic SPC detail, with identity explicitly inside the company scope (no retained real detail bytes). */
+export const spcDetail = (row: Record<string, unknown> = org()) => {
+  const esc = (v: unknown) => String(v ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;')
+  return `<html><body><main><h1>${esc(row.name)}</h1><p>${esc(row.description)}</p><a href="${esc(row.url)}">Website</a></main></body></html>`
+}
 export const job = (extra = {}) => ({ '@type': 'JobPosting', identifier: { value: 'mobile-1' }, title: 'iOS Engineer', url: 'https://www.ycombinator.com/jobs/mobile-1',
   hiringOrganization: org(), description: 'Develop our iOS app in Swift and SwiftUI.', datePosted: '2026-10-01', validThrough: '2026-11-01', applicationUrl: 'https://acme.example/careers/mobile', ...extra })
 export function responses(): Record<string, StubResponse> {
   const pages: Record<string, StubResponse> = {}
   for (const route of EXPANDED_ROUTES) if (route.url && ['directory', 'jobs'].includes(route.kind)) pages[route.url] = { body: fixture(`${route.id.replaceAll(':', '-')}.html`) }
+  pages['https://yc-oss.github.io/api/companies/hiring.json'] = { body: '[]' } // SX1 yc:hiring route
   pages['https://yc-oss.github.io/api/companies/all.json'] = { body: JSON.stringify([
     { id: 1, name: 'Acme', website: 'https://acme.example', batch: 'Summer 2026', team_size: 2, status: 'Active', one_liner: 'iOS Swift SwiftUI mobile app' },
     { id: 2, name: 'Old Mobile', website: 'https://old-mobile.example', batch: 'Summer 2010', team_size: 900, status: 'Active', one_liner: 'mobile iOS Swift' },

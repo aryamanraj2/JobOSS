@@ -1,5 +1,7 @@
 /** Reviewed public API contracts; callers cannot declare arbitrary paths exempt from robots. */
-export type ApiContract = { id: string; documentationUrl: string }
+export type ApiContract = { id: string; documentationUrl: string; minSpacingMs?: number }
+/** StartupDB documents 120 requests per minute per IP: same-host requests are never closer than 500 ms. */
+const startupLimit = 500
 const startupDocs = 'https://startupdb.com/api'
 const slug = '[A-Za-z0-9][A-Za-z0-9._-]*'
 
@@ -22,17 +24,17 @@ export function matchApiContract(input: string, method: 'GET' | 'POST' = 'GET'):
   const path = url.pathname
   if (host === 'startupdb.com') {
     if (/^\/api\/v1\/(investors|startups)$/.test(path) && queryAllowed(url, ['q', 'limit', 'offset'])) {
-      return { id: 'startupdb.search', documentationUrl: startupDocs }
+      return { id: 'startupdb.search', documentationUrl: startupDocs, minSpacingMs: startupLimit }
     }
     if (new RegExp(`^/api/v1/(investors|startups)/${slug}$`).test(path) && queryAllowed(url, [])) {
-      return { id: 'startupdb.detail', documentationUrl: startupDocs }
+      return { id: 'startupdb.detail', documentationUrl: startupDocs, minSpacingMs: startupLimit }
     }
     if (new RegExp(`^/api/v1/investors/${slug}/portfolio$`).test(path) && queryAllowed(url, ['limit', 'offset'])) {
-      return { id: 'startupdb.portfolio', documentationUrl: startupDocs }
+      return { id: 'startupdb.portfolio', documentationUrl: startupDocs, minSpacingMs: startupLimit }
     }
     if (new RegExp(`^/api/v1/startups/${slug}/activity$`).test(path) && queryAllowed(url, ['kind', 'limit', 'offset']) &&
       (url.searchParams.get('kind') === null || url.searchParams.get('kind') === 'funding')) {
-      return { id: 'startupdb.activity', documentationUrl: startupDocs }
+      return { id: 'startupdb.activity', documentationUrl: startupDocs, minSpacingMs: startupLimit }
     }
   }
   if (host === 'hacker-news.firebaseio.com' &&

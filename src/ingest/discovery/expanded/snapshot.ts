@@ -149,7 +149,7 @@ export function decodePageCursor(value: unknown, route: ExpandedRoute, now: Date
     if (candidates.length > 500 || new Set(keys).size !== keys.length || new Set(candidates.map((c) => c.externalId)).size !== candidates.length) invalid('snapshot candidate uniqueness/bounds')
     const parsed: ParsedPage = { candidates, unresolved: unresolvedEntries, next: p.next === null ? null : routeUrl(p.next, route, 'snapshot next'),
       limitations: stringList(p.limitations, 'snapshot limitations'), representation: text(p.representation, 'snapshot representation') }
-    if (parsed.representation !== 'public-semantic-or-jsonld@1') invalid('snapshot representation version')
+    if (!['public-semantic-or-jsonld@1', 'publisher-cards@sx1'].includes(parsed.representation)) invalid('snapshot representation version')
     snapshot = { url, observedAt: time.toISOString(), parsed }
   }
   if (raw.scopeDone ? next !== null || snapshot !== undefined : next === null) invalid('finished/pending contradiction')

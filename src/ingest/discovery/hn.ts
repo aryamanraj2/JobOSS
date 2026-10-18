@@ -16,17 +16,40 @@ export const initialHnCursor = (): HnCursor => ({ version: 2, submissionIndex: 0
 const NON_COMPANY_DOMAINS = new Set(['linkedin.com', 'github.com', 'google.com', 'gmail.com', 'notion.so', 'notion.site',
   'youtube.com', 'youtu.be', 'calendly.com', 'outlook.com', 'hotmail.com', 'yahoo.com', 'icloud.com',
   'proton.me', 'protonmail.com', 'aol.com', 'fastmail.com', 'googlemail.com',
-  'simplelogin.com', 'simplelogin.co', 'simplelogin.fr', 'anonaddy.me', 'addy.io', 'mozmail.com', 'duck.com', '33mail.com'])
+  'simplelogin.com', 'simplelogin.co', 'simplelogin.fr', 'anonaddy.me', 'addy.io', 'mozmail.com', 'duck.com', '33mail.com',
+  // DC1-R2 second layer (R-R1b leak list): free-mail and forwarding providers.
+  'hey.com', 'pm.me', 'me.com', 'mac.com', 'live.com', 'msn.com', 'yahoo.co.uk', 'ymail.com', 'hotmail.co.uk', 'outlook.co.uk',
+  'gmx.de', 'gmx.com', 'gmx.net', 'web.de', 'zohomail.com', 'zoho.com', 'yandex.com', 'yandex.ru', 'mail.com', 'tutanota.com', 'tuta.io',
+  'medium.com', 'substack.com'])
 
 // Existing exact ATS signatures + vendor host-policy entries cover supported and
 // recognized unsupported ATS. Supplemental routes come from R-R1's saved posts.
-const APPLICATION_DOMAINS = new Set(['greenhouse.io', 'grnh.se', 'lever.co', 'ashbyhq.com',
+export const APPLICATION_DOMAINS = new Set(['greenhouse.io', 'grnh.se', 'lever.co', 'ashbyhq.com',
   'workable.com', 'myworkdayjobs.com', 'param.ai', 'gem.com', 'dover.com', 'wellfound.com',
   'ycombinator.com', 'workatastartup.com', 'nordictechjobs.com', 'perfectwiki.page',
   'bit.ly', 't.co', 'linktr.ee', 'notion.site', 'notion.so', 'webflow.io', 'wixsite.com', 'wordpress.com',
-  'github.io', 'vercel.app', 'netlify.app', ...SEED_ALLOW_HOSTS.filter((h) => /ATS|hosted boards/i.test(h.note ?? '')).map((h) => h.host)])
+  'github.io', 'vercel.app', 'netlify.app',
+  // DC1-R2 second layer (R-R1b leak list): ATS, job boards, forms, shortlinks and hosted pages.
+  'smartrecruiters.com', 'jobvite.com', 'recruitee.com', 'teamtailor.com', 'bamboohr.com', 'breezy.hr', 'rippling.com',
+  'personio.de', 'personio.com', 'pinpointhq.com', 'welcometothejungle.com', 'otta.com', 'builtin.com',
+  'remoteok.com', 'workablemail.com', 'typeform.com', 'forms.gle', 'tally.so', 'airtable.com', 'tinyurl.com', 'lnkd.in',
+  // JazzHR is a passive identity exclusion, never an application-submission integration.
+  'applytojob.com',
+  'carrd.co', 'gitlab.io', 'pages.dev', 'herokuapp.com', ...SEED_ALLOW_HOSTS.filter((h) => /ATS|hosted boards/i.test(h.note ?? '')).map((h) => h.host)])
 function applicationRoute(route: string, domain: string): boolean {
   return !!detectAtsInUrl(route) || [...APPLICATION_DOMAINS].some((d) => domain === d || domain.endsWith(`.${d}`))
+}
+
+const NAME_STOP_TOKENS = new Set(['the', 'and', 'inc', 'llc', 'ltd', 'gmbh', 'corp', 'company', 'labs', 'lab', 'tech', 'technologies',
+  'health', 'group', 'systems', 'software', 'studio', 'studios', 'remote', 'hiring', 'http', 'https', 'www', 'com', 'org', 'net'])
+/** DC1-R2: a token from the post's company-name header must appear in the domain's registrable label. */
+export function nameCorroboratesDomain(header: string, domain: string): boolean {
+  const label = domain.split('.')[0]!.toLowerCase()
+  const name = header.replace(/(?:https?:\/\/|www\.)[^\s<>]+/gi, '').replace(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '').replace(/\([^)]*\)/g, '')
+  const tokens = name.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3 && !NAME_STOP_TOKENS.has(t))
+  const compact = name.toLowerCase().replace(/[^a-z0-9]/g, '')
+  // Also a name spelled as the whole domain ("PlantingSpace" / planting.space).
+  return tokens.some((t) => label.includes(t)) || (compact.length >= 2 && (label === compact || compact === domain.toLowerCase().replace(/[^a-z0-9]/g, '')))
 }
 
 /** A top-level hiring invitation with one identifiable company route. Ambiguous employer identity stays unimported. */
@@ -51,15 +74,19 @@ function parseHiringPost(item: Record<string, unknown>, threadId: number): Disco
     else consider(href)
   }
   for (const email of emails) consider(email, true)
-  const unique = [...new Set(identities.map((i) => i.website))]
   const companyName = text.split(/[|\n]/)[0]?.trim().slice(0, 120)
   if (!companyName || companyName.length > 100 || !item.id) return null
+  const distinct = [...new Set(identities.map((i) => i.website))]
+  // A sole route that the name header does not corroborate (e.g. a third-party product beside an ATS link) stays unresolved.
+  const unique = distinct.length === 1 && nameCorroboratesDomain(companyName, new URL(distinct[0]!).hostname) ? distinct : []
+  const identityReason = distinct.length === 1 && !unique.length ? 'name_domain_uncorroborated' : distinct.length > 1 ? 'multiple_employer_routes' : distinct.length ? null : 'no_employer_route'
   const publishedAt = typeof item.time === 'number' ? new Date(item.time * 1000) : null
   return { source: 'hn', externalId: String(item.id), companyName, website: unique.length === 1 ? unique[0]! : '',
     sourceUrl: `https://news.ycombinator.com/item?id=${String(item.id)}`, text, publishedAt,
     raw: { ...item, threadId, contactEmails: emails, routes: [...new Set(routes)],
       identitySourceFields: { nameHeader: companyName, route: identities.find((i) => i.website === unique[0])?.source ?? null },
-      employerIdentity: unique.length === 1 ? 'public_post_unverified' : 'employer_identity_unresolved' }, contactEmails: emails }
+      employerIdentity: unique.length === 1 ? 'public_post_unverified' : 'employer_identity_unresolved',
+      ...(identityReason ? { identityReason } : {}) }, contactEmails: emails }
 }
 
 /** Public parser only emits a single non-application employer route. */
@@ -127,7 +154,7 @@ export class HnHiringProvider {
           cursor.identityUnresolved ??= []
           if (!cursor.identityUnresolved.some((r) => r.externalId === candidate.externalId)) cursor.identityUnresolved.push({
             externalId: candidate.externalId, companyName: candidate.companyName, sourceUrl: candidate.sourceUrl,
-            reason: 'employer_identity_unresolved', routes: candidate.raw.routes,
+            reason: 'employer_identity_unresolved', detail: candidate.raw.identityReason ?? null, routes: candidate.raw.routes,
           })
         } else if (candidate && await handle(candidate) !== false) count++
         cursor.commentIndex++; cursor.scanned++; scannedThisRun++; await save()

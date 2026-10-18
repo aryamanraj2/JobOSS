@@ -3,9 +3,9 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { testDb, truncateAll, closeTestDb } from '../helpers/db.js'
 import { StubFetcher } from '../helpers/fixtures.js'
 import { prepareDiscovery, refreshExpandedListingBoards } from '../../src/ingest/discovery/prepare.js'
-import { EXPANDED_ROUTES } from '../../src/ingest/discovery/expanded/registry.js'
+import { EXPANDED_ROUTES, routeRunnable } from '../../src/ingest/discovery/expanded/registry.js'
 import { parseExpandedPage, employerWebsite } from '../../src/ingest/discovery/expanded/parsers.js'
-import { responses, html, org, job, NOW } from '../fixtures/discovery-expansion/fixtures.js'
+import { spcDetail, responses, html, org, job, NOW } from '../fixtures/discovery-expansion/fixtures.js'
 import { dWorld } from '../fixtures/joboss-d/world.js'
 import type { Db } from '../../src/core/audit/audit-log.js'
 const db = testDb(), options = { mode: 'expanded-v1' as const, limit: 20, now: NOW, delayMs: 0 }
@@ -30,6 +30,13 @@ it.each(['yc:jobs', 'seedcamp:talent'])('RX-02 restores PostgreSQL JSON dates an
   pages['https://yc-oss.github.io/api/companies/all.json'] = { body: '[]' }
   pages[r.url!] = { body: html(['a', 'b'].map((key) => job({ identifier: key, url: new URL(`/jobs/${key}`, r.url!).href,
     applicationUrl: `https://job-${key}.example/careers/mobile`, hiringOrganization: org(`Job ${key}`, `https://job-${key}.example`) }))) }
+  if (!routeRunnable(r)) {
+    // SX1 (Part B 8): yc:jobs is blocked by decision; it makes zero requests and stays a visible gap. Coverage: the seedcamp:talent case.
+    const gate = new StubFetcher(pages), blocked = await prepareDiscovery(db, gate, { ...options, limit: 1 })
+    expect(gate.requested).not.toContain(r.url)
+    expect(src(blocked, id)).toMatchObject({ status: 'access_blocked', discovered: 0, coverage: { reason: 'access_blocked', scopeComplete: false, records: [] } })
+    return
+  }
   const first = await prepareDiscovery(db, new StubFetcher(pages), { ...options, limit: 1 })
   expect(src(first, id).discovered).toBe(1)
   const saved = await db.discoveryRun.findUniqueOrThrow({ where: { id: src(first, id).runId } })
@@ -44,7 +51,7 @@ it.each(['yc:jobs', 'seedcamp:talent'])('RX-02 restores PostgreSQL JSON dates an
   evidence(`roundtrip-${id.replace(':', '-')}`, { first: src(first, id), saved, second: src(second, id), third: src(third, id) })
 })
 it('RX-03 reconciles an actual identity commit with a lost acknowledgement before error finalization', async () => {
-  const pages = responses(), r = route('ef:companies'); pages[r.url!] = { body: html([org('Committed', 'https://committed.example')]) }
+  const pages = responses(), r = route('seedcamp:companies') /* SX1: EF unavailable */; pages[r.url!] = { body: html([org('Committed', 'https://committed.example')]) }
   const original = db.$transaction.bind(db); let fired = false
   const spy = vi.spyOn(db, '$transaction').mockImplementation((async (...args: unknown[]) => {
     const result = await Reflect.apply(original, db, args)
@@ -81,7 +88,7 @@ it('RX-03 funding failure retains committed identity ledger and explicit pending
   evidence('funding-repair', { first: src(first, 'startupdb'), second: src(second, 'startupdb'), fired })
 })
 it('RX-04 refuses a persisted other-allowed-host next URL without fetching or erasing forensic state', async () => {
-  const r = route('ef:companies'), pages = responses(); pages[r.url!] = { body: html([org(), org('Pending', 'https://pending.example')]) }
+  const r = route('seedcamp:companies') /* SX1: EF unavailable */, pages = responses(); pages[r.url!] = { body: html([org(), org('Pending', 'https://pending.example')]) }
   const first = await prepareDiscovery(db, new StubFetcher(pages), { ...options, limit: 1 }), row = await db.discoveryRun.findUniqueOrThrow({ where: { id: src(first, r.id).runId } })
   const cursor = row.cursor as Record<string, unknown>; delete cursor.snapshot; cursor.next = 'https://www.ycombinator.com/foreign-portfolio'
   await db.discoveryRun.update({ where: { id: row.id }, data: { cursor: JSON.parse(JSON.stringify(cursor)) } })
@@ -168,7 +175,7 @@ it.each([false, true])('RX-01 deliberate outer rollback after refusal leaves no 
   expect(gate.requested).toHaveLength(0); expect(await db.company.count()).toBe(0); expect(await db.discoveryRun.count()).toBe(0); expect(await db.evidence.count()).toBe(0)
 })
 it('RX-04 validates all nested persisted shapes and source relationships before actual allowed transport, preserving forensic JSON', async () => {
-  const r = route('ef:companies'), pages = responses()
+  const r = route('seedcamp:companies') /* SX1: EF unavailable */, pages = responses()
   pages[r.url!] = { body: html(Array.from({ length: 21 }, (_, i) => org(`EF ${i}`, `https://ef-${i}.example`))) }
   const first = await prepareDiscovery(db, new StubFetcher(pages), options)
   const row = await db.discoveryRun.findUniqueOrThrow({ where: { id: src(first, r.id).runId } }), original = row.cursor as Record<string, unknown>
@@ -209,7 +216,7 @@ it('RX-04 validates all nested persisted shapes and source relationships before 
 it('RX-04 rejects an initial foreign public URL at the real gateway seam before even robots or credits', async () => {
   await seedHostPolicies(db); await db.researchBudget.create({ data: { companyId: null, periodMonth: '2026-10', creditsCap: 5, billedUsdCap: 0 } })
   const gate = new FetchPolicyGate(db, { userAgent: 'x-offline/1', robotsTtlSeconds: 86400, defaultRateDelayMs: 5000, now: () => NOW })
-  await expect(publicPage(boundedSourceGate(gate, route('ef:companies'), 0).gate, 'https://seedcamp.com/our-companies/', route('ef:companies'))).rejects.toMatchObject({ reason: 'invalid_source_route_url' })
+  await expect(publicPage(boundedSourceGate(gate, route('seedcamp:companies'), 0).gate, 'https://www.southparkcommons.com/companies/', route('seedcamp:companies'))).rejects.toMatchObject({ reason: 'invalid_source_route_url' })
   expect(await db.robotsCache.count()).toBe(0); expect((await db.researchBudget.findFirstOrThrow()).creditsSpent).toBe(0)
 })
 it.each(['2026-02-29', '2026-02-30', '2026-11-31', '2026-13-01', '2026-00-01', '2026-01-00', '0000-01-01',
@@ -225,12 +232,13 @@ it.each(['2024-02-29', '2026-09-30', '2026-10-01T12:00:00+05:30', '2026-10-01T03
   expect(result.candidates[0]!.raw.datePosted).toBe(value)
 })
 it('RX-06 production persistence ignores header decoys and refuses contradictory or tenant-only entries', async () => {
-  const pages = responses(), ef = route('ef:companies'), yc = route('yc:jobs')
+  // SX1 (Part B 6, 8): EF and yc:jobs make no requests; the same entries ride on seedcamp:companies and seedcamp:talent.
+  const pages = responses(), ef = route('seedcamp:companies'), yc = route('seedcamp:talent'), role = (key: string) => new URL(`/jobs/${key}`, yc.url!).href
   pages[ef.url!] = { body: html([org('Real entry', 'https://real-entry.example')], `<script type="application/ld+json">${JSON.stringify(org('Analytics Widget', 'https://analytics-widget.example'))}</script>`) }
   pages[yc.url!] = { body: html([
-    job({ identifier: 'valid', hiringOrganization: org('Valid role', 'https://valid-role.example'), applicationUrl: 'https://valid-role.example/apply' }),
-    job({ identifier: 'wrong', hiringOrganization: org('Other Employer', 'https://other-employer.example'), applicationUrl: 'https://acme.example/apply' }),
-    job({ identifier: 'tenant', hiringOrganization: org('Tenant Employer', 'https://jobs.gem.com/tenant'), applicationUrl: 'https://jobs.gem.com/tenant/apply' }),
+    job({ identifier: 'valid', url: role('valid'), hiringOrganization: org('Valid role', 'https://valid-role.example'), applicationUrl: 'https://valid-role.example/apply' }),
+    job({ identifier: 'wrong', url: role('wrong'), hiringOrganization: org('Other Employer', 'https://other-employer.example'), applicationUrl: 'https://acme.example/apply' }),
+    job({ identifier: 'tenant', url: role('tenant'), hiringOrganization: org('Tenant Employer', 'https://jobs.gem.com/tenant'), applicationUrl: 'https://jobs.gem.com/tenant/apply' }),
   ]) }
   const result = await prepareDiscovery(db, new StubFetcher(pages), options)
   for (const domain of ['analytics-widget.example', 'other-employer.example', 'gem.com']) {
@@ -268,7 +276,7 @@ it('RX-E01 current interface explicitly disclaims a durable X intent marker and 
   expect(contract).toContain('E must block unresolved advertised intent before calling D')
 })
 it.each(['beforeCommit', 'afterCheckpoint', 'beforeFinalSummary', 'afterFinalSummary', 'reconcileFailure'])('RX-03 %s preserves authoritative progress and repairs idempotently', async (boundary) => {
-  const pages = responses(), r = route('ef:companies'), domain = 'boundary.example', runId = `rx-${boundary}`
+  const pages = responses(), r = route('seedcamp:companies') /* SX1: EF unavailable */, domain = 'boundary.example', runId = `rx-${boundary}`
   pages[r.url!] = { body: html([org('Boundary employer', `https://${domain}`)]) }
   let fired = false
   const transaction = db.$transaction.bind(db), update = db.discoveryRun.update.bind(db.discoveryRun), read = db.discoveryRun.findUniqueOrThrow.bind(db.discoveryRun)
@@ -324,13 +332,13 @@ it.each([false, true])('RX-03 manifest transaction rollback/acknowledgement ambi
   const gate = new StubFetcher(responses())
   await expect(prepareDiscovery(db, gate, { ...options, runId })).rejects.toThrow(runId)
   spy.mockRestore(); expect(fired).toBe(true); expect(gate.requested).toHaveLength(0)
-  expect(await db.discoveryRun.count()).toBe(committed ? 15 : 0); expect(await db.company.count()).toBe(0)
+  expect(await db.discoveryRun.count()).toBe(committed ? EXPANDED_ROUTES.length : 0); expect(await db.company.count()).toBe(0) // SX1: 16 routes
   const next = await prepareDiscovery(db, new StubFetcher(responses()), { ...options, runId, ...(committed ? { resume: true } : {}) })
-  expect(next.sources).toHaveLength(15); expect(await db.discoveryRun.count()).toBe(15)
+  expect(next.sources).toHaveLength(EXPANDED_ROUTES.length); expect(await db.discoveryRun.count()).toBe(EXPANDED_ROUTES.length)
 })
 it('RX-02/04 legacy v1 JSON snapshots restore valid dates, refuse invalid nested job state and retain original observation across later-day resume', async () => {
-  const r = route('yc:jobs'), pages = responses()
-  pages[r.url!] = { body: html(['a', 'b'].map((key) => job({ identifier: key, hiringOrganization: org(`Legacy ${key}`, `https://legacy-${key}.example`), applicationUrl: `https://legacy-${key}.example/apply` }))) }
+  const r = route('seedcamp:talent'), pages = responses() // SX1 (Part B 8): yc:jobs is never requested
+  pages[r.url!] = { body: html(['a', 'b'].map((key) => job({ identifier: key, url: new URL(`/jobs/${key}`, r.url!).href, hiringOrganization: org(`Legacy ${key}`, `https://legacy-${key}.example`), applicationUrl: `https://legacy-${key}.example/apply` }))) }
   const first = await prepareDiscovery(db, new StubFetcher(pages), { ...options, limit: 1 })
   const row = await db.discoveryRun.findUniqueOrThrow({ where: { id: src(first, r.id).runId } }), original = row.cursor as { processed: string[]; snapshot: { observedAt: string; parsed: { candidates: { publishedAt: unknown; provenance: { listing: { validThrough?: string | null; publishedAt: string } }; raw: Record<string, unknown> }[] } } }
   const legacy = structuredClone(original)
@@ -354,7 +362,7 @@ it('RX-02/04 legacy v1 JSON snapshots restore valid dates, refuse invalid nested
   expect((src(resumed, r.id).coverage.records as { observedAt: string }[]).every((r) => r.observedAt === NOW.toISOString())).toBe(true)
 })
 it('RX-04 accepts a genuine company-only JSON snapshot in the direct bounded adapter without freshening its capture', async () => {
-  const r = route('ef:companies'), gate = new StubFetcher({ [r.url!]: { body: html([org(), org('Next', 'https://next.example')]) } })
+  const r = route('seedcamp:companies'), gate = new StubFetcher({ [r.url!]: { body: html([org(), org('Next', 'https://next.example')]) } })
   let saved: unknown
   const { pageCursor } = await import('../../src/ingest/discovery/expanded/adapter.js')
   await discoverPublic(gate, r, pageCursor(r), NOW, async () => true, async (c) => { saved = JSON.parse(JSON.stringify(c)) }, 1)
@@ -376,9 +384,11 @@ it('RX-E02 active wrapper honors stored careers URL over supplied decoy and pres
 it('RX-04 frozen redirected details and original v1 detail shapes resume without requesting another source or freshening observation', async () => {
   const r = route('southparkcommons:companies'), pages = responses(), requested = 'https://www.southparkcommons.com/companies/acme'
   const final = 'https://www.southparkcommons.com/company/acme'
-  pages[r.url!] = { body: html([org('Next employer', 'https://next-employer.example')], '<article><h2><a href="/companies/acme">Acme</a></h2><p>member company</p></article>') }
+  // SX1 (Part B 4): SPC listing rows never bind identity, so the first employer also comes from its detail page.
+  pages[r.url!] = { body: '<html><body><article><h2><a href="/companies/next">Next employer</a></h2></article><article><h2><a href="/companies/acme">Acme</a></h2><p>member company</p></article></body></html>' }
+  pages['https://www.southparkcommons.com/companies/next'] = { body: spcDetail(org('Next employer', 'https://next-employer.example')) }
   pages[requested] = { body: '', statusCode: 302, headers: { location: final } }
-  pages[final] = { body: html([org()]) }
+  pages[final] = { body: spcDetail() }
   const first = await prepareDiscovery(db, new StubFetcher(pages), { ...options, limit: 1 })
   const row = await db.discoveryRun.findUniqueOrThrow({ where: { id: src(first, r.id).runId } })
   const cursor = row.cursor as { snapshot: { parsed: { candidates: { raw: Record<string, unknown>; companyName: string }[] } } }
@@ -404,7 +414,9 @@ it('RX-01/03 standalone production source calls stay outside manifest/identity/f
   const stub = new StubFetcher(pages), trace: { url: string; inside: number }[] = []
   const gate = { check: stub.check.bind(stub), fetchText: (async (...args: Parameters<typeof stub.fetchText>) => { trace.push({ url: args[0], inside }); expect(inside).toBe(0); return stub.fetchText(...args) }) }
   const result = await prepareDiscovery(db, gate, options); spy.mockRestore()
-  expect(result.discovered).toBe(4); expect(transactions).toBeGreaterThan(15)
+  // SX1: fewer runnable routes commit fewer identities; every committed record still had its own transaction after the manifest.
+  const committed = result.sources.reduce((n, s) => n + (Array.isArray(s.coverage.records) ? s.coverage.records.length : 0), 0)
+  expect(result.discovered).toBe(4); expect(transactions).toBeGreaterThan(committed)
   expect(trace.some((r) => r.url === 'https://acme.example/news/seed')).toBe(true)
   expect(trace.every((r) => r.inside === 0)).toBe(true)
   expect(src(result, 'startupdb').coverage.pendingFollowups).toEqual([])

@@ -1,0 +1,16 @@
+{
+  "label": "real-format fixture: saved first-party pre-flight 02 bytes; whole records removed only, no markup rewritten",
+  "sourceFile": "scratch/joboss-source-access-preflight-02-20261018-a/raw/www.southparkcommons.com_companies_baseten",
+  "sourceSha256": "3894776bb975d8ddd8f1f34ca29251792b1d4a308bd7a685df610170bc6b504c",
+  "sourceBytes": 46189,
+  "preflight": "docs/JOBOSS-SOURCE-ACCESS-PREFLIGHT-02-REPORT.md (18 Oct 2026, root, plain GET, joboss-preflight/1)",
+  "fixtureSha256": "3894776bb975d8ddd8f1f34ca29251792b1d4a308bd7a685df610170bc6b504c",
+  "fixtureBytes": 46189,
+  "selection": {
+    "records": "whole page; nothing removed"
+  },
+  "expected": {
+    "candidates": 1,
+    "website": "https://baseten.co/"
+  }
+}

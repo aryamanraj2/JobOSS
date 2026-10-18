@@ -1,0 +1,29 @@
+{
+  "label": "real-format trimmed fixture: saved first-party pre-flight bytes; whole records removed only, no markup rewritten",
+  "sourceFile": "scratch/joboss-source-access-preflight-01-20261018-a/raw/https_www_southparkcommons_com_companies_",
+  "sourceSha256": "2a2041f7b258cb08e60f4cf39c4e63f64753bab7bf9aa3a10800f9b3ba229e79",
+  "sourceBytes": 141063,
+  "preflight": "docs/JOBOSS-SOURCE-ACCESS-PREFLIGHT-01.md (18 Oct 2026, root, plain GET, joboss-preflight/1)",
+  "fixtureSha256": "a6ad3cc2b7f155ad992901482eacdc5cbc77b206f00322f6a943ee3800beb4b7",
+  "fixtureBytes": 112353,
+  "selection": {
+    "records": "data-highlight-card anchors and SSR-fallback article rows; Company News anchors",
+    "keptHighlightCards": 2,
+    "keptArticleRows": 2,
+    "keptNewsLinks": 1,
+    "sourceHighlightCards": 16,
+    "sourceArticleRows": 12,
+    "sourceDetailSlugs": 28,
+    "keptDetailLinks": [
+      "/companies/compound",
+      "/companies/goodfire",
+      "/companies/pilot",
+      "/companies/render"
+    ]
+  },
+  "expected": {
+    "candidates": 0,
+    "unresolvedWithDetail": 4,
+    "note": "listing never establishes identity; empty-filter island text retained"
+  }
+}

@@ -5,7 +5,7 @@ import { writeAudit } from '../audit/audit-log.js'
 import type { ReasonCodeValue } from '../reason-codes/registry.js'
 import { normalizeHost } from './host-lists.js'
 import { resolveHostPolicy } from './host-policy.js'
-import { checkRobots } from './robots.js'
+import { checkRobots, RobotsPacingShortfall } from './robots.js'
 import { matchApiContract } from './api-contracts.js'
 import { checkBudget, reserveBudget, validateBudgetSpend, type BudgetSpend } from './budget.js'
 import { HostRateLimiter, effectiveDelayMs } from './rate-limit.js'
@@ -22,6 +22,10 @@ export type PreflightRefusal = {
 export type PreflightResult = PreflightAllow | PreflightRefusal
 
 export type GateContext = {
+  /** Bounded source walks opt into one scheduler wait; ordinary content calls still refuse. */
+  sourceDelayMs?: number
+  /** Continuation of the same bounded source walk, after its first dispatch. */
+  sourceWait?: boolean
   /** Attributes spend and budget headroom. Null for global-budget-only fetches. */
   companyId?: string | null
   /**
@@ -110,25 +114,36 @@ export class FetchPolicyGate {
   private readonly limiter: HostRateLimiter
   private readonly robotsDelays = new Map<string, number>()
   private readonly robotsQueues = new Map<string, Promise<unknown>>()
+  /** Hosts whose latest limiter stamp came from a robots hop, not from content. */
+  private readonly robotsStamped = new Set<string>()
 
-  private async waitForHost(host: string, delay: number): Promise<void> {
-    for (;;) {
-      const rate = this.limiter.check(host, delay)
-      if (rate.allowed) return
-      await (this.opts.waitForDelay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))))(rate.retryAfterMs)
-    }
+  /**
+   * Waits at most once, for the computed spacing, then reports whether it is met.
+   * Callers refuse when it is not, so a limiter clock that never advances cannot
+   * loop forever. The extra millisecond absorbs timers that fire a tick early.
+   */
+  private async waitForHost(host: string, delay: number): Promise<boolean> {
+    const rate = this.limiter.check(host, delay)
+    if (rate.allowed) return true
+    await (this.opts.waitForDelay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))))(rate.retryAfterMs + 1)
+    return this.limiter.check(host, delay).allowed
   }
 
   /** Robots hops use the same limiter timestamps as content and each is audited. */
-  private async fetchRobots(url: string): Promise<RawResponse> {
+  private async fetchRobots(url: string, sourceDelayMs = 0): Promise<RawResponse> {
     const host = normalizeHost(new URL(url).host)
     const previous = this.robotsQueues.get(host) ?? Promise.resolve()
     const pending = previous.catch(() => {}).then(async () => {
       const policy = await resolveHostPolicy(this.db, host)
       if (policy.kind !== 'allowed' || policy.termsProhibited) throw new Error('robots redirect host/terms refused')
-      const delay = effectiveDelayMs(this.opts.defaultRateDelayMs, policy.rateDelayMsOverride, (this.robotsDelays.get(host) ?? 0) / 1000)
-      await this.waitForHost(host, delay)
+      const delay = Math.max(sourceDelayMs, effectiveDelayMs(this.opts.defaultRateDelayMs, policy.rateDelayMsOverride, (this.robotsDelays.get(host) ?? 0) / 1000))
+      // Local pacing shortfall: a transient, uncached pause in checkRobots, never a robots refusal.
+      if (!(await this.waitForHost(host, delay))) {
+        const rate = this.limiter.check(host, delay)
+        throw new RobotsPacingShortfall(rate.allowed ? delay : rate.retryAfterMs)
+      }
       this.limiter.record(host)
+      this.robotsStamped.add(host)
       const response = await rawGet(url, { userAgent: this.opts.userAgent, maxBytes: 512 * 1024 })
       await writeAudit(this.db, { actorType: 'system', actorId: 'fetch-policy-gate', action: 'fetch.robots_performed',
         subjectType: 'Url', subjectId: url, metadata: { host, statusCode: response.statusCode,
@@ -202,7 +217,7 @@ export class FetchPolicyGate {
       userAgent: this.opts.userAgent,
       ttlSeconds: this.opts.robotsTtlSeconds,
       hostExplicitlyAllowed: true,
-      request: (robotsUrl) => this.fetchRobots(robotsUrl),
+      request: (robotsUrl) => this.fetchRobots(robotsUrl, ctx.sourceDelayMs),
       ...(this.opts.now ? { now: this.opts.now } : {}),
     })
     if (!robots.allowed) {
@@ -218,15 +233,18 @@ export class FetchPolicyGate {
     }
 
     // 4. Rate policy.
-    const delay = effectiveDelayMs(
+    // A documented API rate limit (e.g. StartupDB 120/min) is a floor on same-host spacing.
+    const delay = Math.max(effectiveDelayMs(
       this.opts.defaultRateDelayMs,
       verdict.rateDelayMsOverride,
       robots.crawlDelaySeconds,
-    )
+    ), contract?.minSpacingMs ?? 0, ctx.sourceDelayMs ?? 0)
     this.robotsDelays.set(host, delay)
-    // A newly fetched robots policy is part of this request's prerequisite walk.
-    // Wait for it before content. Ordinary too-early subsequent requests still refuse.
-    if ('source' in robots && robots.source === 'network') await this.waitForHost(host, delay)
+    // A newly fetched robots policy, or a robots hop (e.g. the www destination of an apex
+    // walk) holding this host's latest stamp, is part of this request's prerequisite walk.
+    // Wait for it once before content; if spacing is still unmet the check below refuses.
+    // Ordinary too-early content-after-content requests still refuse without waiting.
+    if (ctx.sourceWait === true || ('source' in robots && robots.source === 'network') || this.robotsStamped.has(host)) await this.waitForHost(host, delay)
     const rate = this.limiter.check(host, delay)
     if (!rate.allowed) {
       await this.recordRefusal(url, 'rate_limited', { host, retryAfterMs: rate.retryAfterMs })
@@ -246,6 +264,12 @@ export class FetchPolicyGate {
     }
 
     return { allowed: true, rateDelayMs: delay }
+  }
+
+  /** Sequential bounded source scheduling shares robots/content timestamps and never waits twice. */
+  async fetchSourceText(url: string, ctx: GateContext & { sourceDelayMs: number }) {
+    if (!Number.isFinite(ctx.sourceDelayMs) || ctx.sourceDelayMs < 0) throw new Error('Invalid source pacing floor')
+    return this.fetchText(url, ctx)
   }
 
   /**
@@ -276,6 +300,7 @@ export class FetchPolicyGate {
       return { ok: false, reason: 'rate_limited' }
     }
     this.limiter.record(host)
+    this.robotsStamped.delete(host)
     const response = await rawGet(url, {
       userAgent: this.opts.userAgent,
       ...(ctx.maxBytes === undefined ? {} : { maxBytes: ctx.maxBytes }),
@@ -335,6 +360,7 @@ export class FetchPolicyGate {
       return { ok: false, reason: 'rate_limited' }
     }
     this.limiter.record(host)
+    this.robotsStamped.delete(host)
     const response = await rawPostJson(url, {
       userAgent: this.opts.userAgent,
       json: body,
@@ -407,6 +433,7 @@ export class FetchPolicyGate {
       return { ok: false, reason: 'rate_limited' }
     }
     this.limiter.record(host)
+    this.robotsStamped.delete(host)
     const response = await rawPostForm(url, {
       userAgent: this.opts.userAgent,
       form,

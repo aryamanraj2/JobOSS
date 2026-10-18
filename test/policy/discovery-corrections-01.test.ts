@@ -3,6 +3,7 @@ import { testDb, truncateAll, closeTestDb } from '../helpers/db.js'
 import { mockAgent } from '../setup.js'
 import { FetchPolicyGate } from '../../src/core/policy/fetch-policy-gate.js'
 import { fetchPage } from '../../src/ingest/fetch-page.js'
+import { HostRateLimiter } from '../../src/core/policy/rate-limit.js'
 import { currentPeriodMonth } from '../../src/core/policy/budget.js'
 const db = testDb()
 beforeEach(truncateAll)
@@ -32,6 +33,15 @@ it('RR1-03 spaces every same-host robots/content hop, applies Crawl-delay and fe
   }
   expect(await db.auditLog.count({ where: { action: 'fetch.robots_performed' } })).toBe(2)
 })
+it('RR1-03 a limiter clock that never advances cannot hang fetchText: one bounded wait, then rate_limited', async () => {
+  await gate()
+  const frozen = Date.now(), waits: number[] = []
+  const g = new FetchPolicyGate(db, { userAgent: 'DC1-test', robotsTtlSeconds: 86400, defaultRateDelayMs: 5000,
+    waitForDelay: (ms) => { waits.push(ms); return new Promise((resolve) => setTimeout(resolve, 0)) } }, new HostRateLimiter(5000, () => frozen))
+  mockAgent.get('https://pace.example').intercept({ path: '/robots.txt' }).reply(200, 'User-agent: *\nAllow: /\n')
+  expect(await g.fetchText('https://pace.example/seed')).toEqual({ ok: false, reason: 'rate_limited' })
+  expect(waits.length).toBe(1)
+}, 2_000)
 it.each([401, 403, 429, 500, 503])('RR1-08 robots %i refuses/pauses without fetching content, including cache', async (status) => {
   const g = await gate(), calls: string[] = []
   mockAgent.get('https://pace.example').intercept({ path: '/robots.txt' }).reply(() => { calls.push('robots'); return { statusCode: status, data: 'refused', responseOptions: { headers: { 'retry-after': '120' } } } })

@@ -13,7 +13,7 @@ import { ensureCompanyResearchBudget } from '../budget/company-budget.js'
 import { YcOssSeedProvider, inRecentStartupBand } from '../yc/yc-oss.js'
 import { runSeedIngest } from '../yc/seed-loader.js'
 import { object, DiscoveryPaused, type DiscoveryCandidate } from './common.js'
-import { StartupDbProvider, initialStartupDbCursor, type StartupDbCursor } from './startupdb.js'
+import { StartupDbProvider, initialStartupDbCursor, sanitizeStartupDbCursor, type StartupDbCursor } from './startupdb.js'
 import { HnHiringProvider, initialHnCursor, type HnCursor } from './hn.js'
 import type { PageResult } from '../fetch-page.js'
 import { storeFundingRound } from './funding.js'
@@ -78,9 +78,9 @@ async function storeCandidate(db: Db, gate: GatedFetcher, candidate: DiscoveryCa
     const identity = { kind: 'discovery_identity', companyName: candidate.companyName, website: candidate.website,
       canonicalDomain: canonical.domain, recordHash: hash, sourceFields }
     const json = JSON.stringify(identity)
-    // Unusually long exact source fields stay reconstructible without truncating JSON.
-    const excerpts = json.length <= 500 ? [json] : Array.from({ length: Math.ceil(json.length / 40) }, (_, index) =>
-      JSON.stringify({ kind: 'discovery_identity_chunk', recordHash: hash, index, total: Math.ceil(json.length / 40), text: json.slice(index * 40, (index + 1) * 40) }))
+    // Unusually long exact source fields stay reconstructible without truncating JSON: chunks of
+    // at most 300 characters, shortened only where escaping would exceed the 500-character excerpt.
+    const excerpts = json.length <= 500 ? [json] : identityChunks(json, hash)
     for (const excerpt of excerpts) {
       const identityHash = contentHashOf({ identity: hash, excerpt })
       if (!await db.evidence.findFirst({ where: { companyId: company.id, sourceUrl: candidate.sourceUrl, contentHash: identityHash }, select: { id: true } })) {
@@ -108,6 +108,18 @@ async function storeCandidate(db: Db, gate: GatedFetcher, candidate: DiscoveryCa
       portfolioRelationship: candidate.raw.portfolioRelationship ?? null },
   }, candidate.sourceUrl, now, candidate.investor, primaryPages)
   return company.id
+}
+
+function identityChunks(json: string, hash: string): string[] {
+  const texts: string[] = []
+  const wrap = (index: number, total: number, text: string) => JSON.stringify({ kind: 'discovery_identity_chunk', recordHash: hash, index, total, text })
+  for (let start = 0; start < json.length;) {
+    let size = Math.min(300, json.length - start)
+    // `total` is bounded by json.length, so its digits never exceed this probe's.
+    while (size > 1 && wrap(texts.length, json.length, json.slice(start, start + size)).length > 500) size--
+    texts.push(json.slice(start, start + size)); start += size
+  }
+  return texts.map((text, index) => wrap(index, texts.length, text))
 }
 
 export type BoardRefreshResult = { companyId: string;
@@ -199,6 +211,8 @@ export async function prepareDiscovery(db: Db, gate: GatedFetcher, opts: Prepare
         }
         status = processed === seeds.length && !provider.coverage.malformed && !provider.coverage.scanCapped && !coverage.invalidDomains ? 'completed' : 'partial'
       } else if (source === 'startupdb') {
+        // Finalization must retain sanitized authoritative state even before the provider's first checkpoint.
+        cursor = sanitizeStartupDbCursor(cursor)
         const state = Object.keys(cursor).length ? structuredClone(cursor) as StartupDbCursor : initialStartupDbCursor()
         const result = await new StartupDbProvider(gate, opts.delayMs ?? 5_000).discover(state, opts.limit, handle, checkpoint)
         coverage = { ...coverage, ...result.coverage }

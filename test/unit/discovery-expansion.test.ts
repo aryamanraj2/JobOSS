@@ -5,20 +5,25 @@ import { employerWebsite, parseExpandedPage } from '../../src/ingest/discovery/e
 import { discoverPublic, pageCursor } from '../../src/ingest/discovery/expanded/adapter.js'
 import { boundedSourceGate, publicPage } from '../../src/ingest/discovery/expanded/page.js'
 import { StubFetcher } from '../helpers/fixtures.js'
-import { fixture, html, job, org, NOW } from '../fixtures/discovery-expansion/fixtures.js'
+import { spcDetail, fixture, html, job, org, NOW } from '../fixtures/discovery-expansion/fixtures.js'
 const route = (id: string) => EXPANDED_ROUTES.find((r) => r.id === id)!
 const parse = (id: string, body?: string) => { const r = route(id); return parseExpandedPage(body ?? fixture(`${id.replaceAll(':', '-')}.html`), r.url!, r, NOW) }
 
 describe('X bounded public parsers — explicitly synthetic shapes', () => {
   it('SPC deduplicates actual rows beside contradictory empty UI and distinguishes fund/member associations', () => {
+    // SX1 (Part B 4): an SPC listing never establishes identity; duplicate rows collapse to one visible unresolved entry.
     const result = parse('southparkcommons:companies')
-    expect(result.candidates).toHaveLength(1); expect(result.candidates[0]?.provenance?.relationship).toBe('fund_investment')
-    const member = parse('southparkcommons:companies', html([org('Memberco', 'https://member.example', { description: 'SPC member company' })]))
+    expect(result.candidates).toHaveLength(0); expect(result.unresolved).toMatchObject([{ name: 'Acme', reason: 'identity_requires_same_source_detail_page' }])
+    // Fund/member distinction is now asserted on the same-source detail page, the only identity route.
+    const detail = (body: string) => { const r = route('southparkcommons:companies'); return parseExpandedPage(body, 'https://www.southparkcommons.com/companies/acme', r, NOW) }
+    expect(detail(spcDetail(org('Acme', 'https://acme.example', { description: 'fund investment' }))).candidates[0]?.provenance?.relationship).toBe('fund_investment')
+    const member = detail(spcDetail(org('Memberco', 'https://member.example', { description: 'SPC member company' })))
     expect(member.candidates[0]?.provenance?.relationship).toBe('member_association')
     expect(member.candidates[0]?.publishedAt).toBeNull(); expect(member.candidates[0]?.funding).toBeUndefined()
   })
   it('SPC does not upgrade conflicting member/investment language', () => {
-    expect(parse('southparkcommons:companies', html([org('Acme', 'https://acme.example', { description: 'member and fund investment' })])).candidates[0]?.provenance?.relationship).toBe('ambiguous_member_and_investment')
+    const r = route('southparkcommons:companies')
+    expect(parseExpandedPage(spcDetail(org('Acme', 'https://acme.example', { description: 'member and fund investment' })), 'https://www.southparkcommons.com/companies/acme', r, NOW).candidates[0]?.provenance?.relationship).toBe('ambiguous_member_and_investment')
   })
   it('Alchemist preserves highlight versus class29 scopes; dynamic shells are not empty complete portfolios', () => {
     expect(parse('alchemist:highlights').candidates).toHaveLength(1)
@@ -77,13 +82,16 @@ describe('X bounded public parsers — explicitly synthetic shapes', () => {
 })
 describe('X durable/bounded adapter contracts', () => {
   it('freezes the exact source/config manifest and reports every required unresolved subroute', () => {
-    expect(EXPANDED_ROUTES).toHaveLength(15)
+    // SX1 (Part B 8, 10): yc:hiring added; yc:jobs kept as a blocked, never-requested route.
+    expect(EXPANDED_ROUTES).toHaveLength(16)
+    expect(EXPANDED_ROUTES.filter((r) => r.kind !== 'unavailable' && !['permitted', 'limited', 'retained_contract'].includes(r.access)).map((r) => [r.id, r.access])).toEqual([
+      ['yc:jobs', 'access_blocked'], ['alchemist:class29', 'stale'], ['ef:companies', 'unavailable'], ['masschallenge:ch-uk-2026', 'access_blocked'], ['masschallenge:us-2023', 'access_blocked']])
     const manifest = expandedManifest(); expect(contentHashOf(manifest)).toBe(expandedManifestHash())
     manifest.routes[0]!.scope = 'tampered'; expect(contentHashOf(manifest)).not.toBe(expandedManifestHash())
     expect(EXPANDED_ROUTES.filter((r) => r.kind === 'unavailable').map((r) => r.id)).toEqual(['yc:work-at-a-startup', 'alchemist:details', 'masschallenge:alumni'])
   })
   it('retains the frozen partial page without refetch/order skips and does not charge duplicate company quota', async () => {
-    const r = route('ef:companies'), cursor = pageCursor(r), ids = new Set<string>()
+    const r = route('seedcamp:companies'), cursor = pageCursor(r), ids = new Set<string>()
     const gate = new StubFetcher({ [r.url!]: { body: html([org(), org('Second', 'https://second.example')]) } })
     const handle = async (c: { website: string }) => { const fresh = !ids.has(c.website); ids.add(c.website); return fresh }
     await discoverPublic(gate, r, cursor, NOW, handle, async () => {}, 1)
@@ -93,7 +101,7 @@ describe('X durable/bounded adapter contracts', () => {
     expect(ids.size).toBe(2); expect(noFetch.requested).toHaveLength(0); expect(cursor.scopeDone).toBe(true)
   })
   it('catches cyclic and repeated-content pagination and caps page traversal', async () => {
-    const r = route('ef:companies')
+    const r = route('seedcamp:companies')
     const pages: Record<string, { body: string }> = {}
     for (let i = 0; i < 8; i++) pages[i ? `${r.url}?page=${i}` : r.url!] = { body: html([org(`C${i}`, `https://c${i}.example`)], `<a rel="next" href="?page=${i + 1}">Next</a>`) }
     const gate = new StubFetcher(pages), cursor = pageCursor(r)
@@ -108,13 +116,13 @@ describe('X durable/bounded adapter contracts', () => {
   })
   it('follows only gated same-source details with exact company names and preserves directory entry', async () => {
     const r = route('southparkcommons:companies'), cursor = pageCursor(r), stored: unknown[] = []
-    const gate = new StubFetcher({ [r.url!]: { body: '<html><body><article><h2><a href="/companies/acme">Acme</a></h2></article></body></html>' }, 'https://www.southparkcommons.com/companies/acme': { body: html([org()]) } })
+    const gate = new StubFetcher({ [r.url!]: { body: '<html><body><article><h2><a href="/companies/acme">Acme</a></h2></article></body></html>' }, 'https://www.southparkcommons.com/companies/acme': { body: spcDetail() } })
     await discoverPublic(gate, r, cursor, NOW, async (c) => { stored.push(c); return true }, async () => {}, 20)
     expect(stored).toHaveLength(1); expect(stored[0]).toMatchObject({ companyName: 'Acme', raw: { detailUrl: 'https://www.southparkcommons.com/companies/acme' } })
     expect(cursor.unresolved).toHaveLength(0)
   })
   it('429 keeps retry-after and byte/truncation/refusal/redirect failures stay bounded', async () => {
-    const r = route('ef:companies')
+    const r = route('seedcamp:companies')
     const rate = boundedSourceGate(new StubFetcher({ [r.url!]: { body: '', statusCode: 429, headers: { 'retry-after': '17' } } }), r, 0)
     await expect(publicPage(rate.gate, r.url!, r)).rejects.toMatchObject({ reason: 'source_rate_limited', retryAfterSeconds: 17 })
     const truncated = boundedSourceGate(new StubFetcher({ [r.url!]: { body: 'partial', truncated: true } }), r, 0)
@@ -124,7 +132,7 @@ describe('X durable/bounded adapter contracts', () => {
   })
 })
 it('source request/byte/record caps cannot be bypassed by a fake transport ignoring maxBytes', async () => {
-  const r = route('ef:companies'), url = r.url!
+  const r = route('seedcamp:companies'), url = r.url!
   const gate = boundedSourceGate(new StubFetcher({ [url]: { body: 'x' } }), r, 0)
   for (let i = 0; i < 250; i++) await gate.gate.fetchText(url, { cost: 1 })
   await expect(gate.gate.fetchText(url, { cost: 1 })).rejects.toMatchObject({ reason: 'request_cap_250' })
@@ -135,7 +143,7 @@ it('source request/byte/record caps cannot be bypassed by a fake transport ignor
 })
 it('foreign source details and wrong-company details cannot manufacture a company binding', async () => {
   const r = route('southparkcommons:companies'), cursor = pageCursor(r), candidates: unknown[] = []
-  const gate = new StubFetcher({ [r.url!]: { body: '<html><body><article><h2><a href="/companies/acme">Acme</a></h2></article></body></html>' }, 'https://www.southparkcommons.com/companies/acme': { body: html([org('Lookalike', 'https://foreign.example')]) } })
+  const gate = new StubFetcher({ [r.url!]: { body: '<html><body><article><h2><a href="/companies/acme">Acme</a></h2></article></body></html>' }, 'https://www.southparkcommons.com/companies/acme': { body: spcDetail(org('Lookalike', 'https://foreign.example')) } })
   await discoverPublic(gate, r, cursor, NOW, async (c) => { candidates.push(c); return true }, async () => {}, 20)
   expect(candidates).toHaveLength(0); expect(cursor.unresolved).toHaveLength(1)
   expect(cursor.limitations).toContain('unresolved_detail_binding:https://www.southparkcommons.com/companies/acme')

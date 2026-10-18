@@ -1,0 +1,23 @@
+{
+  "label": "real-format trimmed fixture: saved first-party pre-flight bytes; whole records removed only, no markup rewritten",
+  "sourceFile": "scratch/joboss-source-access-preflight-01-20261018-a/raw/https_www_alchemistaccelerator_com_portfolio_2",
+  "sourceSha256": "9378857ffdea0ed9a16fb5c3e88225096651bc7b8d7909aae6e88c62415e71d0",
+  "sourceBytes": 126796,
+  "preflight": "docs/JOBOSS-SOURCE-ACCESS-PREFLIGHT-01.md (18 Oct 2026, root, plain GET, joboss-preflight/1)",
+  "fixtureSha256": "b92f0026ec1474a0b6c5f6baad6ffe016a1a5fab31a0062e3b926d670372c713",
+  "fixtureBytes": 72671,
+  "selection": {
+    "records": "portfolio-banner-items and investors-hubdb-items",
+    "keptBanner": 3,
+    "keptGrid": 3,
+    "sourceBanner": 40,
+    "sourceGrid": 20,
+    "pagination": "retained (pno=0..5, next pno=2)"
+  },
+  "expected": {
+    "candidates": 0,
+    "unresolved": 6,
+    "next": "https://www.alchemistaccelerator.com/portfolio-2?pno=2",
+    "vaultRequests": 0
+  }
+}

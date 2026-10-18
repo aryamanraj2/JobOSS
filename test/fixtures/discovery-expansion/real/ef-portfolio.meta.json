@@ -1,0 +1,18 @@
+{
+  "label": "real-format trimmed fixture: saved first-party pre-flight bytes; whole records removed only, no markup rewritten",
+  "sourceFile": "scratch/joboss-source-access-preflight-01-20261018-a/raw/https_www_joinef_com_portfolio_",
+  "sourceSha256": "1cba1b28b3e3a92cd6211864775bff72ec5f5b8fa540a6487a2516c2cbbab6df",
+  "sourceBytes": 248650,
+  "preflight": "docs/JOBOSS-SOURCE-ACCESS-PREFLIGHT-01.md (18 Oct 2026, root, plain GET, joboss-preflight/1)",
+  "fixtureSha256": "5fb683746b3dd12dea205e8faac571df35f3871d5a4909d5568238d826926820",
+  "fixtureBytes": 76201,
+  "selection": {
+    "records": "tile--company tiles",
+    "kept": 2,
+    "sourceTiles": 48
+  },
+  "expected": {
+    "candidates": 0,
+    "note": "no company website in static HTML; ajax_url admin-ajax.php retained in php_variables; route is unavailable and never requested"
+  }
+}

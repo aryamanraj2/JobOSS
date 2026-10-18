@@ -40,10 +40,10 @@ beforeEach(async () => {
 })
 afterAll(async () => closeTestDb())
 
-function gate(now?: () => Date, limiter?: HostRateLimiter) {
+function gate(now?: () => Date, limiter?: HostRateLimiter, waitForDelay?: (ms: number) => Promise<void>) {
   return new FetchPolicyGate(
     testDb(),
-    { userAgent: USER_AGENT, robotsTtlSeconds: 86_400, defaultRateDelayMs: 5_000, ...(now ? { now } : {}) },
+    { userAgent: USER_AGENT, robotsTtlSeconds: 86_400, defaultRateDelayMs: 5_000, ...(now ? { now } : {}), ...(waitForDelay ? { waitForDelay } : {}) },
     limiter,
   )
 }
@@ -93,7 +93,8 @@ const scenarios: Record<string, () => Promise<ReasonCodeValue>> = {
     serveRobots('https://rated.example', 'User-agent: *\nAllow: /\n')
     mockAgent.get('https://rated.example').intercept({ path: /^\/p/, method: 'GET' }).reply(200, 'x').persist()
     await openGlobal(new Date(now))
-    const g = gate(() => new Date(now), limiter)
+    // The fresh robots walk now precedes p1 on the same host; waiting advances this clock.
+    const g = gate(() => new Date(now), limiter, async (ms) => { now += ms })
     await g.fetchText('https://rated.example/p1')
     now += 100
     const r = await g.check('https://rated.example/p2')

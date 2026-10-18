@@ -3,14 +3,14 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { testDb, truncateAll, closeTestDb } from '../helpers/db.js'
 import { StubFetcher } from '../helpers/fixtures.js'
 import { prepareDiscovery } from '../../src/ingest/discovery/prepare.js'
-import { EXPANDED_ROUTES } from '../../src/ingest/discovery/expanded/registry.js'
+import { EXPANDED_ROUTES, routeRunnable } from '../../src/ingest/discovery/expanded/registry.js'
 import { parseExpandedPage } from '../../src/ingest/discovery/expanded/parsers.js'
 import { candidateKey } from '../../src/ingest/discovery/expanded/snapshot.js'
 import type { PageCursor } from '../../src/ingest/discovery/expanded/adapter.js'
 import { contentHashOf } from '../../src/core/evidence/content-hash.js'
 import { FetchPolicyGate } from '../../src/core/policy/fetch-policy-gate.js'
 import { seedHostPolicies } from '../../src/core/policy/host-policy.js'
-import { responses, html, org, job, NOW } from '../fixtures/discovery-expansion/fixtures.js'
+import { spcDetail, responses, html, org, job, NOW } from '../fixtures/discovery-expansion/fixtures.js'
 
 const db = testDb(), options = { mode: 'expanded-v1' as const, limit: 20, now: NOW, delayMs: 0 }
 const NEXT = new Date(NOW.getTime() + 86400000), FEED = 'https://yc-oss.github.io/api/companies/all.json'
@@ -77,7 +77,7 @@ it('RX-03-R1 meaningful changed YC bytes still pause frozen feed before persiste
 })
 
 it.each(['pending-single', 'pending-multi', 'unknown-multi', 'replaced-multi', 'unknown-terminal', 'replaced-terminal'])('RX-04-R1 %s refuses unsupported progress before requests or credits with forensic cursor intact', async (mode) => {
-  const r = route('ef:companies'), pages = responses(), multi = mode.includes('multi'), terminal = mode.includes('terminal')
+  const r = route('seedcamp:companies') /* SX1: EF unavailable */, pages = responses(), multi = mode.includes('multi'), terminal = mode.includes('terminal')
   const entries = Array.from({ length: 21 }, (_, i) => org(i === 20 ? 'Pending' : `Before ${i}`, i === 20 ? 'https://pending.example' : `https://before-${i}.example`))
   pages[r.url!] = { body: multi ? html(entries.slice(0, 1), '<a rel="next" href="?p=2">Next</a>') : html(terminal ? entries.slice(0, 2) : entries) }
   if (multi) pages[r.url! + '?p=2'] = { body: html(entries.slice(1)) }
@@ -104,8 +104,16 @@ it.each(['pending-single', 'pending-multi', 'unknown-multi', 'replaced-multi', '
   expect(s.coverage.countsThisInvocation).toMatchObject({ requests: 0 })
 })
 
-it.each(['ef:companies', 'yc:jobs', 'seedcamp:talent'])('RX-04-R1 genuine multi-page v1 %s keys reconstruct from durable records through partial and terminal resume', async (id) => {
-  const r = route(id), pages = responses(), make = (i: number) => r.kind === 'jobs' ? job({ identifier: `v1-${i}`, url: new URL(`/jobs/${i}`, r.url!).href,
+it.each(['ef:companies', 'yc:jobs', 'seedcamp:talent', 'seedcamp:companies'])('RX-04-R1 genuine multi-page v1 %s keys reconstruct from durable records through partial and terminal resume', async (id) => {
+  const r = route(id), pages = responses()
+  if (!routeRunnable(r)) {
+    // SX1 (Part B 6, 8): EF and yc:jobs make zero requests and stay visible gaps; seedcamp:companies/talent carry this coverage.
+    const gate = new StubFetcher(pages), blocked = await prepareDiscovery(db, gate, options)
+    expect(gate.requested).not.toContain(r.url)
+    expect(src(blocked, id)).toMatchObject({ status: r.access, discovered: 0, coverage: { reason: r.access, scopeComplete: false, records: [] } })
+    return
+  }
+  const make = (i: number) => r.kind === 'jobs' ? job({ identifier: `v1-${i}`, url: new URL(`/jobs/${i}`, r.url!).href,
     hiringOrganization: org(`V1 ${i}`, `https://v1-${i}.example`), applicationUrl: `https://v1-${i}.example/apply` }) : org(`V1 ${i}`, `https://v1-${i}.example`)
   pages[r.url!] = { body: html([make(0)], '<a rel="next" href="?p=2">Next</a>') }; pages[r.url! + '?p=2'] = { body: html(Array.from({ length: 20 }, (_, i) => make(i + 1))) }
   const first = await prepareDiscovery(db, new StubFetcher(pages), options), row = await db.discoveryRun.findUniqueOrThrow({ where: { id: src(first, id).runId } })
@@ -131,9 +139,11 @@ it.each(['ef:companies', 'yc:jobs', 'seedcamp:talent'])('RX-04-R1 genuine multi-
 })
 it.each([false, true])('RX-04-R1 genuine unresolved/resolved redirected detail bookkeeping needs no invented durable candidate; resolved=%s', async (resolved) => {
   const r = route('southparkcommons:companies'), pages = responses(), requested = new URL('/companies/detail', r.url!).href, final = new URL('/company/detail', r.url!).href
-  pages[r.url!] = { body: html(Array.from({ length: 21 }, (_, i) => org(`Plain ${i}`, `https://plain-${i}.example`)), '<article><h2><a href="/companies/detail">Detail</a></h2><p>member company</p></article>') }
-  pages[requested] = { body: '', statusCode: 302, headers: { location: final } }; pages[final] = { body: html(resolved ? [org('Detail', 'https://detail.example')] : []) }
-  const first = await prepareDiscovery(db, new StubFetcher(pages), options), row = await db.discoveryRun.findUniqueOrThrow({ where: { id: src(first, r.id).runId } })
+  // SX1 (Part B 4): SPC listing rows bind no identity, so the other employer comes from its own detail page and limit 1 keeps Detail pending.
+  pages[r.url!] = { body: '<html><body><article><h2><a href="/companies/plain">Plain</a></h2></article><article><h2><a href="/companies/detail">Detail</a></h2><p>member company</p></article></body></html>' }
+  pages[new URL('/companies/plain', r.url!).href] = { body: spcDetail(org('Plain', 'https://plain.example')) }
+  pages[requested] = { body: '', statusCode: 302, headers: { location: final } }; pages[final] = { body: resolved ? spcDetail(org('Detail', 'https://detail.example')) : html([]) }
+  const first = await prepareDiscovery(db, new StubFetcher(pages), { ...options, limit: 1 }), row = await db.discoveryRun.findUniqueOrThrow({ where: { id: src(first, r.id).runId } })
   const cursor = json(row.cursor) as PageCursor
   expect(cursor.processed).toContain(`detail:${requested}`)
   if (resolved) {
@@ -142,13 +152,18 @@ it.each([false, true])('RX-04-R1 genuine unresolved/resolved redirected detail b
     await db.discoveryRun.update({ where: { id: row.id }, data: { cursor: json(cursor) } })
   }
   const gate = new StubFetcher({}), second = await prepareDiscovery(db, gate, { ...options, now: NEXT, resume: true, runId: first.batchId })
-  expect(src(second, r.id).status).toBe('unverified'); expect(src(second, r.id).discovered).toBe(resolved ? 22 : 21)
-  expect(gate.requested).toEqual([]); expect(src(second, r.id).coverage.unresolved).toHaveLength(resolved ? 0 : 1)
+  expect(src(second, r.id).status).toBe('unverified'); expect(src(second, r.id).discovered).toBe(resolved ? 2 : 1)
+  // limit 1 leaves unrelated routes legitimately partial; this SPC scope itself makes no request.
+  const spcRequests = () => gate.requested.filter((u) => new URL(u).hostname === 'www.southparkcommons.com')
+  expect(spcRequests()).toEqual([]); expect(src(second, r.id).coverage.unresolved).toHaveLength(resolved ? 0 : 1)
   const third = await prepareDiscovery(db, gate, { ...options, now: NEXT, resume: true, runId: first.batchId })
-  expect(src(third, r.id).coverage.records).toEqual(src(second, r.id).coverage.records); expect(gate.requested).toEqual([])
+  expect(src(third, r.id).coverage.records).toEqual(src(second, r.id).coverage.records); expect(spcRequests()).toEqual([])
   evidence(`detail-${resolved}`, { cursor, second: src(second, r.id), third: src(third, r.id) })
 })
 
+// SX1 (Part B 8): production-path cases moved from yc:jobs (never requested) to seedcamp:talent.
+const T = 'https://talent.seedcamp.com', oneT = (applicationUrl: string) => job({ identifier: 'role-1', url: `${T}/jobs/1`, hiringOrganization: org('Employer One', 'https://employer-one.example'), applicationUrl })
+const tenT = () => job({ identifier: 'role-10', url: `${T}/jobs/10`, hiringOrganization: org('Employer Ten', 'https://employer-ten.example'), applicationUrl: `${T}/jobs/10/apply` })
 const one = (applicationUrl: string, url = 'https://www.ycombinator.com/jobs/1') => job({ identifier: 'role-1', url, hiringOrganization: org('Employer One', 'https://employer-one.example'), applicationUrl })
 const ten = () => job({ identifier: 'role-10', url: 'https://www.ycombinator.com/jobs/10', hiringOrganization: org('Employer Ten', 'https://employer-ten.example'), applicationUrl: 'https://www.ycombinator.com/jobs/10/apply' })
 it.each([
@@ -174,8 +189,8 @@ it.each([
   expect(parsed.candidates.map((c) => c.companyName)).toEqual(['Employer One', 'Employer Ten']); expect(parsed.unresolved).toEqual([])
 })
 it('RX-06-R1 production two-employer sibling path rejects One before canonical/Evidence/hosts/ledger/bound handoff', async () => {
-  const r = route('yc:jobs'), pages = responses(), bad = one('https://www.ycombinator.com/jobs/10/apply')
-  pages[r.url!] = { body: html([bad, ten()]) }
+  const r = route('seedcamp:talent'), pages = responses(), bad = oneT(`${T}/jobs/10/apply`)
+  pages[r.url!] = { body: html([bad, tenT()]) }
   const result = await prepareDiscovery(db, new StubFetcher(pages), options), s = src(result, r.id)
   const companies = await db.company.findMany({ where: { canonicalDomain: { in: ['employer-one.example', 'employer-ten.example'] } } })
   const sourceEvidence = await db.evidence.findMany({ where: { sourceUrl: r.url! } })
@@ -189,18 +204,18 @@ it('RX-06-R1 production two-employer sibling path rejects One before canonical/E
   expect(result.handoff!.items.find((i) => i.domain === 'employer-ten.example')?.listingHints).toHaveLength(1)
 })
 it('RX-06-R1 independently discovered rejected employer keeps only its truthful company attribution and unresolved advertised input', async () => {
-  const pages = responses(), r = route('yc:jobs'); pages[r.url!] = { body: html([one('https://www.ycombinator.com/jobs/10/apply'), ten()]) }
-  pages[route('ef:companies').url!] = { body: html([org('Employer One', 'https://employer-one.example')]) }
+  const pages = responses(), r = route('seedcamp:talent'); pages[r.url!] = { body: html([oneT(`${T}/jobs/10/apply`), tenT()]) }
+  pages[route('seedcamp:companies').url!] = { body: html([org('Employer One', 'https://employer-one.example')]) }
   const result = await prepareDiscovery(db, new StubFetcher(pages), options), item = result.handoff!.items.find((i) => i.domain === 'employer-one.example')!
-  expect(item.sourceRoutes).toEqual(['ef:companies']); expect(item.listingHints).toEqual([]); expect(item.unresolvedAdvertisedHints).toHaveLength(1)
+  expect(item.sourceRoutes).toEqual(['seedcamp:companies']); expect(item.listingHints).toEqual([]); expect(item.unresolvedAdvertisedHints).toHaveLength(1)
   expect(await db.evidence.count({ where: { companyId: item.companyId, sourceUrl: r.url! } })).toBe(0)
 })
 it('RX-06-R1 persisted pending job with sibling application refuses identically without overwriting forensic JSON', async () => {
-  const r = route('yc:jobs'), pages = responses(); pages[r.url!] = { body: html(Array.from({ length: 21 }, (_, i) => job({ identifier: `restore-${i}`, url: new URL(`/jobs/${i}`, r.url!).href,
+  const r = route('seedcamp:talent'), pages = responses(); pages[r.url!] = { body: html(Array.from({ length: 21 }, (_, i) => job({ identifier: `restore-${i}`, url: new URL(`/jobs/${i}`, r.url!).href,
     hiringOrganization: org(`Restore ${i}`, `https://restore-${i}.example`), applicationUrl: new URL(`/jobs/${i}/apply`, r.url!).href }))) }
   const first = await prepareDiscovery(db, new StubFetcher(pages), options), row = await db.discoveryRun.findUniqueOrThrow({ where: { id: src(first, r.id).runId } })
   const cursor = json(row.cursor) as PageCursor, pending = cursor.snapshot!.parsed.candidates[20]!
-  pending.raw.applicationUrl = 'https://www.ycombinator.com/jobs/200/apply'; pending.provenance!.listing!.applicationUrl = String(pending.raw.applicationUrl)
+  pending.raw.applicationUrl = `${T}/jobs/200/apply`; pending.provenance!.listing!.applicationUrl = String(pending.raw.applicationUrl)
   await db.discoveryRun.update({ where: { id: row.id }, data: { cursor: json(cursor) } })
   const gate = new StubFetcher({}), second = await prepareDiscovery(db, gate, { ...options, now: NEXT, resume: true, runId: first.batchId })
   evidence('sibling-snapshot-refusal', { cursor, second: src(second, r.id), requests: gate.requested })
@@ -209,7 +224,7 @@ it('RX-06-R1 persisted pending job with sibling application refuses identically 
   expect(await db.company.findUnique({ where: { canonicalDomain: 'restore-20.example' } })).toBeNull(); expect(gate.requested).toEqual([])
 })
 it('RX-06-R1 external ATS listing remains raw unresolved and creates no company', async () => {
-  const r = route('yc:jobs'), pages = responses(), bad = one('https://jobs.lever.co/employer-one/mobile')
+  const r = route('seedcamp:talent'), pages = responses(), bad = oneT('https://jobs.lever.co/employer-one/mobile')
   pages[r.url!] = { body: html([bad]) }; const result = await prepareDiscovery(db, new StubFetcher(pages), options)
   expect(src(result, r.id).coverage.records).toEqual([]); expect(src(result, r.id).coverage.unresolved).toMatchObject([{ raw: bad }])
   expect(await db.company.findUnique({ where: { canonicalDomain: 'employer-one.example' } })).toBeNull()

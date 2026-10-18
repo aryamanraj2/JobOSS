@@ -15,6 +15,11 @@ export type RobotsVerdict = {
   retryAfterMs?: number
 }
 
+/** The shared host scheduler could not space a robots hop. Transient: never cached or read as rules. */
+export class RobotsPacingShortfall extends Error {
+  constructor(readonly retryAfterMs: number) { super('robots same-host spacing not met') }
+}
+
 export type RobotsOptions = {
   userAgent: string
   ttlSeconds: number
@@ -68,6 +73,9 @@ export async function checkRobots(
     `${parsed.protocol}//${parsed.host}/robots.txt`,
     opts, db,
   )
+  if (fetched.pacingShortfallMs !== undefined) {
+    return { allowed: false, crawlDelaySeconds: null, parseOk: false, source: 'network', statusCode: null, pause: true, retryAfterMs: fetched.pacingShortfallMs }
+  }
   const { body, parseOk, statusCode } = fetched
   const fetchedAt = opts.now?.() ?? new Date()
   const ttlSeconds = fetched.retryAfterMs === undefined ? Math.min(opts.ttlSeconds, fetched.remainingTtlSeconds ?? opts.ttlSeconds) : Math.max(1, Math.ceil(fetched.retryAfterMs / 1000))
@@ -99,7 +107,7 @@ const REDIRECT_CODES = new Set([301, 302, 303, 307, 308])
 async function fetchRobotsFollowingRedirects(
   startUrl: string,
   opts: RobotsOptions, db: Db,
-): Promise<{ body: string; parseOk: boolean; statusCode: number | null; retryAfterMs?: number; remainingTtlSeconds?: number }> {
+): Promise<{ body: string; parseOk: boolean; statusCode: number | null; retryAfterMs?: number; remainingTtlSeconds?: number; pacingShortfallMs?: number }> {
   const originHost = new URL(startUrl).host
   let url = startUrl
   let statusCode: number | null = null
@@ -126,7 +134,8 @@ async function fetchRobotsFollowingRedirects(
           fetchedAt: opts.now?.() ?? new Date(), ttlSeconds: retryAfterMs === undefined ? opts.ttlSeconds : Math.max(1, Math.ceil(retryAfterMs / 1000)) }
         await db.robotsCache.upsert({ where: { host }, create: { host, ...data }, update: data })
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof RobotsPacingShortfall) return { body: '', parseOk: false, statusCode, pacingShortfallMs: Math.max(1, error.retryAfterMs) }
       return { body: '', parseOk: false, statusCode }
     }
     statusCode = res.statusCode
@@ -203,12 +212,15 @@ function evaluate(
   }
 }
 
-/** Retry-After seconds or HTTP date; unavailable rules pause for at least a minute. */
+// RFC 9110 HTTP-date forms: IMF-fixdate, obsolete RFC 850 and asctime. Anything else is malformed.
+const HTTP_DATE = /^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT|(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day, \d{2}-[A-Z][a-z]{2}-\d{2} \d{2}:\d{2}:\d{2} GMT|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4})$/
+
+/** Retry-After delta-seconds or a genuine HTTP-date; malformed values and unavailable rules pause a minute. */
 function pauseDelay(response: RawResponse, now: Date): number | undefined {
   if (response.statusCode !== 429 && response.statusCode < 500) return undefined
-  const header = response.headers['retry-after'], raw = Array.isArray(header) ? header[0] : header
+  const header = response.headers['retry-after'], raw = (Array.isArray(header) ? header[0] : header)?.trim()
   if (raw && /^\d+$/.test(raw)) return Math.max(1000, Number(raw) * 1000)
-  const date = raw ? Date.parse(raw) : NaN
+  const date = raw && HTTP_DATE.test(raw) ? Date.parse(raw) : NaN
   return Number.isFinite(date) ? Math.max(1000, date - now.getTime()) : 60_000
 }
 

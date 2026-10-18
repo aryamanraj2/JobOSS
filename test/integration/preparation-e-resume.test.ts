@@ -25,7 +25,7 @@ it('E session serialization returns busy from an independent client during HTTP 
   try{
     const locks=(await observer.query("SELECT a.pid,a.state,a.xact_start,l.granted FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.objid=(hashtextextended($1,17) & 4294967295)::oid AND l.classid=((hashtextextended($1,17) >> 32) & 4294967295)::oid",['preparation:serialized'])).rows
     expect(locks).toHaveLength(1);expect(locks[0]).toMatchObject({granted:true,state:'idle',xact_start:null})
-    expect((await observer.query("SELECT count(*)::int AS n FROM discovery_run WHERE coverage->>'batchId'='prep_serialized'")).rows[0].n).toBe(15)
+    expect((await observer.query("SELECT count(*)::int AS n FROM discovery_run WHERE coverage->>'batchId'='prep_serialized'")).rows[0].n).toBe(EXPANDED_ROUTES.length)
     const busy=await prepareOutreach(w.db,w.gate,url(),{runId:'serialized',resume:true},clock);expect(busy.status).toBe('busy')
     console.log('E concurrent PG observation',JSON.stringify(locks),JSON.stringify(busy))
   }finally{release.resolve();await active;await observer.end()}
@@ -37,7 +37,7 @@ it.each(['create','discovery','draft'])('E unknown %s commit acknowledgement res
     if(k==='preparationRun' && stage==='create')return new Proxy(t.preparationRun,{get(model,key){if(key==='create')return async(...args: Parameters<typeof model.create>)=>{const r=await model.create(...args);if(armed){armed=false;throw new Error('synthetic unknown create acknowledgement')}return r};return Reflect.get(model,key)}})
     if(k==='$transaction' && stage!=='create')return async(...args: Parameters<typeof t.$transaction>)=>{
       const result=await Reflect.apply(t.$transaction,t,args)
-      if(armed && (stage==='discovery' && await t.discoveryRun.count()===15 || stage==='draft' && await t.draft.count()>0)){armed=false;throw new Error(`synthetic unknown ${stage} commit acknowledgement`)}return result
+      if(armed && (stage==='discovery' && await t.discoveryRun.count()===EXPANDED_ROUTES.length || stage==='draft' && await t.draft.count()>0)){armed=false;throw new Error(`synthetic unknown ${stage} commit acknowledgement`)}return result
     }
     const value=Reflect.get(t,k);return typeof value==='function'?value.bind(t):value
   }}) as Db
@@ -47,7 +47,7 @@ it.each(['create','discovery','draft'])('E unknown %s commit acknowledgement res
   expect(before.checkpoint).toMatchObject({batchId:`prep_ack-${stage}`})
   const recovered=await prepareOutreach(w.db,w.gate,url(),{runId:`ack-${stage}`,resume:true},clock)
   expect(recovered.checkpoint!.entries.find(e=>e.selected)!.stage).toBe('composing')
-  expect(await w.db.discoveryRun.count()).toBe(15);expect(await w.db.draft.count()).toBe(1);expect(await w.db.lead.count()).toBe(1)
+  expect(await w.db.discoveryRun.count()).toBe(EXPANDED_ROUTES.length);expect(await w.db.draft.count()).toBe(1);expect(await w.db.lead.count()).toBe(1)
 })
 it('E changed options and malformed/foreign checkpoint fail without overwriting forensic state',async()=>{
   const w=await prepWorld();await prepareOutreach(w.db,w.gate,url(),request('frozen'),clock)
@@ -202,7 +202,8 @@ it('E discovery facade preserves actual standalone/transaction identity and neve
 })
 // Corrections 01 controls (R-E O1/O4/S1 shapes). Written red before the corrections.
 it.each(['positive-first-page','low-fit-first-page'])('E corrections01 RP-01 %s: no cohort or company work until bounded discovery finishes, then one complete ranking',async kind=>{
-  const w=await prepWorld(),spc=EXPANDED_ROUTES.find(r=>r.id==='southparkcommons:companies')!
+  // SX1 (Part B 4): SPC listing rows bind no identity; Seedcamp carries this paged-directory coverage.
+  const w=await prepWorld(),spc=EXPANDED_ROUTES.find(r=>r.id==='seedcamp:companies')!
   // Acme exists on SPC page 2 only: StartupDB/HN stay valid finished sources that emit no Acme.
   for(const key of Object.keys(w.pages)){const u=new URL(key)
     if(u.hostname==='startupdb.com'&&u.pathname.endsWith('/portfolio'))w.pages[key]={body:JSON.stringify({data:[],pagination:{total:0}})}
@@ -244,7 +245,7 @@ it('E corrections01 RP-01 pre-correction checkpoint version is rejected visibly 
   const status=await preparationStatus(w.db,'old-version');expect(status).toMatchObject({status:'invalid_checkpoint'});expect(status!.error).toContain('preparation-e@1')
 })
 it('E corrections01 RP-03 unchanged ATS re-observation by actual ingestPostings keeps a listed entry bound',async()=>{
-  const w=await prepWorld({listed:true});addRoute(w,'yc:jobs',true)
+  const w=await prepWorld({listed:true});addRoute(w,'seedcamp:talent',true) // SX1 (Part B 8): yc:jobs is never requested
   await boardSnapshot(w.company.id,NOW,[syntheticJob('j1'),syntheticJob('decoy','iOS Engineer Intern')])
   const first=await prepareOutreach(w.db,w.gate,url(),request('rp03-listed'),clock),e=first.checkpoint!.entries.find(e=>e.selected)!
   const role=await w.db.opportunity.findFirstOrThrow({where:{companyId:w.company.id,externalId:'j1'}});expect(e).toMatchObject({intent:'listed',opportunityId:role.id})

@@ -205,4 +205,4 @@ export interface LlmGateway {
  * Adapters receive a gate, never a client. This alias exists so that constructor
  * signatures across F1-F2 say so out loud.
  */
-export type GatedFetcher = Pick<FetchPolicyGate, 'check' | 'fetchText'>
+export type GatedFetcher = Pick<FetchPolicyGate, 'check' | 'fetchText'> & Partial<Pick<FetchPolicyGate, 'fetchSourceText'>>
