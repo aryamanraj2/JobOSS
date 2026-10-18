@@ -2,7 +2,7 @@ import type { GatedFetcher } from '../../core/interfaces/providers.js'
 import { contentHashOf } from '../../core/evidence/content-hash.js'
 import { canonicalizeDomain } from '../domain/canonicalize.js'
 import { SourceError } from '../source-error.js'
-import { array, object, str, discoveryJson, waitForSource, DiscoveryPaused, type CandidateHandler } from './common.js'
+import { array, object, str, waitForSource, DiscoveryPaused, type CandidateHandler } from './common.js'
 
 export const STARTUPDB_BASE = 'https://startupdb.com/api/v1'
 export const INVESTOR_SEEDS = [
@@ -11,7 +11,7 @@ export const INVESTOR_SEEDS = [
   { name: 'Index Ventures', domain: 'indexventures.com' },
 ] as const
 export type StartupDbCursor = { version: 2; investorIndex: number; investorSlug?: string; offset: number; entryIndex: number;
-  pageHashes: Record<string, string>; omissions: string[]; disclosures: unknown[]; pending?: { slug: string; detail: Record<string, unknown>;
+  pageHashes: Record<string, string>; omissions: (string | Record<string, unknown>)[]; responseFailures?: Record<string, unknown>[]; disclosures: unknown[]; pending?: { slug: string; detail: Record<string, unknown>;
     entry: Record<string, unknown>; funding: Record<string, unknown>[]; fundingOffset: number; total: number;
     fundingHashes: Record<string, string>; fundingDone: boolean } }
 export const initialStartupDbCursor = (): StartupDbCursor => ({ version: 2, investorIndex: 0, offset: 0, entryIndex: 0, pageHashes: {}, omissions: [], disclosures: [] })
@@ -37,6 +37,10 @@ function pageFinished(response: Record<string, unknown>, length: number, offset:
       (!length && total > offset)) throw new Error('Missing/inconsistent pagination total; coverage undetermined')
   return offset + length >= total
 }
+/** A UTF-8 prefix, never more than 4 KiB (including multibyte source text). */
+function rawExcerpt(raw: string): string {
+  return new TextDecoder().decode(Buffer.from(raw).subarray(0, 4096), { stream: true })
+}
 export class StartupDbProvider {
   constructor(private readonly gate: GatedFetcher, private readonly delayMs = 5_000) {}
   async discover(cursor: StartupDbCursor, limit: number, handle: CandidateHandler,
@@ -47,10 +51,20 @@ export class StartupDbProvider {
     let count = 0, requests = 0, scans = 0
     const disclosures = cursor.disclosures
     const save = () => checkpoint(structuredClone(cursor))
+    let lastResponse: { pageUrl: string; raw: string; recordHash: string } | undefined
     const get = async (url: string) => {
       if (requests >= 120) throw new DiscoveryPaused(url, 'request_cap_120')
       if (requests++) await waitForSource(this.delayMs)
-      return object(await discoveryJson(this.gate, url))
+      const result = await this.gate.fetchText(url, { cost: 1, maxBytes: 16 * 1024 * 1024 })
+      if (!result.ok) throw new DiscoveryPaused(url, result.reason)
+      const response = result.response
+      lastResponse = { pageUrl: url, raw: rawExcerpt(response.body), recordHash: contentHashOf(response.body) }
+      if (response.statusCode === 429) {
+        const retry = response.headers['retry-after']
+        throw new DiscoveryPaused(url, 'source_rate_limited', typeof retry === 'string' && /^\d+$/.test(retry) ? Number(retry) : null)
+      }
+      if (response.truncated || response.statusCode < 200 || response.statusCode >= 300) throw SourceError.unusable(url, response.truncated ? 'truncated response' : `HTTP ${response.statusCode}`)
+      try { return object(JSON.parse(response.body)) } catch { throw SourceError.unusable(url, 'invalid JSON') }
     }
     const bind = (hashes: Record<string, string>, key: string, page: unknown) => {
       const hash = contentHashOf(page)
@@ -59,98 +73,111 @@ export class StartupDbProvider {
       if (Object.entries(hashes).some(([k, h]) => k !== key && (!key.startsWith('https:') || k.split('?')[0] === key.split('?')[0]) && h === hash)) throw new Error('Repeated source page; pagination loop')
       hashes[key] = hash
     }
-    while (cursor.investorIndex < INVESTOR_SEEDS.length && count < limit && scans < 500) {
-      const investor = INVESTOR_SEEDS[cursor.investorIndex]!
-      if (!cursor.investorSlug) {
-        const url = `${STARTUPDB_BASE}/investors?q=${encodeURIComponent(investor.name)}&limit=100&offset=0`
+    try {
+      while (cursor.investorIndex < INVESTOR_SEEDS.length && count < limit && scans < 500) {
+        const investor = INVESTOR_SEEDS[cursor.investorIndex]!
+        if (!cursor.investorSlug) {
+          const url = `${STARTUPDB_BASE}/investors?q=${encodeURIComponent(investor.name)}&limit=100&offset=0`
+          const response = await get(url)
+          const records = pageData(response, url, 0)
+          if (!pageFinished(response, records.length, 0)) throw new Error('Investor search truncated; identity undetermined')
+          const identity = selectInvestorIdentity(records, investor)
+          if (!identity) {
+            cursor.omissions.push(`${investor.name}: ambiguous_or_missing_identity`)
+            cursor.investorIndex++; cursor.offset = 0; cursor.entryIndex = 0
+            await save(); continue
+          }
+          cursor.investorSlug = str(identity.slug)!
+          await save()
+        }
+        const url = `${STARTUPDB_BASE}/investors/${encodeURIComponent(cursor.investorSlug)}/portfolio?limit=25&offset=${cursor.offset}`
+        for (const [savedUrl, hash] of Object.entries(cursor.pageHashes)) {
+          if (savedUrl === url || savedUrl.split('?')[0] !== url.split('?')[0]) continue
+          const prior = await get(savedUrl), offset = Number(new URL(savedUrl).searchParams.get('offset'))
+          if (contentHashOf(pageData(prior, savedUrl, offset)) !== hash) throw new Error('Portfolio shifted before cursor; new run required')
+        }
         const response = await get(url)
-        const records = pageData(response, url, 0)
-        if (!pageFinished(response, records.length, 0)) throw new Error('Investor search truncated; identity undetermined')
-        const identity = selectInvestorIdentity(records, investor)
-        if (!identity) {
-          cursor.omissions.push(`${investor.name}: ambiguous_or_missing_identity`)
-          cursor.investorIndex++; cursor.offset = 0; cursor.entryIndex = 0
-          await save(); continue
-        }
-        cursor.investorSlug = str(identity.slug)!
+        const page = pageData(response, url, cursor.offset)
+        if (page.length > 25) throw new Error('Portfolio page exceeds declared bound')
+        const finished = pageFinished(response, page.length, cursor.offset)
+        bind(cursor.pageHashes, url, page)
+        if (cursor.entryIndex > page.length) throw new Error('Invalid portfolio entry cursor')
+        if (!disclosures.some((d) => object(d).url === url)) disclosures.push({ url, investor: investor.name, scopeDisclosures: response.scopeDisclosures ?? [], pagination: response.pagination,
+          license: response.license ?? null, licenseScope: response.licenseScope ?? null, attribution: response.attribution ?? null })
         await save()
-      }
-      const url = `${STARTUPDB_BASE}/investors/${encodeURIComponent(cursor.investorSlug)}/portfolio?limit=25&offset=${cursor.offset}`
-      for (const [savedUrl, hash] of Object.entries(cursor.pageHashes)) {
-        if (savedUrl === url || savedUrl.split('?')[0] !== url.split('?')[0]) continue
-        const prior = await get(savedUrl), offset = Number(new URL(savedUrl).searchParams.get('offset'))
-        if (contentHashOf(pageData(prior, savedUrl, offset)) !== hash) throw new Error('Portfolio shifted before cursor; new run required')
-      }
-      const response = await get(url)
-      const page = pageData(response, url, cursor.offset)
-      if (page.length > 25) throw new Error('Portfolio page exceeds declared bound')
-      const finished = pageFinished(response, page.length, cursor.offset)
-      bind(cursor.pageHashes, url, page)
-      if (cursor.entryIndex > page.length) throw new Error('Invalid portfolio entry cursor')
-      if (!disclosures.some((d) => object(d).url === url)) disclosures.push({ url, investor: investor.name, scopeDisclosures: response.scopeDisclosures ?? [], pagination: response.pagination,
-        license: response.license ?? null, licenseScope: response.licenseScope ?? null, attribution: response.attribution ?? null })
-      await save()
-      while (cursor.entryIndex < page.length && count < limit && scans < 500) {
-        const entry = page[cursor.entryIndex]!
-        const website = str(entry.websiteUrl) ?? str(entry.domain), name = str(entry.name), slug = str(entry.slug)
-        if (!website || !name || !slug) throw SourceError.unusable(url, 'portfolio identity missing')
-        const detailUrl = `${STARTUPDB_BASE}/startups/${encodeURIComponent(slug)}`
-        if (!cursor.pending) {
-          const detailResponse = await get(detailUrl), detail = object(detailResponse.data)
-          const domain = canonicalizeDomain(website), entryDomain = canonicalizeDomain(str(entry.domain) ?? website), detailDomain = canonicalizeDomain(str(detail.websiteUrl) ?? str(detail.domain))
-          const explicitDomain = str(detail.domain) ? canonicalizeDomain(str(detail.domain)) : detailDomain
-          if (!domain.ok || !entryDomain.ok || !detailDomain.ok || !explicitDomain.ok || domain.domain !== entryDomain.domain || domain.domain !== detailDomain.domain ||
-            domain.domain !== explicitDomain.domain || detail.slug !== slug || str(detail.name)?.toLowerCase() !== name.toLowerCase()) {
-            throw SourceError.unusable(detailUrl, 'startup name/slug/domain mismatch')
+        while (cursor.entryIndex < page.length && count < limit && scans < 500) {
+          const entry = page[cursor.entryIndex]!
+          const website = str(entry.websiteUrl) ?? str(entry.domain), name = str(entry.name), slug = str(entry.slug)
+          if (!website || !name || !slug) {
+            cursor.omissions.push({ pageUrl: url, index: cursor.offset + cursor.entryIndex,
+              reason: 'portfolio identity missing', raw: rawExcerpt(JSON.stringify(entry)), recordHash: contentHashOf(entry) })
+            scans++; cursor.entryIndex++; await save(); continue
           }
-          if (!Array.isArray(detail.fundingHistory) || typeof detail.fundingHistoryTotal !== 'number' ||
-            !Number.isSafeInteger(detail.fundingHistoryTotal) || detail.fundingHistoryTotal < detail.fundingHistory.length) {
-            throw SourceError.unusable(detailUrl, 'funding preview/total omitted or malformed')
+          const detailUrl = `${STARTUPDB_BASE}/startups/${encodeURIComponent(slug)}`
+          if (!cursor.pending) {
+            const detailResponse = await get(detailUrl), detail = object(detailResponse.data)
+            const domain = canonicalizeDomain(website), entryDomain = canonicalizeDomain(str(entry.domain) ?? website), detailDomain = canonicalizeDomain(str(detail.websiteUrl) ?? str(detail.domain))
+            const explicitDomain = str(detail.domain) ? canonicalizeDomain(str(detail.domain)) : detailDomain
+            if (!domain.ok || !entryDomain.ok || !detailDomain.ok || !explicitDomain.ok || domain.domain !== entryDomain.domain || domain.domain !== detailDomain.domain ||
+              domain.domain !== explicitDomain.domain || detail.slug !== slug || str(detail.name)?.toLowerCase() !== name.toLowerCase()) {
+              throw SourceError.unusable(detailUrl, 'startup name/slug/domain mismatch')
+            }
+            if (!Array.isArray(detail.fundingHistory) || typeof detail.fundingHistoryTotal !== 'number' ||
+              !Number.isSafeInteger(detail.fundingHistoryTotal) || detail.fundingHistoryTotal < detail.fundingHistory.length) {
+              throw SourceError.unusable(detailUrl, 'funding preview/total omitted or malformed')
+            }
+            cursor.pending = { slug, detail: { ...detail, license: detailResponse.license ?? response.license ?? null,
+              licenseScope: detailResponse.licenseScope ?? response.licenseScope ?? null,
+              attribution: detailResponse.attribution ?? response.attribution ?? null }, entry,
+              funding: detail.fundingHistoryTotal > detail.fundingHistory.length ? [] : detail.fundingHistory.map(object),
+              fundingOffset: 0, total: detail.fundingHistoryTotal, fundingHashes: {}, fundingDone: detail.fundingHistoryTotal === detail.fundingHistory.length }
+            await save()
           }
-          cursor.pending = { slug, detail: { ...detail, license: detailResponse.license ?? response.license ?? null,
-            licenseScope: detailResponse.licenseScope ?? response.licenseScope ?? null,
-            attribution: detailResponse.attribution ?? response.attribution ?? null }, entry,
-            funding: detail.fundingHistoryTotal > detail.fundingHistory.length ? [] : detail.fundingHistory.map(object),
-            fundingOffset: 0, total: detail.fundingHistoryTotal, fundingHashes: {}, fundingDone: detail.fundingHistoryTotal === detail.fundingHistory.length }
+          const pending = cursor.pending
+          if (pending.slug !== slug) throw new Error('Pending company does not match portfolio cursor')
+          // Replay saved funding pages to detect a shifting positional feed before extending it.
+          for (const [offset, hash] of Object.entries(pending.fundingHashes)) {
+            const activityUrl = `${detailUrl}/activity?kind=funding&limit=25&offset=${offset}`
+            const activity = await get(activityUrl), rounds = pageData(activity, activityUrl, Number(offset))
+            if (contentHashOf(rounds) !== hash) throw new Error('Funding activity changed; new run required')
+          }
+          while (!pending.fundingDone && pending.fundingOffset < 100) {
+            const activityUrl = `${detailUrl}/activity?kind=funding&limit=25&offset=${pending.fundingOffset}`
+            const activity = await get(activityUrl), rounds = pageData(activity, activityUrl, pending.fundingOffset)
+            if (rounds.length > 25 || object(activity.pagination).total !== pending.total) throw new Error('Funding page size/total drift')
+            const done = pageFinished(activity, rounds.length, pending.fundingOffset)
+            bind(pending.fundingHashes, String(pending.fundingOffset), rounds)
+            pending.funding.push(...rounds); pending.fundingOffset += rounds.length; pending.fundingDone = done
+            await save()
+          }
+          if (!pending.fundingDone) cursor.omissions.push(`${slug}: funding capped at100; total${pending.total}`)
+          const detail = pending.detail, profile = object(detail.profile)
+          const terms = [...array(profile.productTechnologyTags), ...array(profile.sectorTags), ...array(profile.productsAndServices)]
+            .map((v) => str(object(v).value)).filter(Boolean).join(', ')
+          const accepted = await handle({ source: 'startupdb', externalId: slug, companyName: name, website,
+            sourceUrl: detailUrl, text: [str(profile.shortDescription), terms].filter(Boolean).join('\n'), publishedAt: null,
+            raw: { ...detail, identitySourceFields: { name: entry.name, slug: entry.slug, websiteUrl: entry.websiteUrl ?? null, domain: entry.domain ?? null }, fundingPartial: !pending.fundingDone, portfolioRelationship: entry.relationship ?? null,
+              verifiedInvestorIdentity: investor, relationshipVerification: 'indexed_exact_identities' },
+            investor, funding: [...new Map(pending.funding.map((r) => [str(r.eventId) ?? contentHashOf(r), r])).values()] })
+          if (accepted !== false) count++
+          scans++; cursor.entryIndex++; delete cursor.pending
           await save()
         }
-        const pending = cursor.pending
-        if (pending.slug !== slug) throw new Error('Pending company does not match portfolio cursor')
-        // Replay saved funding pages to detect a shifting positional feed before extending it.
-        for (const [offset, hash] of Object.entries(pending.fundingHashes)) {
-          const activityUrl = `${detailUrl}/activity?kind=funding&limit=25&offset=${offset}`
-          const activity = await get(activityUrl), rounds = pageData(activity, activityUrl, Number(offset))
-          if (contentHashOf(rounds) !== hash) throw new Error('Funding activity changed; new run required')
-        }
-        while (!pending.fundingDone && pending.fundingOffset < 100) {
-          const activityUrl = `${detailUrl}/activity?kind=funding&limit=25&offset=${pending.fundingOffset}`
-          const activity = await get(activityUrl), rounds = pageData(activity, activityUrl, pending.fundingOffset)
-          if (rounds.length > 25 || object(activity.pagination).total !== pending.total) throw new Error('Funding page size/total drift')
-          const done = pageFinished(activity, rounds.length, pending.fundingOffset)
-          bind(pending.fundingHashes, String(pending.fundingOffset), rounds)
-          pending.funding.push(...rounds); pending.fundingOffset += rounds.length; pending.fundingDone = done
-          await save()
-        }
-        if (!pending.fundingDone) cursor.omissions.push(`${slug}: funding capped at100; total${pending.total}`)
-        const detail = pending.detail, profile = object(detail.profile)
-        const terms = [...array(profile.productTechnologyTags), ...array(profile.sectorTags), ...array(profile.productsAndServices)]
-          .map((v) => str(object(v).value)).filter(Boolean).join(', ')
-        const accepted = await handle({ source: 'startupdb', externalId: slug, companyName: name, website,
-          sourceUrl: detailUrl, text: [str(profile.shortDescription), terms].filter(Boolean).join('\n'), publishedAt: null,
-          raw: { ...detail, fundingPartial: !pending.fundingDone, portfolioRelationship: entry.relationship ?? null,
-            verifiedInvestorIdentity: investor, relationshipVerification: 'indexed_exact_identities' },
-          investor, funding: [...new Map(pending.funding.map((r) => [str(r.eventId) ?? contentHashOf(r), r])).values()] })
-        if (accepted !== false) count++
-        scans++; cursor.entryIndex++; delete cursor.pending
+        if (cursor.entryIndex < page.length) break
+        cursor.offset += page.length; cursor.entryIndex = 0
+        if (finished) { cursor.investorIndex++; delete cursor.investorSlug; cursor.offset = 0 }
         await save()
       }
-      if (cursor.entryIndex < page.length) break
-      cursor.offset += page.length; cursor.entryIndex = 0
-      if (finished) { cursor.investorIndex++; delete cursor.investorSlug; cursor.offset = 0 }
-      await save()
+    } catch (error) {
+      if (!(error instanceof DiscoveryPaused) && lastResponse) {
+        cursor.responseFailures ??= []
+        cursor.responseFailures.push({ ...lastResponse, reason: error instanceof Error ? error.message : String(error) })
+        await save()
+      }
+      throw error
     }
     return { count, complete: cursor.investorIndex === INVESTOR_SEEDS.length && cursor.omissions.length === 0,
-      coverage: { investorSeeds: INVESTOR_SEEDS.map((s) => s.name), disclosures, omissions: cursor.omissions,
+      coverage: { investorSeeds: INVESTOR_SEEDS.map((s) => s.name), disclosures, omissions: cursor.omissions, responseFailures: cursor.responseFailures ?? [],
         requests, requestCap: 120, scanned: scans, scanCap: 500, fundingRoundCap: 100,
         attribution: 'StartupDB (https://startupdb.com)', license: 'CC BY 4.0', exhaustive: false } }
   }

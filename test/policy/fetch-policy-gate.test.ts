@@ -182,6 +182,10 @@ describe('FetchPolicyGate — D4 preflight', () => {
     const g = gate(() => new Date(now), limiter)
     await openGlobal(new Date(now))
 
+    // This control tests content-to-content refusal using a previously fetched policy.
+    // Fresh robots-to-content pacing is covered separately by DC1's transport control.
+    await testDb().robotsCache.create({ data: { host: 'slow.example', body: 'User-agent: *\nAllow: /\nCrawl-delay: 30\n',
+      parseOk: true, statusCode: 200, fetchedAt: new Date(now - 60_000), ttlSeconds: 86_400 } })
     const first = await g.fetchText('https://slow.example/page1')
     expect(first.ok).toBe(true)
 

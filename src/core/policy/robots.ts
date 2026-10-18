@@ -1,6 +1,6 @@
 import robotsParser from 'robots-parser'
 import type { Db } from '../audit/audit-log.js'
-import { rawGet } from './http/raw-client.js'
+import { rawGet, type RawResponse } from './http/raw-client.js'
 import { normalizeHost } from './host-lists.js'
 import { isSameSite } from './registrable-domain.js'
 
@@ -10,6 +10,9 @@ export type RobotsVerdict = {
   /** False when the file was missing, errored, or could not be parsed. */
   parseOk: boolean
   source: 'cache' | 'network'
+  statusCode?: number | null
+  pause?: boolean
+  retryAfterMs?: number
 }
 
 export type RobotsOptions = {
@@ -18,6 +21,8 @@ export type RobotsOptions = {
   /** Explicitly allowlisted hosts tolerate a missing robots.txt; unknown hosts do not. */
   hostExplicitlyAllowed: boolean
   now?: () => Date
+  /** Production gate supplies its shared host scheduler and transport accounting. */
+  request?: (url: string) => Promise<RawResponse>
 }
 
 /**
@@ -48,7 +53,7 @@ export async function checkRobots(
   opts: RobotsOptions,
 ): Promise<RobotsVerdict> {
   const parsed = new URL(url)
-  const host = normalizeHost(parsed.host)
+  const host = robotsCacheKey(parsed)
   const now = (opts.now ?? (() => new Date()))()
 
   const cached = await db.robotsCache.findUnique({ where: { host } })
@@ -56,22 +61,24 @@ export async function checkRobots(
     cached && now.getTime() - cached.fetchedAt.getTime() < cached.ttlSeconds * 1000
 
   if (cached && fresh) {
-    return evaluate(cached.body, cached.parseOk, url, opts, 'cache')
+    return evaluate(cached.body, cached.parseOk, url, opts, 'cache', cached.statusCode, Math.max(0, cached.ttlSeconds * 1000 - (now.getTime() - cached.fetchedAt.getTime())))
   }
 
   const fetched = await fetchRobotsFollowingRedirects(
     `${parsed.protocol}//${parsed.host}/robots.txt`,
-    opts.userAgent,
+    opts, db,
   )
   const { body, parseOk, statusCode } = fetched
+  const fetchedAt = opts.now?.() ?? new Date()
+  const ttlSeconds = fetched.retryAfterMs === undefined ? Math.min(opts.ttlSeconds, fetched.remainingTtlSeconds ?? opts.ttlSeconds) : Math.max(1, Math.ceil(fetched.retryAfterMs / 1000))
 
   await db.robotsCache.upsert({
     where: { host },
-    create: { host, body, parseOk, ttlSeconds: opts.ttlSeconds, fetchedAt: now, statusCode },
-    update: { body, parseOk, ttlSeconds: opts.ttlSeconds, fetchedAt: now, statusCode },
+    create: { host, body, parseOk, ttlSeconds, fetchedAt, statusCode },
+    update: { body, parseOk, ttlSeconds, fetchedAt, statusCode },
   })
 
-  return evaluate(body, parseOk, url, opts, 'network')
+  return evaluate(body, parseOk, url, opts, 'network', statusCode, fetched.retryAfterMs)
 }
 
 const ROBOTS_MAX_BYTES = 512 * 1024
@@ -87,13 +94,12 @@ const REDIRECT_CODES = new Set([301, 302, 303, 307, 308])
  * the original host's registrable domain before it is issued, and a cross-site
  * hop ends the walk with `parseOk = false` — restrictive.
  *
- * A 4xx keeps its existing meaning: "no rules published", which `evaluate` treats
- * as permission ONLY for a host we already decided to allow explicitly.
+ * Only 404/410 mean no published rules. Refusal and throttling never grant access.
  */
 async function fetchRobotsFollowingRedirects(
   startUrl: string,
-  userAgent: string,
-): Promise<{ body: string; parseOk: boolean; statusCode: number | null }> {
+  opts: RobotsOptions, db: Db,
+): Promise<{ body: string; parseOk: boolean; statusCode: number | null; retryAfterMs?: number; remainingTtlSeconds?: number }> {
   const originHost = new URL(startUrl).host
   let url = startUrl
   let statusCode: number | null = null
@@ -101,7 +107,25 @@ async function fetchRobotsFollowingRedirects(
   for (let hop = 0; hop <= ROBOTS_MAX_REDIRECTS; hop += 1) {
     let res
     try {
-      res = await rawGet(url, { userAgent, maxBytes: ROBOTS_MAX_BYTES })
+      // Cache the exact standard robots destination independently from the apex
+      // alias. Arbitrary redirect paths must never replace an origin's own rules.
+      const target = new URL(url), host = robotsCacheKey(target)
+      const standard = target.pathname === '/robots.txt' && !target.search && !target.hash
+      if (hop > 0 && standard) {
+        const cached = await db.robotsCache.findUnique({ where: { host } })
+        const age = (opts.now?.() ?? new Date()).getTime() - (cached?.fetchedAt.getTime() ?? 0)
+        if (cached && age < cached.ttlSeconds * 1000) return { body: cached.body, parseOk: cached.parseOk, statusCode: cached.statusCode, remainingTtlSeconds: Math.max(0, Math.floor(cached.ttlSeconds - age / 1000)),
+          ...((cached.statusCode === 429 || (cached.statusCode ?? 0) >= 500) ? { retryAfterMs: Math.max(0, cached.ttlSeconds * 1000 - age) } : {}) }
+      }
+      res = opts.request ? await opts.request(url) : await rawGet(url, { userAgent: opts.userAgent, maxBytes: ROBOTS_MAX_BYTES })
+      if (!REDIRECT_CODES.has(res.statusCode) && standard) {
+        const absent = res.statusCode === 404 || res.statusCode === 410
+        const parseOk = absent || (res.statusCode >= 200 && res.statusCode < 300 && !res.truncated)
+        const retryAfterMs = pauseDelay(res, opts.now?.() ?? new Date())
+        const data = { body: absent ? '' : res.body, parseOk, statusCode: res.statusCode,
+          fetchedAt: opts.now?.() ?? new Date(), ttlSeconds: retryAfterMs === undefined ? opts.ttlSeconds : Math.max(1, Math.ceil(retryAfterMs / 1000)) }
+        await db.robotsCache.upsert({ where: { host }, create: { host, ...data }, update: data })
+      }
     } catch {
       return { body: '', parseOk: false, statusCode }
     }
@@ -113,11 +137,11 @@ async function fetchRobotsFollowingRedirects(
       if (res.truncated) return { body: '', parseOk: false, statusCode }
       return { body: res.body, parseOk: true, statusCode }
     }
-    if (res.statusCode >= 400 && res.statusCode < 500) {
+    if (res.statusCode === 404 || res.statusCode === 410) {
       return { body: '', parseOk: true, statusCode }
     }
     if (!REDIRECT_CODES.has(res.statusCode)) {
-      return { body: '', parseOk: false, statusCode }
+      return { body: res.body, parseOk: false, statusCode, ...(pauseDelay(res, opts.now?.() ?? new Date()) === undefined ? {} : { retryAfterMs: pauseDelay(res, opts.now?.() ?? new Date())! }) }
     }
 
     const raw = res.headers['location']
@@ -148,7 +172,10 @@ function evaluate(
   url: string,
   opts: RobotsOptions,
   source: 'cache' | 'network',
+  statusCode: number | null, retryAfterMs?: number,
 ): RobotsVerdict {
+  if (statusCode === 401 || statusCode === 403) return { allowed: false, crawlDelaySeconds: null, parseOk: false, source, statusCode }
+  if (statusCode === 429 || (statusCode ?? 0) >= 500) return { allowed: false, crawlDelaySeconds: null, parseOk: false, source, statusCode, pause: true, retryAfterMs: retryAfterMs ?? 60_000 }
   if (!parseOk) {
     return { allowed: false, crawlDelaySeconds: null, parseOk: false, source }
   }
@@ -174,4 +201,18 @@ function evaluate(
     parseOk: true,
     source,
   }
+}
+
+/** Retry-After seconds or HTTP date; unavailable rules pause for at least a minute. */
+function pauseDelay(response: RawResponse, now: Date): number | undefined {
+  if (response.statusCode !== 429 && response.statusCode < 500) return undefined
+  const header = response.headers['retry-after'], raw = Array.isArray(header) ? header[0] : header
+  if (raw && /^\d+$/.test(raw)) return Math.max(1000, Number(raw) * 1000)
+  const date = raw ? Date.parse(raw) : NaN
+  return Number.isFinite(date) ? Math.max(1000, date - now.getTime()) : 60_000
+}
+
+/** HTTPS retains historical keys; other origins cannot borrow its policy. */
+function robotsCacheKey(url: URL): string {
+  return url.protocol === 'https:' && !url.port ? normalizeHost(url.host) : `${url.protocol}//${url.host.toLowerCase()}`
 }

@@ -74,6 +74,8 @@ export type FetchPolicyGateOptions = {
   robotsTtlSeconds: number
   defaultRateDelayMs: number
   now?: () => Date
+  /** Test clocks can advance with the scheduler; production uses ordinary timers. */
+  waitForDelay?: (ms: number) => Promise<void>
 }
 
 /**
@@ -106,6 +108,36 @@ export type FetchPolicyGateOptions = {
  */
 export class FetchPolicyGate {
   private readonly limiter: HostRateLimiter
+  private readonly robotsDelays = new Map<string, number>()
+  private readonly robotsQueues = new Map<string, Promise<unknown>>()
+
+  private async waitForHost(host: string, delay: number): Promise<void> {
+    for (;;) {
+      const rate = this.limiter.check(host, delay)
+      if (rate.allowed) return
+      await (this.opts.waitForDelay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))))(rate.retryAfterMs)
+    }
+  }
+
+  /** Robots hops use the same limiter timestamps as content and each is audited. */
+  private async fetchRobots(url: string): Promise<RawResponse> {
+    const host = normalizeHost(new URL(url).host)
+    const previous = this.robotsQueues.get(host) ?? Promise.resolve()
+    const pending = previous.catch(() => {}).then(async () => {
+      const policy = await resolveHostPolicy(this.db, host)
+      if (policy.kind !== 'allowed' || policy.termsProhibited) throw new Error('robots redirect host/terms refused')
+      const delay = effectiveDelayMs(this.opts.defaultRateDelayMs, policy.rateDelayMsOverride, (this.robotsDelays.get(host) ?? 0) / 1000)
+      await this.waitForHost(host, delay)
+      this.limiter.record(host)
+      const response = await rawGet(url, { userAgent: this.opts.userAgent, maxBytes: 512 * 1024 })
+      await writeAudit(this.db, { actorType: 'system', actorId: 'fetch-policy-gate', action: 'fetch.robots_performed',
+        subjectType: 'Url', subjectId: url, metadata: { host, statusCode: response.statusCode,
+          bytes: Buffer.byteLength(response.body), truncated: response.truncated } })
+      return response
+    })
+    this.robotsQueues.set(host, pending)
+    try { return await pending } finally { if (this.robotsQueues.get(host) === pending) this.robotsQueues.delete(host) }
+  }
 
   constructor(
     private readonly db: Db,
@@ -170,15 +202,19 @@ export class FetchPolicyGate {
       userAgent: this.opts.userAgent,
       ttlSeconds: this.opts.robotsTtlSeconds,
       hostExplicitlyAllowed: true,
+      request: (robotsUrl) => this.fetchRobots(robotsUrl),
       ...(this.opts.now ? { now: this.opts.now } : {}),
     })
     if (!robots.allowed) {
-      await this.recordRefusal(url, 'robots_disallowed', {
+      const reason = 'pause' in robots && robots.pause ? 'rate_limited' : 'robots_disallowed'
+      await this.recordRefusal(url, reason, {
         host,
         parseOk: 'parseOk' in robots ? robots.parseOk : true,
         source: 'source' in robots ? robots.source : 'api_contract',
+        ...('statusCode' in robots ? { robotsStatus: robots.statusCode } : {}),
+        ...('retryAfterMs' in robots ? { retryAfterMs: robots.retryAfterMs } : {}),
       })
-      return { allowed: false, reason: 'robots_disallowed' }
+      return { allowed: false, reason }
     }
 
     // 4. Rate policy.
@@ -187,6 +223,10 @@ export class FetchPolicyGate {
       verdict.rateDelayMsOverride,
       robots.crawlDelaySeconds,
     )
+    this.robotsDelays.set(host, delay)
+    // A newly fetched robots policy is part of this request's prerequisite walk.
+    // Wait for it before content. Ordinary too-early subsequent requests still refuse.
+    if ('source' in robots && robots.source === 'network') await this.waitForHost(host, delay)
     const rate = this.limiter.check(host, delay)
     if (!rate.allowed) {
       await this.recordRefusal(url, 'rate_limited', { host, retryAfterMs: rate.retryAfterMs })

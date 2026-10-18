@@ -202,7 +202,7 @@ it('unsupported external listing is blocked by D current-role check; no addition
 })
 
 // These use the ACTUAL FetchPolicyGate/raw-client/MockAgent seam with network disabled by unchanged setup.
-function realGate(now = NOW, limiter?: HostRateLimiter) { return new FetchPolicyGate(db, { userAgent: 'joboss-x-synthetic/1', robotsTtlSeconds: 86400, defaultRateDelayMs: 5000, now: () => now }, limiter) }
+function realGate(now = NOW, limiter?: HostRateLimiter, waitForDelay?: (ms: number) => Promise<void>) { return new FetchPolicyGate(db, { userAgent: 'joboss-x-synthetic/1', robotsTtlSeconds: 86400, defaultRateDelayMs: 5000, now: () => now, ...(waitForDelay ? { waitForDelay } : {}) }, limiter) }
 async function policySetup(cap = 100) {
   await seedHostPolicies(db)
   await db.researchBudget.create({ data: { companyId: null, periodMonth: currentPeriodMonth(NOW), creditsCap: cap, billedUsdCap: 0 } })
@@ -221,7 +221,7 @@ it('all eight added exact hosts reach production adapters through robots and pos
   }
   const after = await db.researchBudget.findFirstOrThrow({ where: { companyId: null } })
   expect(after.creditsSpent - before.creditsSpent).toBe(hosts.length)
-})
+}, 60_000) // Eight fresh robots/content pairs now include the mandatory 5s gaps.
 it.each(['deny', 'robots', 'terms', 'budget', 'rate'])('expanded page real gateway refuses %s before page transport', async (kind) => {
   await policySetup(kind === 'budget' ? 0 : 20)
   const r = route({ deny: 'southparkcommons:companies', robots: 'ef:companies', terms: 'seedcamp:companies', budget: 'masschallenge:ch-uk-2026', rate: 'masschallenge:us-2023' }[kind]!), url = new URL(r.url!); url.searchParams.set('probe', kind); let pageCalls = 0
@@ -229,7 +229,9 @@ it.each(['deny', 'robots', 'terms', 'budget', 'rate'])('expanded page real gatew
   if (kind === 'deny') await db.hostPolicy.updateMany({ where: { host: url.hostname }, data: { mode: 'deny' } })
   if (kind === 'terms') await db.hostPolicy.updateMany({ where: { host: url.hostname }, data: { termsProhibited: true } })
   mockAgent.get(url.origin).intercept({ path: '/robots.txt' }).reply(200, `User-agent: *\n${kind === 'robots' ? 'Disallow: /' : 'Allow: /'}\n`)
-  const limiter = new HostRateLimiter(5000, () => NOW.getTime()), gate = realGate(NOW, limiter)
+  // Advance the same synthetic limiter clock during robots/content spacing.
+  let rateTime = NOW.getTime()
+  const limiter = new HostRateLimiter(5000, () => rateTime), gate = realGate(NOW, limiter, async (ms) => { rateTime += ms })
   if (kind === 'rate') { await publicPage(boundedSourceGate(gate, r, 0).gate, url.href, r); expect(pageCalls).toBe(1) }
   const before = pageCalls
   await expect(publicPage(boundedSourceGate(gate, r, 0).gate, url.href, r)).rejects.toMatchObject({ reason: { deny: 'host_denied', robots: 'robots_disallowed', terms: 'terms_prohibited', budget: 'budget_exhausted', rate: 'rate_limited' }[kind] })
@@ -269,7 +271,7 @@ it('whole expanded prepare path uses the real policy/transport seam for all supp
   }
   let elapsed = NOW.getTime()
   const clock = () => elapsed
-  const gate = realGate(NOW, new HostRateLimiter(5000, clock))
+  const gate = realGate(NOW, new HostRateLimiter(5000, clock), async (ms) => { elapsed += ms })
   // Advancing a synthetic clock represents waiting; the actual limiter, robots, terms, budget and raw-client all still run.
   const guarded = { check: gate.check.bind(gate), fetchText: (async (...args: Parameters<typeof gate.fetchText>) => { elapsed += 6000; return gate.fetchText(...args) }) }
   const result = await prepareDiscovery(db, guarded, options)

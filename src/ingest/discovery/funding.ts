@@ -4,7 +4,7 @@ import type { GatedFetcher } from '../../core/interfaces/providers.js'
 import { contentHashOf } from '../../core/evidence/content-hash.js'
 import { verbatimExcerpt, writeEvidence, writeCompanySignal } from '../../core/evidence/write-evidence.js'
 import { canonicalizeDomain } from '../domain/canonicalize.js'
-import { fetchPage } from '../fetch-page.js'
+import { fetchPage, type PageResult } from '../fetch-page.js'
 import { ensureDerivedCompanyHost } from '../host/derived-company-host.js'
 import { object, str, strings, array } from './common.js'
 import { extractReadable } from '../../intel/research/readability.js'
@@ -83,7 +83,8 @@ export function fundingSupportExcerpt(text: string, companyName: string, stage: 
 
 export async function storeFundingRound(db: Db, gate: GatedFetcher,
   company: { id: string; canonicalDomain: string; displayName: string }, round: Record<string, unknown>,
-  indexUrl: string, now: Date, investor?: { name: string; domain: string }): Promise<void> {
+  indexUrl: string, now: Date, investor?: { name: string; domain: string },
+  primaryPages?: Map<string, Promise<PageResult>>): Promise<void> {
   let sourceKey = fundingSourceKey(round)
   let existing = await db.fundingRecord.findUnique({ where: { companyId_sourceKey: { companyId: company.id, sourceKey } } })
   const date = parseFundingDate(round.eventDate)
@@ -111,7 +112,13 @@ export async function storeFundingRound(db: Db, gate: GatedFetcher,
     try {
       const domain = canonicalizeDomain(primary)
       if (domain.ok) await ensureDerivedCompanyHost(db, { companyId: company.id, host: domain.domain, sourceUrl: indexUrl })
-      const page = await fetchPage(gate, primary, { companyId: company.id, cost: 1, sameHostDelayMs: 5_000 })
+      // Run-local exact originals only. A new walk still gates every physical hop.
+      let pendingPage = primaryPages?.get(primary)
+      if (!pendingPage) {
+        pendingPage = fetchPage(gate, primary, { companyId: company.id, cost: 1, sameHostDelayMs: 5_000 })
+        primaryPages?.set(primary, pendingPage)
+      }
+      const page = await pendingPage
       if (!page.ok) { attempts.push({ url: primary, failure: page.detail }); continue }
       const servedDomain = canonicalizeDomain(page.url)
       const readable = extractReadable(page.body)

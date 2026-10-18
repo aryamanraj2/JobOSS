@@ -15,6 +15,7 @@ import { runSeedIngest } from '../yc/seed-loader.js'
 import { object, DiscoveryPaused, type DiscoveryCandidate } from './common.js'
 import { StartupDbProvider, initialStartupDbCursor, type StartupDbCursor } from './startupdb.js'
 import { HnHiringProvider, initialHnCursor, type HnCursor } from './hn.js'
+import type { PageResult } from '../fetch-page.js'
 import { storeFundingRound } from './funding.js'
 import { detectAtsForCompany, saveDetection } from '../ats/detect.js'
 import { atsProviders, ingestPostings } from '../ats/ingest-postings.js'
@@ -53,7 +54,7 @@ export async function refreshDiscoveryBoards(db: Db, gate: GatedFetcher, company
   return results
 }
 
-async function storeCandidate(db: Db, gate: GatedFetcher, candidate: DiscoveryCandidate, now: Date): Promise<string> {
+async function storeCandidate(db: Db, gate: GatedFetcher, candidate: DiscoveryCandidate, now: Date, primaryPages?: Map<string, Promise<PageResult>>): Promise<string> {
   const canonical = canonicalizeDomain(candidate.website)
   if (!canonical.ok) throw new Error(`unusable company domain for ${candidate.companyName}`)
   const company = await db.company.upsert({ where: { canonicalDomain: canonical.domain },
@@ -69,6 +70,24 @@ async function storeCandidate(db: Db, gate: GatedFetcher, candidate: DiscoveryCa
       contentHash: hash, observedAt: now, publishedAt: candidate.publishedAt, confidence: 0.65, fetchedVia: 'structured_feed' })
     if (candidate.source === 'hn') await writeCompanySignal(db, { companyId: company.id, evidenceId: evidence.id,
       signalType: 'job_posting', observedAt: candidate.publishedAt ?? now, confidence: 0.65 })
+  }
+  // Additive identity support; descriptions and existing record/chunk rows are immutable.
+  if (candidate.source === 'startupdb' || candidate.source === 'hn') {
+    const sourceFields = candidate.raw.identitySourceFields ??
+      Object.fromEntries(['name', 'slug', 'websiteUrl', 'domain'].filter((k) => candidate.raw[k] !== undefined).map((k) => [k, candidate.raw[k]]))
+    const identity = { kind: 'discovery_identity', companyName: candidate.companyName, website: candidate.website,
+      canonicalDomain: canonical.domain, recordHash: hash, sourceFields }
+    const json = JSON.stringify(identity)
+    // Unusually long exact source fields stay reconstructible without truncating JSON.
+    const excerpts = json.length <= 500 ? [json] : Array.from({ length: Math.ceil(json.length / 40) }, (_, index) =>
+      JSON.stringify({ kind: 'discovery_identity_chunk', recordHash: hash, index, total: Math.ceil(json.length / 40), text: json.slice(index * 40, (index + 1) * 40) }))
+    for (const excerpt of excerpts) {
+      const identityHash = contentHashOf({ identity: hash, excerpt })
+      if (!await db.evidence.findFirst({ where: { companyId: company.id, sourceUrl: candidate.sourceUrl, contentHash: identityHash }, select: { id: true } })) {
+        await writeEvidence(db, { companyId: company.id, sourceUrl: candidate.sourceUrl, sourceType: 'external_source',
+          excerpt, contentHash: identityHash, observedAt: now, publishedAt: candidate.publishedAt, confidence: 0.65, fetchedVia: 'structured_feed' })
+      }
+    }
   }
   // Preserve the complete hiring invitation and its explicitly published contacts across the 500-character excerpt bound.
   if (candidate.source === 'hn') {
@@ -87,7 +106,7 @@ async function storeCandidate(db: Db, gate: GatedFetcher, candidate: DiscoveryCa
       license: candidate.raw.license ?? null, licenseScope: candidate.raw.licenseScope ?? null,
       attribution: candidate.raw.attribution ?? null, fundingPartial: candidate.raw.fundingPartial ?? false,
       portfolioRelationship: candidate.raw.portfolioRelationship ?? null },
-  }, candidate.sourceUrl, now, candidate.investor)
+  }, candidate.sourceUrl, now, candidate.investor, primaryPages)
   return company.id
 }
 
@@ -98,7 +117,8 @@ export type BoardRefreshResult = { companyId: string;
 /** Per-source emitted limit; batchId binds all three source scopes. Resume never falls back to unrelated work. */
 export async function prepareDiscovery(db: Db, gate: GatedFetcher, opts: PrepareDiscoveryOptions): Promise<DiscoverySummary> {
   if (!Number.isInteger(opts.limit) || opts.limit < 1 || opts.limit > 200) throw new Error('discovery limit must be an integer between1 and200')
-  if (opts.mode === 'expanded-v1') return prepareExpandedDiscovery(db, gate, opts, storeCandidate)
+  const primaryPages = new Map<string, Promise<PageResult>>()
+  if (opts.mode === 'expanded-v1') return prepareExpandedDiscovery(db, gate, opts, (client, fetcher, candidate, now) => storeCandidate(client, fetcher, candidate, now, primaryPages))
   if (opts.mode !== undefined && opts.mode !== 'legacy3') throw new Error('Unsupported discovery mode')
   const now = opts.now ?? new Date()
   if (!Number.isFinite(now.getTime())) throw new Error('Invalid discovery observation time')
@@ -135,7 +155,7 @@ export async function prepareDiscovery(db: Db, gate: GatedFetcher, opts: Prepare
       cursor = durable as Record<string, unknown>
     }
     const handle = async (candidate: DiscoveryCandidate) => {
-      const id = await storeCandidate(db, gate, candidate, now)
+      const id = await storeCandidate(db, gate, candidate, now, primaryPages)
       const accepted = !companyIds.has(id)
       companyIds.add(id); discovered = companyIds.size; coverage.companyIds = [...companyIds]
       if (accepted) emitted++
@@ -194,7 +214,7 @@ export async function prepareDiscovery(db: Db, gate: GatedFetcher, opts: Prepare
       coverage = { ...coverage, resumeSupported: true,
         ...(error instanceof DiscoveryPaused ? { reason: error.reason, retryAfterSeconds: error.retryAfterSeconds } : {}) }
     }
-    coverage = { ...coverage, ...(Array.isArray(cursor.disclosures) ? { disclosures: cursor.disclosures } : {}), partial: status !== 'completed', limit: opts.limit, emittedThisInvocation: emitted, companyIds: [...companyIds] }
+    coverage = { ...coverage, ...Object.fromEntries(['omissions', 'responseFailures', 'identityUnresolved'].filter((key) => Array.isArray(cursor[key])).map((key) => [key, cursor[key]])), ...(Array.isArray(cursor.disclosures) ? { disclosures: cursor.disclosures } : {}), partial: status !== 'completed', limit: opts.limit, emittedThisInvocation: emitted, companyIds: [...companyIds] }
     await db.discoveryRun.update({ where: { id: run.id }, data: { status, cursor: cursor as Prisma.InputJsonValue,
       counts: { discovered }, coverage: coverage as Prisma.InputJsonValue, errors,
       ...(status === 'completed' ? { completedAt: now } : {}) } })
@@ -205,7 +225,7 @@ export async function prepareDiscovery(db: Db, gate: GatedFetcher, opts: Prepare
     complete: sources.every((s) => s.status === 'completed') }
 }
 
-/** Explicit downstream step; discovery itself does not schedule employer fetches.
+/** Explicit downstream ATS step; discovery can fetch gated original funding pages.
  * Source application URLs are candidates only. Exact current employer ATS rows still determine listed intent. */
 export async function refreshExpandedListingBoards(db: Db, gate: GatedFetcher, summary: DiscoverySummary,
   opts: { companyIds: string[]; now?: Date; limit?: number; delayMs?: number }) {

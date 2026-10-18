@@ -4,7 +4,7 @@ import { normalizeHost } from '../core/policy/host-lists.js'
 
 export type PageResult =
   | { ok: true; url: string; body: string; statusCode: number; hops: string[]; fetches: number }
-  | { ok: false; reason: PreflightRefusal['reason'] | 'source_unavailable'; detail: string; fetches: number }
+  | { ok: false; reason: PreflightRefusal['reason'] | 'source_unavailable'; detail: string; fetches: number; truncated?: boolean }
 
 export type FetchPageOptions = {
   companyId?: string | null
@@ -92,6 +92,9 @@ export async function fetchPage(
       return { ok: false, reason: result.reason, detail: `${url}: ${result.reason}`, fetches }
     }
 
+    if (result.response.truncated) {
+      return { ok: false, reason: 'source_unavailable', detail: `${url}: truncated response`, fetches, truncated: true }
+    }
     const { statusCode, headers, body } = result.response
     if (!REDIRECT_CODES.has(statusCode)) {
       if (statusCode < 200 || statusCode >= 300) {
