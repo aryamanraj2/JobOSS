@@ -1,3 +1,4 @@
+import { APPLICATION_DOMAINS } from '../../ingest/discovery/hn.js'
 import type { ContactType } from '../../../generated/prisma/enums.js'
 
 /**
@@ -141,6 +142,8 @@ export function classifyLocal(email: string): Classification {
  */
 export function isCompanyDomain(email: string, canonicalDomain: string): boolean {
   const domain = email.slice(email.lastIndexOf('@') + 1)
+  if (!/^[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z0-9-]+$/.test(email)) return false
+  if ([...NON_EMPLOYER_EMAIL_DOMAINS].some((d) => domain === d || domain.endsWith(`.${d}`) || canonicalDomain === d)) return false
   return domain === canonicalDomain || domain.endsWith(`.${canonicalDomain}`)
 }
 
@@ -148,3 +151,10 @@ export function isCompanyDomain(email: string, canonicalDomain: string): boolean
 export function normalizeEmail(email: string): string {
   return email.trim().toLowerCase()
 }
+
+// Vendor roots and free mail cannot establish an employer, even when historical
+// Company identity rows contain one. Kept local: EM1 does not edit discovery.
+const NON_EMPLOYER_EMAIL_DOMAINS = new Set([
+  ...APPLICATION_DOMAINS, 'getro.com', 'getro.xyz',
+  'gmail.com','googlemail.com','outlook.com','hotmail.com','yahoo.com','icloud.com','proton.me','protonmail.com','aol.com',
+])

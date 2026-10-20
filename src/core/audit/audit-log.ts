@@ -33,7 +33,7 @@ export async function writeAudit(db: Db, entry: AuditEntry): Promise<void> {
       actorId: entry.actorId,
       action: entry.action,
       subjectType: entry.subjectType,
-      subjectId: entry.subjectId ?? null,
+      subjectId: entry.subjectId === undefined ? null : redact(entry.subjectId) as string,
       reasonCode: entry.reasonCode ?? null,
       costUsd: entry.costUsd ?? null,
       ...(entry.metadata === undefined

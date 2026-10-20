@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { registerSecretValue } from '../logging/redact.js'
 import { MILESTONE_STAGE, stageAllowsSending, type Milestone } from './stage.js'
 
 const boolish = z
@@ -70,6 +71,31 @@ const EnvSchema = z.object({
    */
   FIRECRAWL_API_KEY: z.string().optional(),
 
+  // Human dashboard balances only. Missing/zero never authorizes a lookup.
+  HUNTER_API_KEY: z.string().trim().min(1).optional(),
+  HUNTER_FREE_CREDITS: z.coerce.number().nonnegative().finite().default(0),
+  HUNTER_CREDIT_MODEL: z.enum(['monthly', 'one_time']).default('one_time'),
+  HUNTER_CREDIT_WINDOW_START: z.iso.datetime().optional(),
+  HUNTER_CREDIT_WINDOW_END: z.iso.datetime().optional(),
+  HUNTER_UNIFIED_CREDITS: boolish.default(false),
+  TOMBA_API_KEY: z.string().trim().min(1).optional(),
+  TOMBA_FREE_VERIFICATION_CREDITS: z.coerce.number().nonnegative().finite().default(0),
+  TOMBA_API_SECRET: z.string().trim().min(1).optional(),
+  TOMBA_FREE_CREDITS: z.coerce.number().nonnegative().finite().default(0),
+  TOMBA_CREDIT_MODEL: z.enum(['monthly', 'one_time']).default('one_time'),
+  TOMBA_CREDIT_WINDOW_START: z.iso.datetime().optional(),
+  TOMBA_CREDIT_WINDOW_END: z.iso.datetime().optional(),
+  PROSPEO_API_KEY: z.string().trim().min(1).optional(),
+  PROSPEO_FREE_CREDITS: z.coerce.number().nonnegative().finite().default(0),
+  PROSPEO_CREDIT_MODEL: z.enum(['monthly', 'one_time']).default('one_time'),
+  PROSPEO_CREDIT_WINDOW_START: z.iso.datetime().optional(),
+  PROSPEO_CREDIT_WINDOW_END: z.iso.datetime().optional(),
+  ZEROBOUNCE_API_KEY: z.string().trim().min(1).optional(),
+  ZEROBOUNCE_FREE_CREDITS: z.coerce.number().nonnegative().finite().default(0),
+  ZEROBOUNCE_CREDIT_MODEL: z.enum(['monthly', 'one_time']).default('one_time'),
+  ZEROBOUNCE_CREDIT_WINDOW_START: z.iso.datetime().optional(),
+  ZEROBOUNCE_CREDIT_WINDOW_END: z.iso.datetime().optional(),
+
   /**
    * Blind pattern construction — building `first.last@domain` from a name and a
    * domain nobody published together.
@@ -107,6 +133,10 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
   if (!parsed.success) {
     // z.prettifyError avoids echoing the offending VALUES, which may be secrets.
     throw new Error(`Invalid environment:\n${z.prettifyError(parsed.error)}`)
+  }
+  for (const key of ['HUNTER_API_KEY','TOMBA_API_KEY','TOMBA_API_SECRET','PROSPEO_API_KEY','ZEROBOUNCE_API_KEY'] as const) {
+    const value=parsed.data[key]
+    if (value) {registerSecretValue(value);registerSecretValue(encodeURIComponent(value))}
   }
   return parsed.data
 }

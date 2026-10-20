@@ -1,5 +1,5 @@
 /** Reviewed public API contracts; callers cannot declare arbitrary paths exempt from robots. */
-export type ApiContract = { id: string; documentationUrl: string; minSpacingMs?: number }
+export type ApiContract = { id: string; documentationUrl: string; method?: 'GET' | 'POST'; minSpacingMs?: number }
 /** StartupDB documents 120 requests per minute per IP: same-host requests are never closer than 500 ms. */
 const startupLimit = 500
 const startupDocs = 'https://startupdb.com/api'
@@ -19,9 +19,12 @@ function queryAllowed(url: URL, names: string[]): boolean {
 export function matchApiContract(input: string, method: 'GET' | 'POST' = 'GET'): ApiContract | null {
   let url: URL
   try { url = new URL(input) } catch { return null }
-  if (method !== 'GET' || url.protocol !== 'https:' || url.username || url.password || url.port || url.hash) return null
+  if (url.protocol !== 'https:' || url.username || url.password || url.port || url.hash) return null
   const host = url.hostname.toLowerCase()
   const path = url.pathname
+  const email = matchEmailApiContract(url, method)
+  if (email) return email
+  if (method !== 'GET') return null
   if (host === 'startupdb.com') {
     if (/^\/api\/v1\/(investors|startups)$/.test(path) && queryAllowed(url, ['q', 'limit', 'offset'])) {
       return { id: 'startupdb.search', documentationUrl: startupDocs, minSpacingMs: startupLimit }
@@ -57,5 +60,31 @@ export function matchApiContract(input: string, method: 'GET' | 'POST' = 'GET'):
     (host === 'raw.githubusercontent.com' && /^\/yc-oss\/api\/(master|main)\/(meta|companies\/(all|hiring))\.json$/.test(path))) {
     if (queryAllowed(url, [])) return { id: 'yc-oss.index', documentationUrl: 'https://github.com/yc-oss/api' }
   }
+  return null
+}
+
+/** Exact EM1 request surfaces, confirmed in retained 2026-10-19 public docs.
+ * No host allow entries are seeded by this packet. Public site paths are not APIs.
+ */
+export const EMAIL_API_HOSTS = new Set(['api.hunter.io', 'api.tomba.io', 'api.prospeo.io', 'api.zerobounce.net', 'api-eu.zerobounce.net'])
+function matchEmailApiContract(url: URL, method: 'GET' | 'POST'): ApiContract | null {
+  const host = url.hostname, path = url.pathname
+  const required = (keys: string[]) => keys.every((key) => !!url.searchParams.get(key))
+  if (host === 'api.hunter.io' && method === 'GET') {
+    if (path === '/v2/email-finder' && queryAllowed(url, ['api_key', 'domain', 'first_name', 'last_name']) && required(['api_key','domain','first_name','last_name']))
+      return { id: 'hunter.find', method, documentationUrl: 'https://hunter.io/api-documentation/v2#email-finder', minSpacingMs: 1000 }
+    if (path === '/v2/email-verifier' && queryAllowed(url, ['api_key','email']) && required(['api_key','email']))
+      return { id: 'hunter.verify', method, documentationUrl: 'https://hunter.io/api-documentation/v2#email-verifier', minSpacingMs: 1000 }
+  }
+  if (host === 'api.tomba.io' && method === 'GET') {
+    if (path === '/v1/email-finder' && queryAllowed(url, ['domain','first_name','last_name']) && required(['domain','first_name','last_name']))
+      return { id: 'tomba.find', method, documentationUrl: 'https://docs.tomba.io/api/finder#email-finder', minSpacingMs: 1000 }
+    if (path === '/v1/email-verifier' && queryAllowed(url, ['email']) && required(['email']))
+      return { id: 'tomba.verify', method, documentationUrl: 'https://docs.tomba.io/api/verifier', minSpacingMs: 1000 }
+  }
+  if (host === 'api.prospeo.io' && path === '/enrich-person' && method === 'POST' && queryAllowed(url, []))
+    return { id: 'prospeo.find', method, documentationUrl: 'https://prospeo.io/api-docs/enrich-person', minSpacingMs: 1000 }
+  if ((host === 'api.zerobounce.net' || host === 'api-eu.zerobounce.net') && path === '/v2/validate' && method === 'GET' && queryAllowed(url, ['api_key','email']) && required(['api_key','email']))
+    return { id: 'zerobounce.verify', method, documentationUrl: 'https://www.zerobounce.net/docs/email-validation-api-quickstart/v2-validate-emails', minSpacingMs: 1000 }
   return null
 }

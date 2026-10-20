@@ -6,7 +6,7 @@ import type { ReasonCodeValue } from '../reason-codes/registry.js'
 import { normalizeHost } from './host-lists.js'
 import { resolveHostPolicy } from './host-policy.js'
 import { checkRobots, RobotsPacingShortfall } from './robots.js'
-import { matchApiContract } from './api-contracts.js'
+import { matchApiContract, EMAIL_API_HOSTS } from './api-contracts.js'
 import { checkBudget, reserveBudget, validateBudgetSpend, type BudgetSpend } from './budget.js'
 import { HostRateLimiter, effectiveDelayMs } from './rate-limit.js'
 import { rawGet, rawPostForm, rawPostJson, type RawResponse } from './http/raw-client.js'
@@ -185,6 +185,13 @@ export class FetchPolicyGate {
     }
 
     const host = normalizeHost(parsed.host)
+
+    // Provider API paths cannot fall back to website robots permission.
+    if (EMAIL_API_HOSTS.has(host) && (!matchApiContract(url, method) ||
+        (host === 'api.prospeo.io' && (operation !== 'json_post' || !validProspeoBody(body))))) {
+      await this.recordRefusal(url, 'host_denied', { detail: 'email_api_contract_mismatch' })
+      return { allowed: false, reason: 'host_denied' }
+    }
 
     // 1. Host policy.
     const verdict = await resolveHostPolicy(this.db, host)
@@ -477,4 +484,13 @@ export class FetchPolicyGate {
       metadata,
     })
   }
+}
+
+function validProspeoBody(body: unknown): boolean {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false
+  const b = body as Record<string, unknown>
+  return Object.keys(b).length === 2 && b.only_verified_email === true && !!b.data &&
+    typeof b.data === 'object' && !Array.isArray(b.data) &&
+    Object.keys(b.data).length === 3 && ['first_name','last_name','company_website'].every((k) =>
+      typeof (b.data as Record<string, unknown>)[k] === 'string' && !!(b.data as Record<string, unknown>)[k])
 }

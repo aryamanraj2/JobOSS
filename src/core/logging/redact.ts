@@ -49,10 +49,14 @@ const SECRET_PATTERNS: Array<{ name: string; re: RegExp }> = [
 
 /** Keys whose value is masked wholesale regardless of shape. */
 const SENSITIVE_KEY_RE =
-  /(password|passwd|secret|token|api[_-]?key|apikey|authorization|auth|credential|refresh|cookie|session|kek|dek|private[_-]?key|salt|hmac)/i
+  /(x-key|x-tomba-key|password|passwd|secret|token|api[_-]?key|apikey|authorization|auth|credential|refresh|cookie|session|kek|dek|private[_-]?key|salt|hmac)/i
 
 function redactString(input: string): string {
-  let out = input
+  let out = input.replace(/([?&])([^=&#\s]+)=([^&#\s]*)/g, (match, separator: string, key: string) => {
+    let decoded: string
+    try { decoded = decodeURIComponent(key) } catch { return match }
+    return /^api[_-]?key$/i.test(decoded) ? `${separator}${key}=${REDACTED}` : match
+  })
   for (const value of registeredSecrets) {
     if (value && out.includes(value)) out = out.split(value).join(REDACTED)
   }

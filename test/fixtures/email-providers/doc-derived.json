@@ -1,0 +1,8 @@
+{
+  "provenance": "Synthetic minimal projections of EM1 retained public documentation examples; not live API responses. Names and domains replaced, no credentials.",
+  "hunter": {"data":{"email":"jane@startup.example","first_name":"Jane","last_name":"Doe","position":"CTO","verification":{"status":"valid"},"sources":[{"uri":"https://startup.example/team"}]}},
+  "tomba": {"data":{"email":"jane@startup.example","first_name":"Jane","last_name":"Doe","position":"CTO","verification":{"status":"valid"},"sources":[{"uri":"https://startup.example/team"}]}},
+  "tombaVerify": {"data":{"email":{"email":"jane@startup.example","status":"valid","result":"deliverable"}}},
+  "prospeo": {"error":false,"free_enrichment":false,"person":{"full_name":"Jane Doe","current_job_title":"CTO","email":{"status":"VERIFIED","revealed":true,"email":"jane@startup.example"}}},
+  "zerobounce": {"address":"jane@startup.example","status":"valid","sub_status":"","free_email":false}
+}

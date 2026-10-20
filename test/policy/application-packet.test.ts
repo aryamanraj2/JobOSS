@@ -503,13 +503,16 @@ describe('nothing auto-submits (H8, irreversible in Part H)', () => {
     //
     // F5 is that review. The second caller is the Gmail adapter, and the assertion
     // below is deliberately not loosened to "any file under outreach/" — each entry is
-    // one module, listed by hand, so a third caller still fails this test.
+    // one module, listed by hand, so any additional caller still fails this test.
     const ALLOWED_POST_JSON_CALLERS = [
       // F2 §4.5 — Firecrawl's v2 scrape endpoint, the only vendor API with no GET form.
       'intel/research/firecrawl.ts',
       // F5 — users.messages.send. A mail send is a POST to a Google host with an
       // OAuth bearer; it cannot reach an ATS, and the endpoint check below pins that.
       'outreach/mail/gmail.ts',
+      // EM1 packet — exact Prospeo enrich-person contract, verified-only body.
+      // Free enrichment remains UNCONFIRMED and disabled in the adapter.
+      'outreach/contacts/email-providers.ts',
     ]
     const callers = sourceFiles.filter((file) => {
       if (file.endsWith(join('policy', 'fetch-policy-gate.ts'))) return false

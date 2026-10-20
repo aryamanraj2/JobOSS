@@ -6,6 +6,7 @@ import { currentObservation, sourcePageKey } from '../../ingest/ats/verified.js'
 import { observePersonPage, MAX_IDENTITY_SOURCE_CHARS, identityCaptureHash } from './person-research.js'
 import { isCompanyDomain } from './classify.js'
 import { recipientSuitability } from './suitability.js'
+import { readEmailProviderRoute } from './email-lookup.js'
 import { readImportedRow } from './verify-backfill.js'
 import { providerAttestsDeliverable } from './import.js'
 
@@ -79,6 +80,8 @@ export async function recipientState(db: Db, contact: Contact, companyDomain: st
     let employer = false
     try { employer = isCompanyDomain(`source@${new URL(route.sourceUrl).hostname}`, companyDomain) } catch { /* No published route. */ }
     if (!employer || route.sourceType !== 'company_page' || !route.excerpt.toLowerCase().includes(contact.emailNormalized.toLowerCase())) return fail('Employer evidence does not publish this exact address.')
+  } else if (route.sourceUrl.startsWith('provider-api://')) {
+    if (!readEmailProviderRoute(route, contact, companyDomain)) return fail('Machine provider route lacks an exact bound provider attestation.')
   } else {
     const imported = readImportedRow({ ...route, emailNormalized: contact.emailNormalized })
     if (!imported?.ok || !providerAttestsDeliverable(imported.cells['email_status'])) return fail('Imported route lacks an exact valid provider attestation.')

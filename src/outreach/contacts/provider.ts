@@ -1,32 +1,44 @@
 import type { ContactType } from '../../../generated/prisma/enums.js'
 
-/**
- * Tier B — the verified-lookup seam. **Built in F4, deliberately not exercised.**
- *
- * ## Status, stated so nobody mistakes the seam for a decision
- *
- * The operator's F4 scope note amends `handover.md` §1.2 to permit verified lookup
- * providers, and then instructs that the amendment be left **written down and
- * unexercised** this milestone: no vendor chosen, no terms read, no host allow entry,
- * no live call. Tier A — addresses read off the employer's own pages — is the working
- * path, and it needs no amendment at all.
- *
- * So this file is an interface and a fixture-backed fake. Enabling a real provider is
- * a separate, reviewed act that must do what the plan requires of every optional
- * adapter (Part E): *"endpoint live, terms read, rate policy recorded, fixtures
- * captured, `FetchPolicyGate` entry added"*.
- *
- * ## Two things a future implementer must not get wrong
- *
- * **A provider is not a licence to skip the executive filter.** Whatever a vendor
- * returns goes through `isExecutiveContact` exactly as a scraped address does.
- * `handover.md` §1.1 is not amended by anything in the F4 scope note — the operator
- * kept the exclusion explicitly, and it is the boundary of the broadened policy.
- *
- * **A provider call is a network call**, so it goes through `FetchPolicyGate` like
- * everything else. There is no client here and there must never be one: the adapter
- * receives a gate. That is why this interface takes no transport of its own.
+/** Tier B receives a FetchPolicyGate, never a transport. Provider results still
+ * pass recipientSuitability, company-domain and independent identity/evidence rules.
+ * Founders and technical leaders are eligible; isExecutiveContact is not a filter.
+ * Automatic execution remains isolation_blocked; EM1 exposes only a dry-run CLI.
  */
+export type EmailStatus = 'deliverable' | 'risky' | 'invalid' | 'unknown'
+export type EmailFindInput = { firstName: string; lastName: string; domain: string }
+export type EmailLookupResult = {
+  email: string | null
+  status: EmailStatus
+  rawStatus: string
+  fullName: string | null
+  title: string | null
+  sourceUrl: string | null
+  observedAt: string
+  outcome: string
+  /** Normalized authoritative request, supplied by lookup; never by a verifier. */
+  request?: EmailFindInput
+  /** Finder metadata can accompany a separate verifier's SMTP attestation. */
+  finderProvider?: 'hunter' | 'tomba' | 'prospeo' | 'page'
+}
+
+/** Exact full-name comparison: canonical Unicode, case and whitespace only.
+ * No initials, token overlap, local-part inference, transliteration or fuzzy match. */
+export function personNameText(value: string): string {
+  return value.normalize('NFC').trim().replace(/\s+/gu, ' ').toLowerCase()
+}
+export function personNameMatches(fullName: string | null, request: EmailFindInput): boolean {
+  return typeof fullName === 'string' && !!personNameText(request.firstName) && !!personNameText(request.lastName) &&
+    personNameText(fullName) === `${personNameText(request.firstName)} ${personNameText(request.lastName)}`
+}
+/** Version 1 bounded machine projection: request tuple, email, returned name/title,
+ * finder, SMTP attester, raw status, original observation time and source pointer. */
+export type EmailProviderProjection = {
+  v: 1; q: [string, string, string]; e: string; n: string; t: string | null
+  f: 'hunter' | 'tomba' | 'prospeo' | 'page'
+  a: 'hunter' | 'tomba' | 'prospeo' | 'zerobounce'
+  s: string; o: string; u: string | null
+}
 
 export type VerifiedContactQuery = {
   companyId: string
@@ -41,7 +53,7 @@ export type VerifiedContactResult = {
   email: string
   /** The provider's own confidence that the address deliverable, 0..1. */
   confidence: number
-  /** Published title, when the provider has one. Fed to the executive filter. */
+  /** Published title, when the provider has one. Fed to recipientSuitability. */
   title: string | null
   fullName: string | null
   /** The provider's own evidence URL, when it publishes one. */
@@ -53,6 +65,8 @@ export interface VerifiedContactProvider {
   readonly slug: string
   /** False when no key is configured. Callers must check before spending anything. */
   readonly enabled: boolean
+  findEmail?(input: EmailFindInput): Promise<EmailLookupResult>
+  verify?(email: string): Promise<EmailLookupResult>
   lookup(query: VerifiedContactQuery): Promise<VerifiedContactResult[]>
 }
 

@@ -131,6 +131,8 @@ export type ImportOptions = {
   /** Who typed them. The second half of the provenance — a person, not a page. */
   operator: string
   now?: Date
+  /** Machine lookup provenance; independent identity remains unverified. */
+  providerApi?: boolean
   /** Report what would happen, write nothing. */
   dryRun?: boolean
 }
@@ -178,7 +180,7 @@ export async function importContacts(
   }
 
   for (const row of parsed.rows) {
-    rows.push(await importRow(db, row, opts, now))
+    rows.push(await importContactRow(db, row, opts, now))
   }
 
   const counts = {
@@ -223,7 +225,7 @@ export async function importContacts(
  */
 const IMPORT_REFUSED = 'contact.import_refused'
 
-async function importRow(
+export async function importContactRow(
   db: Db,
   row: CsvRow,
   opts: ImportOptions,
@@ -318,18 +320,17 @@ async function importRow(
   const provider = cell(row, 'provider') ?? opts.provider
   const evidence = await writeEvidence(db, {
     companyId: company.id,
-    sourceUrl: operatorEntrySource(provider, opts.operator),
-    // Not `company_page`: nobody read a page. `user_hint` is the enum value that says
-    // "a human supplied this", which is exactly what happened.
-    sourceType: 'user_hint',
-    // The operator's own line, verbatim. Any `source_url` the operator noted travels
-    // inside it rather than in the column above, because that column has to say where
-    // THIS system got the value, and it got it from a person.
+    sourceUrl: opts.providerApi ? `provider-api://${encodeURIComponent(provider)}` : operatorEntrySource(provider, opts.operator),
+    // A provider projection is an external structured response; operator rows are
+    // user hints. Neither claims a captured employer identity page.
+    sourceType: opts.providerApi ? 'external_source' : 'user_hint',
+    // Operator line or explicitly marked machine projection, as supplied. Any
+    // source URL remains an unverified pointer until separately captured.
     excerpt: verbatimExcerpt(row.raw),
     contentHash: contentHashOf({ provider, operator: opts.operator, email, row: row.raw }),
     observedAt: now,
     confidence: OPERATOR_IMPORT_CONFIDENCE,
-    fetchedVia: FETCHED_VIA.userHint,
+    fetchedVia: opts.providerApi ? FETCHED_VIA.structuredFeed : FETCHED_VIA.userHint,
   })
 
   const emailStatus = row.cells['email_status']
@@ -373,7 +374,7 @@ async function importRow(
       verified,
       emailStatus: emailStatus ?? null,
       provider,
-      sourceUrl: operatorEntrySource(provider, opts.operator),
+      sourceUrl: opts.providerApi ? `provider-api://${encodeURIComponent(provider)}` : operatorEntrySource(provider, opts.operator),
     },
   })
 
