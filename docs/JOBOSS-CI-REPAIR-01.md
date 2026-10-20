@@ -1,5 +1,7 @@
 # CI — Verification repair 01
 
+**HISTORICAL PACKET — superseded by `JOBOSS-CI-REPAIR-02.md`.** Final R-D now accepts scoped D; refreshed repair02 is sole next serial CI packet. Use repair02 only: the old typing ownership is revoked, D types already pass, and full-suite isolation is required. The deferred schedule below is historical.
+
 **SUPERSEDED SCHEDULE — human instruction, 15 October 2026:** Do not launch this standalone CI chat. **D runs next**, then CI workflow/clean-runner repairs are combined with E's later integration assignment when the human's Claude access refreshes. The three draft contactId type fixes belong to D again; this packet grants no overlapping ownership. Its actual CI evidence and remaining workflow/artifact hazards are retained as input for E's refreshed packet. No full-suite/remote-green requirement blocks D's start; D still runs its required local checks. No parallel CI/E chats are authorized by the combined future scope.
 
 15 October 2026, Asia/Kolkata. Start a **fresh human-run local builder chat named CI — Verification repair**, workspace `/Users/aryamanjaiswal/Documents/ChatGPT/scraper`. This is the **sole next assignment when the human submits the prompt**; start is unconfirmed. Do not spawn agents, dispatch chats or message other chats. All prior builders/reviewers are idle. C and RC-1–RC-3 are independently accepted in deterministic/synthetic scope; do not reopen their broad reviews.

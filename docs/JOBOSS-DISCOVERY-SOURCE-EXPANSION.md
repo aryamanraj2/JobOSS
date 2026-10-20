@@ -1,5 +1,7 @@
 # JOBOSS — additional company discovery sources
 
+**Scheduling update — 17 October 2026:** A/B/C/D/CI/S/X/E01 accepted within bounded scopes; RE-01 closed, latest independent1717/71 +7controls. Sole next **same original E preparation workflow01** (`JOBOSS-E-PREPARATION-01.md`), prepared/start unconfirmed; original R-E idle. Packet requires actual expanded dataflow/per-source offline funnels and visible gaps. Actual publisher formats/access/all requested source coverage remain unfinished, as do email APIs/runtime/real cohort; no live permission. HEADebbd901…/indexempty preserved. Historical15October research/status statements below are not current offline implementation status.
+
 Read-only feasibility research, **15 October 2026, Asia/Kolkata**. Human requested South Park Commons, Alchemist, Entrepreneurs First, MassChallenge and Seedcamp as company-discovery sources alongside YC. All five have technology companies worth evaluating. **This is research/queued scope, not adapter implementation, permission clearance, live database ingestion, hiring verification or company-cohort acceptance.** D remains the sole next human-run assignment (start not confirmed here); CI stays with E later. No new worker/reviewer is launched.
 
 ## Observed official sources

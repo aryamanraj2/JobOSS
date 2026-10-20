@@ -1,5 +1,9 @@
 # R-D — People, drafts and review corrections 01 re-review
 
+**COMPLETED — independent report returned:** `JOBOSS-D-CORRECTIONS-01-REVIEW.md` closes RD-2–RD-6; two RD-1 P1 residuals go to same D under corrections02. Do not rerun this packet. Same reviewer awaits a fresh targeted recheck packet after builder returns. CI remains unstarted/queued.
+
+**Scheduling update — 15 October 2026:** Human authorizes a fresh CI repair02 builder alongside this same R-D re-review. This supersedes sole-assignment/CI-deferred wording below only for that pair. CI owns `.github/workflows/ci.yml`, artifact paths/imports in `test/integration/discovery-c.test.ts` and its new report. It must run its full suite in an isolated source copy on B, never primary D scratch or D database. Those bounded file changes and orchestrator coordination documents are expected concurrent preservation exceptions; do not restore them or attribute them to D. D application/tests under review remain frozen. Continue the same targeted review/report; no need to restart checks. Neither start is inferred. No other builder/reviewer starts.
+
 15 October 2026, Asia/Kolkata. Use the **same existing R-D — People, drafts and review reviewer chat**, workspace `/Users/aryamanjaiswal/Documents/ChatGPT/scraper`. D corrections01 report has returned and builder yielded. This is the **sole next assignment once the human submits the prompt**, start unconfirmed. D/all other builders/reviewers idle. No agents/chat dispatch/messages to other chats.
 
 ## Objective and ownership
