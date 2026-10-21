@@ -104,6 +104,13 @@ data/*contacts*.csv
 data/*targets*.csv
 data/*-cache/
 
+# JOBOSS contact-bearing research and mailbox evidence stay local too.
+docs/JOBOSS-FULL-LIST-*-COVERAGE.csv
+docs/JOBOSS-EMAIL-EXPORT-*.json
+docs/JOBOSS-SEND-*.json
+docs/JOBOSS-NEXT-CHAT-*/
+docs/JOBOSS-NEXT-CHAT-*.zip
+
 # ---------------------------------------------------------------------------
 # Editors and OS
 # ---------------------------------------------------------------------------
