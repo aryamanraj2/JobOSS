@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import { z } from 'zod'
 import type { Prisma } from '../../../generated/prisma/client.js'
 import { ContactType } from '../../../generated/prisma/enums.js'
 import type { Db } from '../../core/audit/audit-log.js'
@@ -47,7 +48,7 @@ import { recipientSuitability } from './suitability.js'
  * a provider's name/title/valid address verdict never establishes those facts.
  * Unknown responsibilities remain visible rather than guessed from an address.
  *
- * **Off-domain addresses.** Refused the way `curate.ts` refuses them. A `gmail.com`
+ * **Off-domain addresses.** Refused by default, as `curate.ts` refuses them. A `gmail.com`
  * address is somebody's personal account (§1.2), and an address at another company is
  * somebody else's employee. A provider's export is *more* likely to contain both than
  * a careers page is, not less.
@@ -135,6 +136,26 @@ export type ImportOptions = {
   providerApi?: boolean
   /** Report what would happen, write nothing. */
   dryRun?: boolean
+  /** Explicit manual approval of exact company-domain/email pairs; never verifies them. */
+  humanApprovedExceptions?: HumanApprovedExceptions
+}
+
+const humanApprovedExceptionsSchema = z.object({
+  approvalReference: z.string().max(160).regex(/^docs\/[A-Za-z0-9._/-]+\.md$/),
+  pairs: z.array(z.object({
+    domain: z.string().refine((domain) => {
+      const canonical = canonicalizeDomain(domain)
+      return canonical.ok && canonical.domain === domain
+    }, 'An exact canonical company domain is required'),
+    email: z.email().refine((email) => normalizeEmail(email) === email, 'An exact normalized email is required'),
+  }).strict()).min(1),
+}).strict()
+
+export type HumanApprovedExceptions = z.infer<typeof humanApprovedExceptionsSchema>
+
+/** Local task input only. No wildcard domains, patterns, or global bypass flag. */
+export function readHumanApprovedExceptions(filePath: string): HumanApprovedExceptions {
+  return humanApprovedExceptionsSchema.parse(JSON.parse(readFileSync(filePath, 'utf8')))
 }
 
 /**
@@ -272,9 +293,18 @@ export async function importContactRow(
     }
   }
 
-  // Same rule as `curate.ts`, and it matters more here: a provider export mixes
-  // personal accounts and other employers' addresses in a way a careers page does not.
-  if (!isCompanyDomain(email, canonical.domain)) {
+  const approvedPair = opts.humanApprovedExceptions?.pairs.find(
+    (pair) => pair.domain === canonical.domain && pair.email === email,
+  )
+  const humanApprovedException = approvedPair ? {
+    domain: canonical.domain,
+    email,
+    approvalReference: opts.humanApprovedExceptions!.approvalReference,
+  } : null
+
+  // Default domain policy is unchanged. Only an explicitly supplied exact pair
+  // can cross it; this does not establish ownership, affiliation, or validity.
+  if (!isCompanyDomain(email, canonical.domain) && !humanApprovedException) {
     if (opts.dryRun !== true) {
       await writeAudit(db, {
         actorType: 'user',
@@ -317,24 +347,31 @@ export async function importContactRow(
     return { line: row.line, email, domain: canonical.domain, outcome: 'imported', contactType, detail: 'dry run' }
   }
 
-  const provider = cell(row, 'provider') ?? opts.provider
+  const provider = humanApprovedException ? 'human-supplied' : cell(row, 'provider') ?? opts.provider
+  const providerApi = !humanApprovedException && opts.providerApi
+  const sourceUrl = providerApi ? `provider-api://${encodeURIComponent(provider)}` : operatorEntrySource(provider, opts.operator)
+  // The explicit non-CSV prefix preserves approval independently of row notes and
+  // prevents the provider-verification backfill from treating a verdict as proof.
+  const excerpt = humanApprovedException
+    ? `Human-approved exact-pair exception: ${canonical.domain} + ${email}; ${humanApprovedException.approvalReference}; domain relationship, affiliation and email validity unconfirmed.\n${row.raw}`
+    : row.raw
   const evidence = await writeEvidence(db, {
     companyId: company.id,
-    sourceUrl: opts.providerApi ? `provider-api://${encodeURIComponent(provider)}` : operatorEntrySource(provider, opts.operator),
+    sourceUrl,
     // A provider projection is an external structured response; operator rows are
     // user hints. Neither claims a captured employer identity page.
-    sourceType: opts.providerApi ? 'external_source' : 'user_hint',
+    sourceType: providerApi ? 'external_source' : 'user_hint',
     // Operator line or explicitly marked machine projection, as supplied. Any
     // source URL remains an unverified pointer until separately captured.
-    excerpt: verbatimExcerpt(row.raw),
-    contentHash: contentHashOf({ provider, operator: opts.operator, email, row: row.raw }),
+    excerpt: verbatimExcerpt(excerpt),
+    contentHash: contentHashOf({ provider, operator: opts.operator, email, row: row.raw, ...(humanApprovedException ? { humanApprovedException } : {}) }),
     observedAt: now,
     confidence: OPERATOR_IMPORT_CONFIDENCE,
-    fetchedVia: opts.providerApi ? FETCHED_VIA.structuredFeed : FETCHED_VIA.userHint,
+    fetchedVia: providerApi ? FETCHED_VIA.structuredFeed : FETCHED_VIA.userHint,
   })
 
   const emailStatus = row.cells['email_status']
-  const verified = providerAttestsDeliverable(emailStatus)
+  const verified = !humanApprovedException && providerAttestsDeliverable(emailStatus)
 
   const created = await db.contact.create({
     data: {
@@ -352,7 +389,7 @@ export async function importContactRow(
       sourcePageKind: null,
       publicTitle: title,
       fullName: cell(row, 'full_name'),
-      identitySourceUrl: cell(row, 'source_url'),
+      identitySourceUrl: humanApprovedException ? null : cell(row, 'source_url'),
       suitability: recipientSuitability({ emailNormalized: email, contactType, publicTitle: title }).category,
       suitabilityReason: recipientSuitability({ emailNormalized: email, contactType, publicTitle: title }).reason,
       evidenceId: evidence.id,
@@ -374,7 +411,8 @@ export async function importContactRow(
       verified,
       emailStatus: emailStatus ?? null,
       provider,
-      sourceUrl: opts.providerApi ? `provider-api://${encodeURIComponent(provider)}` : operatorEntrySource(provider, opts.operator),
+      sourceUrl,
+      ...(humanApprovedException ? { humanApprovedException } : {}),
     },
   })
 

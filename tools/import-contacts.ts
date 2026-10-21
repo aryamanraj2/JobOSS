@@ -6,6 +6,7 @@
  *   npm run contacts:import -- --file data/contacts.csv --provider apollo.io
  *   npm run contacts:import -- --file data/contacts.csv --dry-run
  *   npm run contacts:import -- --file data/contacts.csv --report data/contact-import-report.csv
+ *   npm run contacts:import -- --file data/contacts.csv --human-approved-exceptions scratch/task/approved-pairs.json
  *
  * Header: domain,email,full_name,title,contact_type,provider,source_url,notes[,email_status]
  * Required: domain,email. Everything else may be blank.
@@ -16,17 +17,16 @@
  * optional `email_status` is exactly `valid` (F6-DECISIONS §3.1): see the module
  * comment in `src/outreach/contacts/import.ts`.
  *
- * Rows are refused for three reasons and each is reported rather than dropped —
- * executives (`handover.md` §1.1, unamended), addresses off the company's domain, and
- * domains that are not in the corpus yet. Seed a company before importing a contact
- * for it: `npm run ingest:seed -- --from-file <list>`.
+ * Off-domain rows are refused unless an explicit approval file lists the exact
+ * company-domain/email pair. Approved exceptions are always human-supplied and
+ * unverified. Unknown companies and unusable rows are also reported and refused.
  */
 import 'dotenv/config'
 import { userInfo } from 'node:os'
 import { writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { prisma, disconnectPrisma } from '../src/core/db/client.js'
-import { importContacts } from '../src/outreach/contacts/import.js'
+import { importContacts, readHumanApprovedExceptions } from '../src/outreach/contacts/import.js'
 
 const args = process.argv.slice(2)
 const has = (f: string) => args.includes(f)
@@ -37,7 +37,7 @@ const val = (f: string) => {
 
 const file = val('--file')
 if (!file) {
-  console.error('usage: npm run contacts:import -- --file <csv> [--provider apollo.io] [--dry-run] [--report <csv>]')
+  console.error('usage: npm run contacts:import -- --file <csv> [--provider apollo.io] [--dry-run] [--report <csv>] [--human-approved-exceptions <json>]')
   process.exit(2)
 }
 
@@ -47,9 +47,16 @@ const provider = val('--provider') ?? 'apollo.io'
 // `--operator` when it is not the right name.
 const operator = val('--operator') ?? userInfo().username
 const dryRun = has('--dry-run')
+const exceptionFile = val('--human-approved-exceptions')
+if (has('--human-approved-exceptions') && (!exceptionFile || exceptionFile.startsWith('--'))) {
+  throw new Error('--human-approved-exceptions requires an approval JSON file')
+}
+const exceptionOptions = exceptionFile
+  ? { humanApprovedExceptions: readHumanApprovedExceptions(resolve(exceptionFile)) }
+  : {}
 
 const db = prisma()
-const result = await importContacts(db, resolve(file), { provider, operator, dryRun })
+const result = await importContacts(db, resolve(file), { provider, operator, dryRun, ...exceptionOptions })
 
 console.log(`\nImporting contacts from ${file}${dryRun ? '  (DRY RUN — nothing written)' : ''}`)
 console.log(`  provider ${provider} · operator ${operator}\n`)
