@@ -1,0 +1,26 @@
+# Full list 06 — ranks 51–60, same research/contact flow
+
+**Destination: JOBOSS Full-list Builder (same builder).** Workspace `/Users/aryamanjaiswal/Documents/ChatGPT/scraper`.
+
+Read AGENTS.md, current handover, FULL-LIST-05-REPORT.md and this packet. Reuse the successful pass05 research/provider/import tools and fresh preservation checks. Keep this packet fixed during execution; any scope change needs a separate continuation, preserving completed work.
+
+## Scope
+
+Baseline ranks **51–60**, exact IDs from FULL-LIST-05-COVERAGE.csv: Quantum Minds (`quantumminds.com`), Sendery (`sendery.co`), Sourcegraph (`sourcegraph.com`), StartupHakk (`startuphakk.com`), Toolhouse AI (`toolhouse.ai`), Treat Health (`treat.health`), VLM Run (`vlm.run`), Dust (`dust.tt`), Metaview (`metaview.ai`), Wexler (`wexler.ai`). All ten were baseline eligible without holds at the root file check; fresh C status/hold conflicts stop that company without backfill.
+
+Aim for **two distinct suitable people total per eligible company**, counting existing people and sent people toward coverage once, never two addresses for one person. This remains a bounded step across all 245 companies. Retain prior person/role/email gaps and deferred ML6 navigation; do not expand this pass to fetch/enrich earlier companies.
+
+## Execute the established sequence
+
+1. **Cache-first company research:** genuine saved/captured site links; otherwise homepage then a supported same-site person/team/about link. At most two new starts per company, **20 starts / 50 website HTTP requests**, including robots/redirect/retry hops, enforced before dispatch. Existing FetchPolicyGate unchanged. Stop at sufficient evidence; no guessed-path loops, guard bypass or browser workaround. Record missing evidence honestly; a generic careers signal proves no vacancy.
+2. **Existing provider contact lookup:** reuse accepted scripts, caches and the human's configured accounts, not an own-site-only restriction and not a provider replacement. Hunter ended pass05 at **29 free credits left**, Snov balance **40**: recheck current access/free entitlement first. Retain pass05's **14 total search/finder-call ceiling**, no pagination or separate verification; account reads counted separately. Hunter's three-credit reserve and Snov's ten-credit reserve/original forty-credit cumulative ceiling stay intact; spend only current confirmed free availability, never billed/paid credits. Do not retry Snov's known blocked lookup endpoints or any access/quota/payment refusal. Use other existing accepted providers only if already configured and currently entitled, within the same lookup ceiling; no new keys, accounts, tools, upgrades or provider integration. Report available/blocked routes without exposing credentials.
+3. Choose at most two people per company, founders/CTOs, relevant engineers/leaders, or recruiters; cached suitable people count first. Skip repeat sent-address/person lookups when an existing suitable route is already recorded. Keep full names, roles, independent affiliation support, provider provenance, email status and verdict time distinct. A provider-valid flag is not independent identity proof. Partial names, generic inboxes, investors and testimonials stay separate. No guessed email patterns or generalized off-domain/manual exceptions.
+4. **Dry-run-first additive C import:** missing eligible exact pairs only, using existing `contacts:import`. Inspect duplicates/refusals before importing; stop if existing rows would change or a new exception/code change is needed. Preserve old contacts and all other business rows. No drafting or approval/send operations in this pass; those remain the next stages after contact selection and exact human approval.
+
+## Controls and deliverables
+
+₹0. Inherit pass03/05's C-only identity, strict source-based write review and full-table before/after preservation. Explicit process-only `outreach_real_joboss_c` override before DB/config imports; read-only identity first, never open live or print URLs/keys. Permit only normal scoped research budget/cache/audit bookkeeping, append-only page evidence/signals, and intended additive contact/import evidence/audits. No cap/policy reset or increase, old-row rewrite/delete, app/schema/guard edits, external model call, Firecrawl, LinkedIn scraping, login/bypass, Git, agents/chats or automation. Stop/report unexpected mutations without silent repair. Website global usage was 531/1,009; recheck instead of treating it as fresh.
+
+Preserve every prior CSV observation and all 245 rows, 13 exclusions, Firebender skip, GloGlo/ion design/Keystroke holds, 21 sent exclusions and frozen S2 records. No new drafts, approvals, emails, resend/follow-up or sending goal.
+
+Deliver `docs/JOBOSS-FULL-LIST-06-COVERAGE.csv`, `docs/JOBOSS-FULL-LIST-06-REPORT.md`, bounded supporting captures/request and credit ledgers/import dry-run/results/preservation under `scratch/joboss-full-list-06/`, and a short coordination entry. Keep contact-bearing files local. Report imported named versus generic rows, primary-supported versus provider-only identities, validity/role gaps, deduplicated coverage and new unsent routes, actual website/provider/credit usage, C deltas and preservation. Propose the next pass in the same flow without executing it. Lean report, no reviewer chat.
