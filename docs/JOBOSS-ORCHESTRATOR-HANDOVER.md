@@ -3,6 +3,10 @@
 Updated 23 October 2026 · `/Users/aryamanjaiswal/Documents/ChatGPT/scraper`.
 Read this page fully, then `AGENTS.md`, then only the last few coordination entries.
 
+**Pause resolved 26 October 2026.** The human's check was the YC-founder route: active task is `docs/JOBOSS-YC-FOUNDERS-01.md`, run by a new builder chat. The paused text below is history.
+
+**PAUSED by the human on 23 October 2026.** They want to check one unspecified thing in a fresh orchestrator chat before continuing. Read `docs/JOBOSS-PAUSED-HANDOVER-20261023.md` for the compact checkpoint. Confirm briefly, then ask what they want to check; do not assume it is draft approval or resume any research, provider calls, drafting, imports, sending, goals or automations. No separate builder was messaged/stopped by root; this records the human's pause and handoff, not a runtime shutdown claim. The review/research steps below are deferred until explicitly resumed.
+
 ## Next objective
 
 The human wants the **whole company list**, aiming for **at least two distinct suitable people per company where possible**. Treat this as the saved 245-company catalog, not just the previous twenty. First establish current coverage; do not invent a second person or count two addresses for one person. Existing suitable contacts count toward two total, not two additional. Generic inboxes are mailboxes, not named people. New emails still need exact recipient/content approval.
